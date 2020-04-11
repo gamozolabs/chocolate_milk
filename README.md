@@ -10,11 +10,11 @@ wise.
 
 To build this you need Rust, `nasm`, and `lld-link` (from LLVM's linker).
 
-You can get nasm [here][https://nasm.us/] or from `apt install nasm`
+You can get nasm [here](https://nasm.us/) or from `apt install nasm`
 
-You can get LLVM binaries [here][https://llvm.org/builds/] or `apt install lld`
+You can get LLVM binaries [here](https://llvm.org/builds/) or `apt install lld`
 
-You can get Rust [here][https://rustup.rs/]. You must use nightly Rust!
+You can get Rust [here](https://rustup.rs/). You must use nightly Rust!
 
 This project requires that you have the `i586-pc-windows-msvc` and
 `x86_64-pc-windows-msvc` Rust targets installed.
