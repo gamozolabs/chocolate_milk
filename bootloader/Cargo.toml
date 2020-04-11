@@ -7,6 +7,10 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+cpu = { path = "../shared/cpu" }
+serial = { path = "../shared/serial" }
+rangeset = { path = "../shared/rangeset" }
+lockcell = { path = "../shared/lockcell" }
 
 [profile.release]
 panic = "abort"

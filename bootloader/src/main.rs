@@ -1,25 +1,28 @@
-#![feature(rustc_private, asm)]
+//! Main Rust entry point for the chocolate milk bootloader
+
+#![feature(rustc_private, panic_info_message, alloc_error_handler)]
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod core_reqs;
+mod realmode;
+mod mm;
+mod panic;
 
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop { }
-}
+use serial::print;
 
 #[no_mangle]
-fn entry() {
-    unsafe {
-        core::ptr::write(0xb8000 as *mut u16, 0x0f45);
+extern fn entry() -> ! {
+    serial::init();
+    mm::init();
 
-        asm!(r#"
-            cli
-            hlt
-        "# :::: "volatile", "intel");
-    }
+    let mut data = alloc::vec![50];
+    data.push(5);
+
+    print!("Welcome to the chocolate milk! {:?}\n", data);
+
+    cpu::halt();
 }
 

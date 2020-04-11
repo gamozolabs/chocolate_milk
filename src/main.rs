@@ -1,9 +1,14 @@
+//! Build script for the chocolate milk bootloader and OS
+
 use std::path::Path;
 use std::error::Error;
 use std::convert::TryInto;
 use std::process::Command;
 
 use pe_parser::PeParser;
+
+/// Base address for the Rust bootloader
+const BOOTLOADER_BASE: u32 = 0x7e00;
 
 /// Maximum size allowed by PXE
 const MAX_BOOTLOADER_SIZE: u64 = 32 * 1024;
@@ -53,8 +58,11 @@ fn flatten_pe<P: AsRef<Path>>(filename: P) -> Option<(u32, u32, Vec<u8>)> {
         let flat_off: usize = (base - image_start).try_into().ok()?;
         let size:     usize = size.try_into().ok()?;
 
+        // Compute the number of bytes to initialize
+        let to_copy = std::cmp::min(size, raw.len());
+
         // Copy the initialized bytes from the PE into the flattened image
-        flattened[flat_off..flat_off.checked_add(size)?]
+        flattened[flat_off..flat_off.checked_add(to_copy)?]
             .copy_from_slice(raw);
 
         Some(())
@@ -130,6 +138,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Create the boot file name
     let bootfile = Path::new("build").join("chocolate_milk.boot");
 
+    // Build the assembly routines for the bootloader
+    if !Command::new("nasm")
+            .args(&["-f", "win32",
+                &format!("-DPROGRAM_BASE={:#x}", BOOTLOADER_BASE),
+                Path::new("bootloader").join("src").join("asm_routines.asm")
+                .to_str().unwrap(),
+                "-o", Path::new("build").join("bootloader")
+                .join("asm_routines.obj").to_str().unwrap()
+            ]).status()?.success() {
+        return Err("Failed to build bootloader assembly routines".into());
+    }
+
     // Build the bootloader
     let bootloader_build_dir =
         Path::new("build").join("bootloader").canonicalize()?;
@@ -149,8 +169,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("Failed to flatten bootloader PE image")?;
 
     // Make sure the PE gets loaded to where we expect
-    if base != 0x7e00 {
-        return Err("Base address for bootloader did not match 0x7e00".into());
+    if base != BOOTLOADER_BASE {
+        return
+            Err("Base address for bootloader did not match expected".into());
     }
 
     // Write out the flattened bootloader image
