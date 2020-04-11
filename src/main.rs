@@ -93,6 +93,20 @@ fn check_install(command: &str, args: &[&str],
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Handle clean to remove all artifacts
+    if args.len() == 2 && args[1] == "clean" {
+        if Path::new("build").is_dir() {
+            std::fs::remove_dir_all("build")?;
+        }
+        if Path::new("pxe").is_dir() {
+            std::fs::remove_dir_all("pxe")?;
+        }
+
+        return Ok(());
+    }
+
     // Check for nasm
     check_install("nasm", &["-v"], &["NASM version"])
         .ok_or("nasm not present in the path")?;
@@ -161,7 +175,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     
     // Deploy the images to the PXE directory
-    std::fs::copy(bootfile, "/home/pleb/netboot/chocolate_milk.boot")?;
+    std::fs::create_dir_all("pxe")?;
+    std::fs::copy(bootfile, Path::new("pxe").join("chocolate_milk.boot"))?;
 
     Ok(())
 }

@@ -29,7 +29,10 @@ specific version (eg: `lld-link-10`)
 
 ## Building
 
-To build this simply run `cargo run`
+To build this simply run `cargo run` this will create a folder called `pxe`
+that will contain the folder which needs to be exposed via a TFTP server.
+Optionally, the files could be copied from the `pxe` folder to your existing
+PXE deployment folder.
 
 # Usage
 
