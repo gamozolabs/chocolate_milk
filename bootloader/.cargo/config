@@ -2,4 +2,4 @@
 target = "i586-pc-windows-msvc"
 
 [target.i586-pc-windows-msvc]
-rustflags = ["-C", "relocation-model=static", "-C", "linker=lld-link-10", "-C", "link-args=/entry:entry /subsystem:native /base:0x6e00 /filealign:0x1000 /fixed /align:1 /debug:dwarf /nodefaultlib"]
+rustflags = ["-C", "relocation-model=static", "-C", "linker=lld-link", "-C", "link-args=/entry:entry /subsystem:native /base:0x6e00 /filealign:0x1000 /fixed /align:1 /debug:dwarf /nodefaultlib"]

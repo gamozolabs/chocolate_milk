@@ -105,9 +105,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ]).ok_or("rustup not present or i586-pc-windows-msvc or \
                   x86_64-pc-windows-msvc targets not installed")?;
 
-    // Check for lld-link-10
-    check_install("lld-link-10", &["--version"], &["LLD "])
-        .ok_or("lld-link-10 not present in the path")?;
+    // Check for lld-link
+    check_install("lld-link", &["--version"], &["LLD "])
+        .ok_or("lld-link not present in the path")?;
 
     // Create a build folder, if it does not exist
     std::fs::create_dir_all("build")?;
