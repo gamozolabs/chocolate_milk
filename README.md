@@ -8,7 +8,9 @@ wise.
 
 ## Requirements
 
-To build this you need Rust, `nasm`, and `lld-link` (from LLVM's linker).
+To build this you need Rust, `nasm`, and `lld-link` (from LLVM's linker). This
+bootloader and kernel are built identically regardless of the build system. It
+should build just fine on Linux, Windows, OSX, BSD, whatever.
 
 You can get nasm [here](https://nasm.us/) or from `apt install nasm`
 
