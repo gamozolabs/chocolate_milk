@@ -8,7 +8,7 @@ use std::process::Command;
 use pe_parser::PeParser;
 
 /// Base address for the Rust bootloader
-const BOOTLOADER_BASE: u32 = 0x7e00;
+const BOOTLOADER_BASE: u32 = 0x8100;
 
 /// Maximum size allowed by PXE
 const MAX_BOOTLOADER_SIZE: u64 = 32 * 1024;

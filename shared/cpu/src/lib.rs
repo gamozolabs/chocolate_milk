@@ -3,6 +3,18 @@
 #![feature(asm)]
 #![no_std]
 
+/// MSR for APIC base
+const IA32_APIC_BASE: u32 = 0x1b;
+
+/// MSR for active GS base
+const IA32_GS_BASE: u32 = 0xc0000101;
+
+/// Returns true if the current CPU is the BSP, otherwise returns false.
+#[inline]
+pub fn is_bsp() -> bool {
+    (unsafe { rdmsr(IA32_APIC_BASE) } & (1 << 8)) != 0
+}
+
 /// Output `val` to I/O port `addr`
 #[inline]
 pub unsafe fn out8(addr: u16, val: u8) {
@@ -23,6 +35,16 @@ pub unsafe fn invlpg(vaddr: usize) {
     asm!("invlpg [$0]" :: "r"(vaddr) : "memory" : "volatile", "intel");
 }
 
+/// Read an MSR
+#[inline]
+pub unsafe fn rdmsr(msr: u32) -> u64 {
+    let val_lo: u32;
+    let val_hi: u32;
+    asm!("rdmsr" : "={edx}"(val_hi), "={eax}"(val_lo) : "{ecx}"(msr) :
+         "memory" : "volatile", "intel");
+    ((val_hi as u64) << 32) | val_lo as u64
+}
+
 /// Write an MSR
 #[inline]
 pub unsafe fn wrmsr(msr: u32, val: u64) {
@@ -36,7 +58,7 @@ pub unsafe fn wrmsr(msr: u32, val: u64) {
 /// Set the GS
 #[inline]
 pub unsafe fn set_gs_base(base: u64) {
-    wrmsr(0xc000_0101, base);
+    wrmsr(IA32_GS_BASE, base);
 }
 
 /// Disable interrupts and halt forever
@@ -50,5 +72,11 @@ pub fn halt() -> ! {
             "# :::: "volatile", "intel");
         }
     }
+}
+
+/// Canonicalize an address
+#[inline]
+pub fn canonicalize_address(addr: u64) -> u64 {
+    (((addr as i64) << 16) >> 16) as u64
 }
 

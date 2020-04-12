@@ -15,9 +15,10 @@ impl core::fmt::Write for SerialWriter {
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
+        let _lock = core!().boot_args.print_lock.lock();
         let _ = core::fmt::Write::write_fmt(
             &mut $crate::print::SerialWriter, format_args!($($arg)*));
-    }
+    }}
 }
 

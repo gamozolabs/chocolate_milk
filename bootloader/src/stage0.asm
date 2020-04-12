@@ -37,6 +37,14 @@ pm_entry:
     mov gs, ax
     mov ss, ax
 
+    ; Wait for the shared early boot stack to be available for use
+.wait_for_stack:
+    pause
+    xor  al, al
+    lock xchg byte [stack_avail], al
+    test al, al
+    jz   .wait_for_stack
+
     ; Set up a basic stack
     mov esp, 0x7c00
 
@@ -62,5 +70,18 @@ pm_gdt:
 times 510-($-$$) db 0
 dw 0xaa55
 
+; Do not move this, it must stay at 0x7e00. We release the early boot stack
+; once we get into the kernel and are using a new stack. We write directly to
+; this location.
+stack_avail: db 1
+
+times (0x8000 - 0x7c00)-($-$$) db 0
+
+[bits 16]
+
+ap_entry:
+    jmp 0x0000:entry
+
+times (0x8100 - 0x7c00)-($-$$) db 0
 incbin "build/chocolate_milk.flat"
 

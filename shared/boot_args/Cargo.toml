@@ -10,4 +10,5 @@ edition = "2018"
 lockcell = { path = "../lockcell" }
 rangeset = { path = "../rangeset" }
 serial = { path = "../serial" }
+page_table = { path = "../page_table" }
 

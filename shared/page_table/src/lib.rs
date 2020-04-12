@@ -15,10 +15,12 @@ pub const PAGE_NX:      u64 = 1 << 63;
 /// This may represent a host physical address, or a guest physical address.
 /// The meaning will vary based on context.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct PhysAddr(pub u64);
 
 /// A strongly typed virtual address.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct VirtAddr(pub u64);
 
 pub trait PhysMem {
@@ -55,35 +57,23 @@ pub enum PageType {
 }
 
 /// A 64-bit x86 page table 
-pub struct PageTable<'a, P: PhysMem> {
+#[repr(C)]
+pub struct PageTable {
     /// The physical address of the top-level page table. This is typically
     /// the value in `cr3`, without the VPID bits.
     table: PhysAddr,
-
-    /// Physical memory
-    phys_mem: &'a mut P,
 }
 
-impl<'a, P: PhysMem> PageTable<'a, P> {
+impl PageTable {
     /// Create a new empty page table
-    pub fn new(phys_mem: &'a mut P) -> Option<PageTable<P>> {
+    pub fn new<P: PhysMem>(phys_mem: &mut P) -> Option<PageTable> {
         // Allocate the root level table
         let table = phys_mem.alloc_phys_zeroed(
             Layout::from_size_align(4096, 4096).ok()?)?;
 
         Some(PageTable {
             table,
-            phys_mem,
         })
-    }
-
-    /// Create a new page table from an existing CR3
-    pub fn from_cr3(phys_mem: &'a mut P, cr3: u64) -> PageTable<P> {
-        // Return out the page table with the VPID bits masked off
-        PageTable {
-            table: PhysAddr(cr3 & !0xfff),
-            phys_mem
-        }
     }
 
     /// Get the address of the page table
@@ -94,9 +84,10 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
     /// Create a page table entry at `vaddr` for `size` bytes in length,
     /// `page_type` as the page size. `read`, `write`, and `exec` will be used
     /// as the permission bits.
-    pub unsafe fn map(&mut self, vaddr: VirtAddr, page_type: PageType,
+    pub unsafe fn map<P: PhysMem>(&mut self, 
+            phys_mem: &mut P, vaddr: VirtAddr, page_type: PageType,
             size: u64, read: bool, write: bool, exec: bool) -> Option<()> {
-        self.map_init(
+        self.map_init(phys_mem,
             vaddr, page_type, size, read, write, exec, None::<fn(u64) -> u8>)
     }
 
@@ -107,7 +98,9 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
     /// If `init` is `Some`, it will be invoked with the current offset into
     /// the mapping, and the return value from the closure will be used to
     /// initialize that byte.
-    pub unsafe fn map_init<F>(&mut self, vaddr: VirtAddr, page_type: PageType,
+    pub unsafe fn map_init<F, P: PhysMem>(
+                &mut self, phys_mem: &mut P,
+                vaddr: VirtAddr, page_type: PageType,
                 size: u64, _read: bool, write: bool, exec: bool,
                 init: Option<F>) -> Option<()>
             where F: Fn(u64) -> u8 {
@@ -130,7 +123,7 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
         // Go through each page in this mapping
         for vaddr in (vaddr.0..=end_vaddr).step_by(page_size as usize) {
             // Allocate the page
-            let page = self.phys_mem.alloc_phys(
+            let page = phys_mem.alloc_phys(
                 Layout::from_size_align(page_size as usize,
                                         page_size as usize).ok()?)?;
 
@@ -141,7 +134,7 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
 
             if let Some(init) = &init {
                 // Translate the page
-                let bytes = self.phys_mem.translate(page, page_size as usize)?;
+                let bytes = phys_mem.translate(page, page_size as usize)?;
 
                 // Get access to the memory we just allocated
                 let sliced = core::slice::from_raw_parts_mut(
@@ -153,7 +146,8 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
             }
 
             // Add this mapping to the page table
-            self.map_raw(VirtAddr(vaddr), page_type, ent, true, false, false);
+            self.map_raw(phys_mem,
+                         VirtAddr(vaddr), page_type, ent, true, false, false);
         }
 
         Some(())
@@ -175,16 +169,18 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
     ///                        occurs, and this is `true`, then an `invlpg`
     ///                        will be executed to invalidate the TLBs for the
     ///                        virtual address.
-    pub unsafe fn map_raw(&mut self, vaddr: VirtAddr, page_type: PageType,
-                          raw: u64, add: bool, update: bool,
-                          invlpg_on_update: bool) -> Option<()> {
+    pub unsafe fn map_raw<P: PhysMem>(
+            &mut self, phys_mem: &mut P, vaddr: VirtAddr, page_type: PageType,
+            raw: u64, add: bool, update: bool,
+            invlpg_on_update: bool) -> Option<()> {
         // Get the raw page size in bytes and the mask
         let page_size = page_type as u64;
         let page_mask = page_size - 1;
 
         // Make sure that the virtual address is aligned to the page size
-        // request
-        if (vaddr.0 & page_mask) != 0 {
+        // request and canonical
+        if (vaddr.0 & page_mask) != 0 ||
+                cpu::canonicalize_address(vaddr.0) != vaddr.0 {
             return None;
         }
 
@@ -217,7 +213,7 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
         for (depth, &index) in indicies.iter().enumerate() {
             // Get the physical address of the page table entry
             let ptp = PhysAddr(table.0 + index * size_of::<u64>() as u64);
-            let vad = self.phys_mem.translate(ptp, size_of::<u64>())?;
+            let vad = phys_mem.translate(ptp, size_of::<u64>())?;
 
             // Get the page table entry
             let mut ent = *(vad as *const u64);
@@ -234,7 +230,7 @@ impl<'a, P: PhysMem> PageTable<'a, P> {
                 }
 
                 // Allocate a new table
-                let new_table = self.phys_mem.alloc_phys_zeroed(
+                let new_table = phys_mem.alloc_phys_zeroed(
                     Layout::from_size_align(4096, 4096).ok()?)?;
 
                 // Update the entry

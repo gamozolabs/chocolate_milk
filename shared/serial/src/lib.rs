@@ -5,6 +5,7 @@
 /// A collection of 4 8250A serial ports, as seen on IBM PC systems. These are
 /// the 4 serial ports which are identified by the BIOS, and thus it is limited
 /// to just COM1-COM4.
+#[repr(C)]
 pub struct SerialPort {
     devices: [Option<u16>; 4],
 }
