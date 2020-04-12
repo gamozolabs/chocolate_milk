@@ -1,5 +1,5 @@
 /// All general-purpose registers for 32-bit x86
-#[derive(Default)]
+#[derive(Default, Debug)]
 #[repr(C)]
 pub struct RegisterState {
     pub eax: u32,

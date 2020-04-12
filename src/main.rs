@@ -134,6 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Create a build folder, if it does not exist
     std::fs::create_dir_all("build")?;
     std::fs::create_dir_all("build/bootloader")?;
+    std::fs::create_dir_all("build/kernel")?;
 
     // Create the boot file name
     let bootfile = Path::new("build").join("chocolate_milk.boot");
@@ -187,6 +188,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("Failed to assemble stage0".into());
     }
 
+    // Print some statistics about the bootloader space utilization
     let bl_size = bootfile.metadata()?.len();
     print!("Current bootloader size is {} of {} bytes [{:8.4} %]\n",
         bl_size, MAX_BOOTLOADER_SIZE,
@@ -195,9 +197,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("Bootloader size is too large".into());
     }
     
+    // Build the kernel
+    let kernel_build_dir =
+        Path::new("build").join("kernel").canonicalize()?;
+    let kernel_exe = kernel_build_dir.join("x86_64-pc-windows-msvc")
+        .join("release").join("kernel.exe");
+    if !Command::new("cargo")
+            .current_dir("kernel")
+            .args(&[
+                "build", "--release", "--target-dir",
+                kernel_build_dir.to_str().unwrap()
+            ]).status()?.success() {
+        return Err("Failed to kernel".into());
+    }
+    
     // Deploy the images to the PXE directory
     std::fs::create_dir_all("pxe")?;
     std::fs::copy(bootfile, Path::new("pxe").join("chocolate_milk.boot"))?;
+    std::fs::copy(kernel_exe, Path::new("pxe").join("chocolate_milk.kern"))?;
 
     Ok(())
 }

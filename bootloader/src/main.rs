@@ -1,27 +1,33 @@
 //! Main Rust entry point for the chocolate milk bootloader
 
-#![feature(rustc_private, panic_info_message, alloc_error_handler)]
+#![feature(panic_info_message, alloc_error_handler)]
 #![no_std]
 #![no_main]
 
+extern crate core_reqs;
 extern crate alloc;
 
-mod core_reqs;
 mod realmode;
 mod mm;
 mod panic;
+mod pxe;
 
-use serial::print;
+use pe_parser::PeParser;
 
 #[no_mangle]
 extern fn entry() -> ! {
     serial::init();
     mm::init();
 
-    let mut data = alloc::vec![50];
-    data.push(5);
+    // Download the kernel
+    let kernel = pxe::download("chocolate_milk.kern").unwrap();
 
-    print!("Welcome to the chocolate milk! {:?}\n", data);
+    // Parse the PE from the kernel
+    let pe = PeParser::parse(&kernel).expect("Failed to parse PE");
+    pe.sections(|vaddr, vsize, _raw| {
+        serial::print!("{:#018x} {:#018x}\n", vaddr, vsize);
+        Some(())
+    }).unwrap();
 
     cpu::halt();
 }

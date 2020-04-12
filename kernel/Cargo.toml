@@ -1,5 +1,5 @@
 [package]
-name = "bootloader"
+name = "kernel"
 version = "0.1.0"
 authors = ["Brandon Falk <bfalk@gamozolabs.com>"]
 edition = "2018"
@@ -10,14 +10,10 @@ edition = "2018"
 core_reqs = { path = "../shared/core_reqs" }
 cpu = { path = "../shared/cpu" }
 serial = { path = "../shared/serial" }
-rangeset = { path = "../shared/rangeset" }
-lockcell = { path = "../shared/lockcell" }
-pe_parser = { path = "../shared/pe_parser" }
 
 [profile.release]
 panic = "abort"
-opt-level = "z"
-lto = "fat"
+opt-level = 2
 debug = true
 
 [profile.dev]

@@ -1,6 +1,9 @@
 //! Requirements for Rust libcore. These are just basic libc `mem*()` routines
 //! as well as some intrinsics to get access to 64-bit integers in 32-bit land
 
+#![feature(rustc_private)]
+#![no_std]
+
 extern crate compiler_builtins;
 
 /// libc `memcpy` implementation in Rust

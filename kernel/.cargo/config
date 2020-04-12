@@ -1,0 +1,5 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "relocation-model=static", "-C", "linker=lld-link", "-C", "link-args=/entry:entry /subsystem:native /base:0x133700000000 /filealign:0x1000 /fixed /align:4096 /debug:dwarf /nodefaultlib"]
