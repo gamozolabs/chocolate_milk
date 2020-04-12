@@ -31,7 +31,7 @@ pub extern fn entry(boot_args: &'static BootArgs) -> ! {
     // Initialize the core locals
     core_locals::init(boot_args);
 
-    if cpu::is_bsp() { //core!().id == 0 {
+    if cpu::is_bsp() {
         // One-time initialization for the whole kernel
 
         // Bring up all other cores
