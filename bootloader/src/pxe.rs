@@ -1,9 +1,11 @@
+//! Routines for using the real-mode PXE APIs as provided by the BIOS and/or
+//! option ROMs
+
 use core::convert::TryInto;
 use alloc::vec::Vec;
 
 use crate::realmode::{invoke_realmode, pxecall, RegisterState};
 
-use serial::print;
 use lockcell::LockCell;
 
 /// A guard to prevent multiple uses of the PXE API at the same time
@@ -210,8 +212,6 @@ pub fn download<P: AsRef<[u8]>>(filename: P) -> Option<Vec<u8>> {
         if st.status != 0 || st.packet_size != 512 {
             return None;
         }
-
-        print!("Opened file\n");
     }
 
     // Read the file
@@ -273,8 +273,6 @@ pub fn download<P: AsRef<[u8]>>(filename: P) -> Option<Vec<u8>> {
         }
     }
 
-    print!("Downloaded {} bytes\n", download.len());
-
     // Close file
     {
         const PXE_OPCODE_TFTP_CLOSE: u16 = 0x21;
@@ -292,8 +290,6 @@ pub fn download<P: AsRef<[u8]>>(filename: P) -> Option<Vec<u8>> {
         if status != 0 {
             return None;
         }
-        
-        print!("Closed file\n");
     }
 
     Some(download)

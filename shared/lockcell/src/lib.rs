@@ -4,15 +4,16 @@
 
 use core::ops::{Deref, DerefMut};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering, spin_loop_hint};
+use core::sync::atomic::{AtomicU32, Ordering, spin_loop_hint};
 
 /// A spinlock-guarded variable
+#[repr(C)]
 pub struct LockCell<T: ?Sized> {
     /// Ticket counter to get new tickets to access the `val`
-    ticket: AtomicUsize,
+    ticket: AtomicU32,
 
     /// Current ticket value which can be released
-    release: AtomicUsize,
+    release: AtomicU32,
     
     /// Value which is guarded by locks
     val: UnsafeCell<T>,
@@ -25,8 +26,8 @@ impl<T> LockCell<T> {
     pub const fn new(val: T) -> Self {
         LockCell {
             val:     UnsafeCell::new(val),
-            ticket:  AtomicUsize::new(0),
-            release: AtomicUsize::new(0),
+            ticket:  AtomicU32::new(0),
+            release: AtomicU32::new(0),
         }
     }
 }

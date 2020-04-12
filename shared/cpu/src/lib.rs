@@ -17,6 +17,28 @@ pub unsafe fn in8(addr: u16) -> u8 {
     val
 }
 
+/// Invalidate a page table entry
+#[inline]
+pub unsafe fn invlpg(vaddr: usize) {
+    asm!("invlpg [$0]" :: "r"(vaddr) : "memory" : "volatile", "intel");
+}
+
+/// Write an MSR
+#[inline]
+pub unsafe fn wrmsr(msr: u32, val: u64) {
+    asm!("wrmsr" ::
+         "{ecx}"(msr),
+         "{edx}"((val >> 32) as u32),
+         "{eax}"((val >>  0) as u32) :
+         "memory" : "volatile", "intel");
+}
+
+/// Set the GS
+#[inline]
+pub unsafe fn set_gs_base(base: u64) {
+    wrmsr(0xc000_0101, base);
+}
+
 /// Disable interrupts and halt forever
 #[inline]
 pub fn halt() -> ! {

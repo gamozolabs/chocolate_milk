@@ -354,17 +354,6 @@ lm_entry:
 	mov gs, ax
 	mov ss, ax
 
-	; Enable OSXSAVE
-	;mov rax, cr4
-	;or  rax, 1 << 18
-	;mov cr4, rax
-
-	; Enable AVX512
-	;xor ecx, ecx
-	;xor edx, edx
-	;mov eax, (7 << 5) | 7
-	;xsetbv
-
 	mov rdi, qword [rsp + 0x4] ; Entry point
 	mov rbp, qword [rsp + 0xc] ; Stack
 	sub rbp, 0x28 ; MSFT 64-bit calling convention requires 0x20 homing space
@@ -381,9 +370,4 @@ lm_entry:
 	push qword 0x0008 ; cs
 	push qword rdi    ; rip
 	iretq
-
-	cli
-.halt:
-	hlt
-	jmp short .halt
 

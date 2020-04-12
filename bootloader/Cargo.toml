@@ -13,6 +13,8 @@ serial = { path = "../shared/serial" }
 rangeset = { path = "../shared/rangeset" }
 lockcell = { path = "../shared/lockcell" }
 pe_parser = { path = "../shared/pe_parser" }
+page_table = { path = "../shared/page_table" }
+boot_args = { path = "../shared/boot_args" }
 
 [profile.release]
 panic = "abort"

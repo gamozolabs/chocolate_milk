@@ -1,5 +1,4 @@
 use core::panic::PanicInfo;
-use serial::print;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

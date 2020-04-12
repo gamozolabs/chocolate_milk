@@ -1,5 +1,5 @@
 [package]
-name = "serial"
+name = "page_table"
 version = "0.1.0"
 authors = ["Brandon Falk <bfalk@gamozolabs.com>"]
 edition = "2018"

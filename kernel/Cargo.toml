@@ -10,6 +10,9 @@ edition = "2018"
 core_reqs = { path = "../shared/core_reqs" }
 cpu = { path = "../shared/cpu" }
 serial = { path = "../shared/serial" }
+boot_args = { path = "../shared/boot_args" }
+page_table = { path = "../shared/page_table" }
+rangeset = { path = "../shared/rangeset" }
 
 [profile.release]
 panic = "abort"

@@ -2,4 +2,4 @@
 target = "i586-pc-windows-msvc"
 
 [target.i586-pc-windows-msvc]
-rustflags = ["-C", "relocation-model=static", "-C", "linker=lld-link", "-C", "link-args=/entry:entry /subsystem:native /base:0x6e00 /filealign:0x1000 /fixed /align:16 /debug:dwarf /nodefaultlib ../build/bootloader/asm_routines.obj"]
+rustflags = ["-C", "linker=lld-link", "-C", "link-args=/entry:entry /subsystem:native /base:0x6e00 /filealign:0x1000 /fixed /align:16 /debug:dwarf /nodefaultlib ../build/bootloader/asm_routines.obj"]

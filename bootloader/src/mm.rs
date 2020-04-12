@@ -1,11 +1,40 @@
+//! Memory management routines for the bootloader allocator
+
+use core::convert::TryInto;
 use core::alloc::{GlobalAlloc, Layout};
-use rangeset::{Range, RangeSet};
-use lockcell::LockCell;
+
 use crate::realmode::{RegisterState, invoke_realmode};
 
-/// Physical memory which is available for use. As reported by E820 with the
-/// first 1 MiB of memory removed.
-static PMEM_FREE: LockCell<Option<RangeSet>> = LockCell::new(None);
+use crate::BOOT_ARGS;
+use page_table::{PhysAddr, PhysMem};
+use rangeset::{Range, RangeSet};
+
+/// A wrapper on a range set to allow implementing the `PhysMem` trait
+pub struct PhysicalMemory<'a>(pub &'a mut RangeSet);
+
+impl<'a> PhysMem for PhysicalMemory<'a> {
+    unsafe fn translate(&mut self, paddr: PhysAddr, size: usize)
+            -> Option<*mut u8> {
+        // Can't translate for a 0 size access
+        if size <= 0 {
+            return None;
+        }
+
+        // Convert the physical address into a `usize` which is addressable in
+        // the bootloader
+        let paddr: usize = paddr.0.try_into().ok()?;
+        let _pend: usize = paddr.checked_add(size - 1)?;
+
+        // At this point, `paddr` for `size` bytes fits in the 32-bit address
+        // space we have mapped in!
+        Some(paddr as *mut u8)
+    }
+
+    fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
+        self.0.allocate(layout.size() as u64, layout.align() as u64)
+            .map(|x| PhysAddr(x as u64))
+    }
+}
 
 /// The global allocator for the bootloader, this just uses physical memory as
 /// a backing and does not handle any fancy things like fragmentation. Use this
@@ -20,16 +49,16 @@ struct GlobalAllocator;
 unsafe impl GlobalAlloc for GlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Get access to physical memory
-        let pmem = PMEM_FREE.lock();
-        pmem.and_then(|mut x| {
+        let mut pmem = BOOT_ARGS.free_memory.lock();
+        pmem.as_mut().and_then(|x| {
             x.allocate(layout.size() as u64, layout.align() as u64)
         }).unwrap_or(0) as *mut u8
     }
     
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // Get access to physical memory
-        let pmem = PMEM_FREE.lock();
-        pmem.and_then(|mut x| {
+        let mut pmem = BOOT_ARGS.free_memory.lock();
+        pmem.as_mut().and_then(|x| {
             let end = (ptr as u64)
                 .checked_add(layout.size().checked_sub(1)? as u64)?;
             x.insert(Range { start: ptr as u64, end: end });
@@ -50,7 +79,7 @@ fn alloc_error(_layout: Layout) -> ! {
 pub fn init() {
     // Create a `RangeSet` to hold the memory that is marked free by the
     // BIOS
-    let mut pmem = PMEM_FREE.lock();
+    let mut pmem = BOOT_ARGS.free_memory.lock();
 
     // Make sure we've never initialized the MM before
     assert!(pmem.is_none(), "Attempted to re-initialize the memory manager");
