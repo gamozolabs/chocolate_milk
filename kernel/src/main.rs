@@ -51,25 +51,12 @@ pub extern fn entry(boot_args: PhysAddr) -> ! {
     }
 
     print!("Core ID {} online!\n", core!().id);
-    if core!().id != 0 {
-        cpu::halt();
-    }
-
-    // FREE PAGE 4096
-    // 
-    // [ free idx: 509 ] [ next: PhysAddr(0) ] [ [free pages: u64; 510] ]
-    // [ free idx: 508 ] [ next: PhysAddr(0) ] [ [free pages: u64; 510] ]
-    // ...
-    // [ free idx:   0 ] [ next: PhysAddr(0) ] [ [free pages: u64; 510] ]
-    // [ free idx:  !0 ] [ next: PhysAddr(0) ] [ [free pages: u64; 510] ]
-    // FREE 
-    // [ free idx:  !0 ] [ next: PhysAddr(OLD) ] [ [free pages: u64; 510] ]
-
+    
     for _ in 0u64.. {
         use alloc::vec::Vec;
         
         let it = cpu::rdtsc();
-        let foo: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024 * 1024);
+        let foo: Vec<u8> = Vec::with_capacity(4 * 1024 * 1024 * 1024);
         //let foo = vec![5u128; 1024 * 1024 * 1024];
         let elapsed = cpu::rdtsc() - it;
 

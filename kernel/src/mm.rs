@@ -11,6 +11,7 @@ static NEXT_FREE_VADDR: AtomicU64 = AtomicU64::new(KERNEL_VMEM_BASE);
 
 /// Read a physical address containing a type `T`. This just handles the
 /// windowing and performs a `core::ptr::read_volatile`.
+#[allow(dead_code)]
 pub unsafe fn read_phys<T>(paddr: PhysAddr) -> T {
     let end = (core::mem::size_of::<T>() as u64).checked_sub(1).and_then(|x| {
         x.checked_add(paddr.0)
@@ -34,6 +35,124 @@ pub unsafe fn write_phys<T>(paddr: PhysAddr, val: T) {
         (KERNEL_PHYS_WINDOW_BASE + paddr.0) as *mut T, val);
 }
 
+/// The metadata on a freed page present in the free list. We don't just
+/// directly link the pages together, instead we use the entire 4 KiB of the
+/// freed page to hold a list of pages. This _significantly_ reduces the
+/// thrashing of TLBs during page allocations. This was about a 4x speedup
+/// when allocate 16 GiB virtual allocations using 4 KiB pages compared to
+/// using a linked list of free nodes.
+struct FreeListNode {
+    /// Physical address of the next free `FreeListNode`, could be 0 if the
+    /// list terminates
+    next: PhysAddr,
+
+    /// Number of available slots in `free_pages`. The pages are always
+    /// allocated from offset 509... down to 0. Thus if `free_slots` is 10 that
+    /// means that `free_pages[0..9]` are invalid, and `free_pages[10..]` are
+    /// valid physical addresses of free pages.
+    free_slots: usize,
+    
+    /// Physical addresses of free pages
+    free_pages: [PhysAddr; 510],
+}
+
+impl FreeListNode {
+    unsafe fn from_raw<'a>(paddr: PhysAddr) -> &'a mut FreeListNode {
+        &mut *((KERNEL_PHYS_WINDOW_BASE + paddr.0) as *mut FreeListNode)
+    }
+}
+
+pub struct PageFreeList {
+    head: PhysAddr,
+}
+
+impl PageFreeList {
+    pub fn new() -> Self {
+        assert!(core::mem::size_of::<FreeListNode>() == 4096);
+        PageFreeList { head: PhysAddr(0) }
+    }
+
+    /// Get a page from the free list
+    unsafe fn pop(&mut self) -> PhysAddr {
+        // If the free list is empty
+        if self.head == PhysAddr(0) {
+            const FREE_LIST_BATCH: u64 = 1024 * 1024;
+
+            // Make sure the free list batch is sane
+            assert!(FREE_LIST_BATCH > 0 && FREE_LIST_BATCH % 4096 == 0);
+
+            // Get some bulk memory
+            let alc = {
+                // Get access to physical memory
+                let mut phys_mem = core!().boot_args.free_memory.lock();
+                let phys_mem     = phys_mem.as_mut().unwrap();
+
+                // Bulk allocate some memory to populate the empty free list
+                phys_mem.allocate(FREE_LIST_BATCH, 4096)
+                    .expect("Failed to allocate physical memory") as u64
+            };
+
+            // Populate the free list
+            for paddr in (alc..alc + FREE_LIST_BATCH).step_by(4096) {
+                self.push(PhysAddr(paddr));
+            }
+        }
+
+        // At this point the free list has been populated
+        let node = FreeListNode::from_raw(self.head);
+
+        if node.free_slots < node.free_pages.len() {
+            // Just grab an entry off the `free_pages`
+            let free = node.free_pages[node.free_slots];
+
+            // Note that we used this entry
+            node.free_slots += 1;
+
+            free
+        } else {
+            // The `free_pages` for this level is empty, thus, pop the entire
+            // node and use it as the free page
+
+            // Save off the address of this node
+            let old = self.head;
+
+            // Point the head to the next node
+            self.head = node.next;
+
+            old
+        }
+    }
+
+    unsafe fn push(&mut self, page: PhysAddr) {
+        // If there is no existing free list or the current one is out of slots
+        // to hold pages, then we need to turn this freed page into a new
+        // `FreeListNode`
+        if self.head == PhysAddr(0) ||
+                FreeListNode::from_raw(self.head).free_slots == 0 {
+            // We need to start a new free list node
+            let node = FreeListNode::from_raw(page);
+
+            // Mark that all slots are free
+            node.free_slots = node.free_pages.len();
+
+            // Set the next pointer to the old head
+            node.next = self.head;
+
+            // Head of the free list now points to this node
+            self.head = page;
+        } else {
+            // There is an active free list with room
+            let node = FreeListNode::from_raw(self.head);
+
+            // Decrement number of available slots
+            node.free_slots -= 1;
+
+            // Put our page into this entry
+            node.free_pages[node.free_slots] = page;
+        }
+    }
+}
+
 /// A wrapper on a range set to allow implementing the `PhysMem` trait
 pub struct PhysicalMemory;
 
@@ -54,102 +173,25 @@ impl PhysMem for PhysicalMemory {
 
     fn alloc_phys(&mut self, layout: Layout) -> PhysAddr {
         if layout.size() == 4096 && layout.align() == 4096 {
-            // Special case, a 4-KiB page was requested
+            unsafe { core!().free_list.lock().pop() }
+        } else {
+            // Get access to physical memory
+            let mut phys_mem = core!().boot_args.free_memory.lock();
+            let phys_mem     = phys_mem.as_mut().unwrap();
 
-            // Get access to the free list
-            let mut free_list = core!().free_pages.lock();
-
-            // Get the head of the free list
-            let mut head: PhysAddr = *free_list;
-
-            // Check if the free list is empty
-            if head == PhysAddr(0) {
-                // Free list was empty
-               
-                /// Number of bytes to allocate if the page free list is empty
-                /// This allows pre-allocating from the expensive rangeset
-                /// operations.
-                const BULK_SIZE: u64 = 1024 * 1024;
-
-                assert!(BULK_SIZE % 4096 == 0 && BULK_SIZE > 0,
-                    "Invalid bulk size, must be 4 KiB aligned and non-zero");
-
-                // Get access to physical memory
-                let mut phys_mem = core!().boot_args.free_memory.lock();
-                let phys_mem     = phys_mem.as_mut().unwrap();
-        
-                // Allocate memory in bulk, populating the free list
-                let bulk = phys_mem.allocate(BULK_SIZE, layout.align() as u64)
-                    .map(|x| PhysAddr(x as u64));
-
-                if bulk.is_none() {
-                    // Failed to do bulk allocation, just attempt a normal
-                    // allocation. We've given up on bulk operations.
-                    let addr = phys_mem.allocate(layout.size() as u64,
-                                                 layout.align() as u64)
-                        .expect("Failed to allocate physical memory for page");
-                    return PhysAddr(addr as u64);
-                }
-                let bulk = bulk.unwrap();
-
-                // Go through every physical page we just allocated, except for
-                // the last one, and link them to the next page
-                for paddr in (bulk.0..bulk.0 + BULK_SIZE - 4096).step_by(4096){
-                    let paddr = PhysAddr(paddr);
-                    unsafe {
-                        write_phys(paddr, PhysAddr(paddr.0 + 4096));
-                    }
-                }
-
-                // Terminate the free list by writing a zero to the next
-                // pointer of the final entry
-                unsafe {
-                    write_phys(PhysAddr(bulk.0 + BULK_SIZE - 4096),
-                               PhysAddr(0));
-                }
-
-                // Re-assign the head of the free list. This is now the
-                // complete free list
-                head = bulk;
-            }
-
-            // Free list is not empty, allocate from it
-            
-            // Get the next entry in the free list
-            let next_free: PhysAddr = unsafe {
-                read_phys(head)
-            };
-
-            // Put the next part of the free list back up for use
-            *free_list = next_free;
-
-            // We allocated from the free list
-            return head;
+            // Could not satisfy allocation from free list, allocate
+            // directly from the physical memory pool
+            let alc = phys_mem.allocate(layout.size() as u64,
+                                        layout.align() as u64)
+                .expect("Failed to allocate physical memory");
+            PhysAddr(alc as u64)
         }
-
-        // Get access to physical memory
-        let mut phys_mem = core!().boot_args.free_memory.lock();
-        let phys_mem     = phys_mem.as_mut().unwrap();
-
-        // Could not satisfy allocation from free list, allocate directly from
-        // the physical memory pool
-        let alc = phys_mem.allocate(layout.size() as u64,
-                                    layout.align() as u64)
-            .expect("Failed to allocate physical memory");
-        PhysAddr(alc as u64)
     }
 
     fn free_phys(&mut self, phys: PhysAddr, size: u64) {
         if (phys.0 & 0xfff) == 0 && size == 4096 {
             // Get access to the free list
-            let mut free_list = core!().free_pages.lock();
-
-            // Link up this new page to point to the current free list head
-            unsafe {
-                write_phys::<PhysAddr>(phys, *free_list);
-            }
-
-            *free_list = phys;
+            unsafe { core!().free_list.lock().push(phys); }
         } else {
             // Compute the end address
             let end = size.checked_sub(1).and_then(|x| {

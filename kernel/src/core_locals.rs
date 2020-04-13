@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::mm::PageFreeList;
 use lockcell::LockCell;
 use page_table::PhysAddr;
 use boot_args::{BootArgs, KERNEL_PHYS_WINDOW_BASE};
@@ -25,13 +26,8 @@ pub struct CoreLocals {
     /// A reference to the bootloader arguments
     pub boot_args: &'static BootArgs,
 
-    /// The address of the first free physical page. The free list is a singly
-    /// linked list with the physical address of the next page at offset 0 in
-    /// the free pages. Once a 0 physical address is encountered, the free list
-    /// terminates. This means we cannot have physical address 0 in our free
-    /// list, but the bootloader doesn't allow use of the first 1 MiB of memory
-    /// anyways, so this will never be an issue.
-    pub free_pages: LockCell<PhysAddr>,
+    /// A core local free list of pages
+    pub free_list: LockCell<PageFreeList>,
 }
 
 /// Empty marker trait that requires `Sync`, such that we can compile-time
@@ -81,10 +77,10 @@ pub fn init(boot_args: PhysAddr) {
 
     // Construct the core locals
     let core_locals = CoreLocals {
-        address:    core_local_ptr,
-        id:         CORES_ONLINE.fetch_add(1, Ordering::SeqCst),
-        boot_args:  boot_args,
-        free_pages: LockCell::new(PhysAddr(0)),
+        address:   core_local_ptr,
+        id:        CORES_ONLINE.fetch_add(1, Ordering::SeqCst),
+        boot_args: boot_args,
+        free_list: LockCell::new(PageFreeList::new()),
     };
 
     unsafe {
