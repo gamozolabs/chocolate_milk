@@ -76,6 +76,21 @@ dw 0xaa55
 ; this location.
 stack_avail: db 1
 
+times (0x7f00 - 0x7c00)-($-$$) db 0
+
+[bits 16]
+    cld
+    cli
+
+    mov di, 0xb800
+    mov es, di
+    xor di, di
+    mov cx, 80
+    mov ax, 0x0f41
+    rep stosw
+    cli
+    hlt
+
 times (0x8000 - 0x7c00)-($-$$) db 0
 
 [bits 16]

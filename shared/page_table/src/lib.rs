@@ -16,13 +16,13 @@ pub const PAGE_NX:      u64 = 1 << 63;
 /// page is final
 #[derive(Debug, Clone, Copy)]
 pub struct Mapping {
-    pml4e: Option<PhysAddr>,
-    pdpe:  Option<PhysAddr>,
-    pde:   Option<PhysAddr>,
-    pte:   Option<PhysAddr>,
+    pub pml4e: Option<PhysAddr>,
+    pub pdpe:  Option<PhysAddr>,
+    pub pde:   Option<PhysAddr>,
+    pub pte:   Option<PhysAddr>,
 
     /// Actual address of the base of the page and the offset into it
-    page: Option<(PhysAddr, u64)>,
+    pub page: Option<(PhysAddr, u64)>,
 }
 
 impl Mapping {

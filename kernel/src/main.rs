@@ -14,6 +14,7 @@ extern crate core_reqs;
 #[macro_use] mod print;
 mod panic;
 mod mm;
+mod vmx;
 
 use page_table::PhysAddr;
 
@@ -46,6 +47,8 @@ pub extern fn entry(boot_args: PhysAddr) -> ! {
     }
 
     print!("Core ID {} online!\n", core!().id);
+
+    vmx::vmx_test();
 
     cpu::halt();
 }
