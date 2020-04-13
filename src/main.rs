@@ -22,7 +22,7 @@ fn flatten_pe<P: AsRef<Path>>(filename: P) -> Option<(u32, u32, Vec<u8>)> {
     // Compute the bounds of the _loaded_ image
     let mut image_start = None;
     let mut image_end   = None;
-    pe.sections(|base, size, _raw| {
+    pe.sections(|base, size, _raw, _, _, _| {
         // Convert the size from 32-bits to 64-bits
         let size = size as u64;
         let end  = base.checked_add(size.checked_sub(1)?)?;
@@ -53,7 +53,7 @@ fn flatten_pe<P: AsRef<Path>>(filename: P) -> Option<(u32, u32, Vec<u8>)> {
     let mut flattened = std::vec![0u8; image_size];
 
     // Flatten the image!
-    pe.sections(|base, size, raw | {
+    pe.sections(|base, size, raw, _, _, _| {
         // Find the offset for this section in the flattened image
         let flat_off: usize = (base - image_start).try_into().ok()?;
         let size:     usize = size.try_into().ok()?;

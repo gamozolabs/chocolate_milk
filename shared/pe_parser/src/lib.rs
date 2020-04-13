@@ -5,6 +5,10 @@ use core::convert::TryInto;
 const IMAGE_FILE_MACHINE_I386:   u16 = 0x014c;
 const IMAGE_FILE_MACHINE_X86_64: u16 = 0x8664;
 
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
+const IMAGE_SCN_MEM_READ:    u32 = 0x40000000;
+const IMAGE_SCN_MEM_WRITE:   u32 = 0x80000000;
+
 /// A validated PE file that has had some basic information parsed out of it.
 /// You can use functions on this structure to extract things like sections.
 pub struct PeParser<'a> {
@@ -104,15 +108,16 @@ impl<'a> PeParser<'a> {
     }
 
     /// Invoke a closure with the format
-    /// (virtual addr, virtual size, raw initialize bytes) for each section
-    /// in the PE file
+    /// (virtual addr, virtual size, raw initialize bytes,
+    ///  read, write, execute) for each section in the PE file
     pub fn sections<F>(&self, mut func: F) -> Option<()>
-            where F: FnMut(u64, u32, &[u8]) -> Option<()> {
+            where F: FnMut(u64, u32, &[u8], bool, bool, bool) -> Option<()> {
         let bytes = self.bytes;
 
         for section in 0..self.num_sections {
             let off = self.section_off + section * 0x28;
 
+            // Get the virtual and raw sizes and offsets
             let virt_size = u32::from_le_bytes(
                 bytes[off + 0x8..off + 0xc].try_into().ok()?);
             let virt_addr = u32::from_le_bytes(
@@ -123,6 +128,10 @@ impl<'a> PeParser<'a> {
                 bytes[off + 0x14..off + 0x18].try_into().ok()?)
                 .try_into().ok()?;
 
+            // Get the section characteristics
+            let characteristics = u32::from_le_bytes(
+                bytes[off + 0x24..off + 0x28].try_into().ok()?);
+
             // Truncate the raw size if it exceeds the section size
             let raw_size: usize = core::cmp::min(raw_size, virt_size)
                 .try_into().ok()?;
@@ -131,7 +140,10 @@ impl<'a> PeParser<'a> {
             func(
                 self.image_base.checked_add(virt_addr as u64)?,
                 virt_size,
-                bytes.get(raw_off..raw_off.checked_add(raw_size)?)?)?;
+                bytes.get(raw_off..raw_off.checked_add(raw_size)?)?,
+                (characteristics & IMAGE_SCN_MEM_READ)    != 0,
+                (characteristics & IMAGE_SCN_MEM_WRITE)   != 0,
+                (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0)?;
         }
 
         Some(())

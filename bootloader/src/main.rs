@@ -98,21 +98,25 @@ extern fn entry() -> ! {
             }
 
             // Load all the sections from the PE into the new page table
-            pe.sections(|vaddr, vsize, raw| {
+            pe.sections(|vaddr, vsize, raw, read, write, execute| {
                 // Create a new virtual mapping for the PE range and initialize
                 // it to the raw bytes from the PE file, otherwise to zero for
                 // all bytes that were not initialized in the file.
                 unsafe {
                     table.map_init(&mut pmem, VirtAddr(vaddr),
                         PageType::Page4K,
-                        vsize as u64, true, true, true,
+                        vsize as u64, read, write, execute,
                         Some(|off| {
                             raw.get(off as usize).copied().unwrap_or(0)
                         }));
                 }
 
-                print!("Created map at {:#018x} for {:#018x} bytes\n",
-                       vaddr, vsize);
+                print!("Created map at {:#018x} for {:#018x} bytes | \
+                       perms {}{}{}\n",
+                       vaddr, vsize,
+                       if read    { "R" } else { "-" },
+                       if write   { "W" } else { "-" },
+                       if execute { "X" } else { "-" });
 
                 Some(())
             }).unwrap();

@@ -35,7 +35,6 @@ pub extern fn entry(boot_args: &'static BootArgs) -> ! {
         // One-time initialization for the whole kernel
 
         // Bring up all other cores
-
         unsafe {
             cpu::wrmsr(0x1b, 0xfee0_0000 | (1 << 11) |
                        ((cpu::is_bsp() as u64) << 8));
