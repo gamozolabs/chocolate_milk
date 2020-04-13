@@ -58,6 +58,10 @@ struct FreeListNode {
 
 impl FreeListNode {
     unsafe fn from_raw<'a>(paddr: PhysAddr) -> &'a mut FreeListNode {
+        let end = paddr.0.checked_add(4096 - 1).unwrap();
+        assert!(end < KERNEL_PHYS_WINDOW_SIZE,
+                "Physical address outside of window");
+
         &mut *((KERNEL_PHYS_WINDOW_BASE + paddr.0) as *mut FreeListNode)
     }
 }

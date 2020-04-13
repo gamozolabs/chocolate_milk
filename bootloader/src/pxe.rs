@@ -95,15 +95,9 @@ pub fn download<P: AsRef<[u8]>>(filename: P) -> Option<Vec<u8>> {
             buffer_limit: u16,
         }
 
-        // Buffer to hold the DHCP ACK packet
-        let mut pkt_buf = [0u8; 128];
-
         // Request the DHCP ACK packet
         let mut st = GetCachedInfo::default();
         st.packet_type = PXENV_PACKET_TYPE_DHCP_ACK;
-        st.buffer_size = pkt_buf.len() as u16;
-        st.buffer_seg  = 0;
-        st.buffer_off  = &mut pkt_buf as *mut _ as u16;
         unsafe {
             pxecall(ep_seg, ep_off, PXE_OPCODE_GET_CACHED_INFO,
                 0, &mut st as *mut _ as u16);
@@ -113,6 +107,12 @@ pub fn download<P: AsRef<[u8]>>(filename: P) -> Option<Vec<u8>> {
         if st.status != 0 {
             return None;
         }
+
+        let pkt_buf = unsafe {
+            core::slice::from_raw_parts(
+                segoff_to_linear(st.buffer_seg, st.buffer_off) as *const u8,
+                st.buffer_size as usize)
+        };
 
         // Extract the server IP
         pkt_buf[0x14..0x18].try_into().ok()?

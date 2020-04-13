@@ -51,18 +51,6 @@ pub extern fn entry(boot_args: PhysAddr) -> ! {
     }
 
     print!("Core ID {} online!\n", core!().id);
-    
-    for _ in 0u64.. {
-        use alloc::vec::Vec;
-        
-        let it = cpu::rdtsc();
-        let foo: Vec<u8> = Vec::with_capacity(4 * 1024 * 1024 * 1024);
-        //let foo = vec![5u128; 1024 * 1024 * 1024];
-        let elapsed = cpu::rdtsc() - it;
-
-        print!("Elapsed {:12.4} Mcyc {:p}\n", elapsed as f64 / 1_000_000.,
-               foo.as_ptr());
-    }
 
     cpu::halt();
 }

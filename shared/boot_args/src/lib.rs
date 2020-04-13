@@ -34,7 +34,7 @@ pub const KERNEL_STACK_SIZE: u64 = 32 * 1024;
 pub const KERNEL_STACK_PAD: u64 = 32 * 1024;
 
 /// Size of the kernel physical window (in bytes)
-pub const KERNEL_PHYS_WINDOW_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+pub const KERNEL_PHYS_WINDOW_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Structures to pass between both the 32-bit and 64-bit modes. This structure
 /// MUST be identical in both modes. Thus, no using pointers, references, or
