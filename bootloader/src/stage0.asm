@@ -49,6 +49,7 @@ pm_entry:
     mov esp, 0x7c00
 
     ; Jump into Rust! (entry_point is a defined variable during build)
+    push dword bootloader_end
     call entry_point
 
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -84,4 +85,7 @@ ap_entry:
 
 times (0x8100 - 0x7c00)-($-$$) db 0
 incbin "build/chocolate_milk.flat"
+
+; A marker for the end of the bootloader
+bootloader_end:
 

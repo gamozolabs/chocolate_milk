@@ -1,6 +1,8 @@
 //! Requirements for Rust libcore. These are just basic libc `mem*()` routines
 //! as well as some intrinsics to get access to 64-bit integers in 32-bit land
 
+#![feature(global_asm)]
+
 #![no_std]
 
 /// libc `memcpy` implementation in Rust
@@ -90,6 +92,15 @@ pub unsafe extern fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
     
     0
 }
+
+// Making a fake __CxxFrameHandler3 in Rust causes a panic, this is hacky
+// workaround where we declare it as a function that will just crash if it.
+// We should never hit this so it doesn't matter.
+global_asm!(r#"
+    .global __CxxFrameHandler3
+    __CxxFrameHandler3:
+        ud2
+"#);
 
 #[export_name="_fltused"]
 pub static FLTUSED: usize = 0;

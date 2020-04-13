@@ -308,10 +308,13 @@ _enter64:
 	; qword [esp + 0x04] - Entry
 	; qword [esp + 0x0c] - Stack
 	; qword [esp + 0x14] - Param
-	; dword [esp + 0x1c] - New cr3
+	; dword [esp + 0x1c] - Kernel cr3
+	; dword [esp + 0x20] - Trampoline cr3
+    ; qword [esp + 0x24] - Physical window address
 
 	; Get the parameters passed in to this function
-	mov esi, [esp+0x1c] ; New cr3
+	mov esi, [esp+0x20] ; Trampoline cr3
+	mov ebx, [esp+0x1c] ; Kernel cr3
 
 	; Set up CR3
 	mov cr3, esi
@@ -353,21 +356,27 @@ lm_entry:
 	mov fs, ax
 	mov gs, ax
 	mov ss, ax
+	
+    ; Set up a long jump to switch from the identity memory map, to the linear
+    ; physical memory map
+    mov rax, qword [rsp + 0x24] ; Physical window address
+    add rax, .addr
+    jmp rax
+   
+.addr:
+	mov rcx, qword [rsp + 0x14] ; Parameter
+	mov rdi, qword [rsp + 0x04] ; Entry point
+	mov rsp, qword [rsp + 0x0c] ; Stack
 
-	mov rdi, qword [rsp + 0x4] ; Entry point
-	mov rbp, qword [rsp + 0xc] ; Stack
-	sub rbp, 0x28 ; MSFT 64-bit calling convention requires 0x20 homing space
+    ; At this point the stack and RIP both point to the linear physical map
+    ; rather than the identity physical map, so we can now safely switch to
+    ; the kernel cr3
+    mov cr3, rbx
+
+	sub rsp, 0x28 ; MSFT 64-bit calling convention requires 0x20 homing space
                   ; We also need 8 bytes for the fake 'return address' since we
                   ; iretq rather than call.
-
-	; Parameter
-	mov rcx, qword [esp + 0x14]
-
-	; Set up a long jump via an iretq to jump to long mode.
-	push qword 0x0010 ; ss
-	push qword rbp    ; rsp
-	pushfq            ; rflags
-	push qword 0x0008 ; cs
-	push qword rdi    ; rip
-	iretq
+    
+    ; Jump into the kernel entry
+    jmp rdi
 

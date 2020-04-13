@@ -2,7 +2,9 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use boot_args::BootArgs;
+use lockcell::LockCell;
+use page_table::PhysAddr;
+use boot_args::{BootArgs, KERNEL_PHYS_WINDOW_BASE};
 
 /// A counter of all cores online
 static CORES_ONLINE: AtomicUsize = AtomicUsize::new(0);
@@ -22,6 +24,14 @@ pub struct CoreLocals {
 
     /// A reference to the bootloader arguments
     pub boot_args: &'static BootArgs,
+
+    /// The address of the first free physical page. The free list is a singly
+    /// linked list with the physical address of the next page at offset 0 in
+    /// the free pages. Once a 0 physical address is encountered, the free list
+    /// terminates. This means we cannot have physical address 0 in our free
+    /// list, but the bootloader doesn't allow use of the first 1 MiB of memory
+    /// anyways, so this will never be an issue.
+    pub free_pages: LockCell<PhysAddr>,
 }
 
 /// Empty marker trait that requires `Sync`, such that we can compile-time
@@ -53,7 +63,12 @@ pub fn get_core_locals() -> &'static CoreLocals {
 }
 
 /// Initialize the locals for this core
-pub fn init(boot_args: &'static BootArgs) {
+pub fn init(boot_args: PhysAddr) {
+    // Convert the physical boot args pointer into the linear mapping
+    let boot_args: &'static BootArgs = unsafe {
+        &*((boot_args.0 + KERNEL_PHYS_WINDOW_BASE) as *const BootArgs)
+    };
+
     // Get access to the physical memory allocator
     let mut pmem = boot_args.free_memory.lock();
     let pmem = pmem.as_mut().unwrap();
@@ -61,13 +76,15 @@ pub fn init(boot_args: &'static BootArgs) {
     // Allocate the core locals
     let core_local_ptr = pmem.allocate(
         core::mem::size_of::<CoreLocals>() as u64,
-        core::mem::align_of::<CoreLocals>() as u64).unwrap();
+        core::mem::align_of::<CoreLocals>() as u64).unwrap() +
+        KERNEL_PHYS_WINDOW_BASE as usize;
 
     // Construct the core locals
     let core_locals = CoreLocals {
-        address:   core_local_ptr,
-        id:        CORES_ONLINE.fetch_add(1, Ordering::SeqCst),
-        boot_args: boot_args,
+        address:    core_local_ptr,
+        id:         CORES_ONLINE.fetch_add(1, Ordering::SeqCst),
+        boot_args:  boot_args,
+        free_pages: LockCell::new(PhysAddr(0)),
     };
 
     unsafe {

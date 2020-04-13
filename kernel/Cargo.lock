@@ -25,6 +25,7 @@ dependencies = [
  "boot_args",
  "core_reqs",
  "cpu",
+ "lockcell",
  "page_table",
  "rangeset",
  "serial",

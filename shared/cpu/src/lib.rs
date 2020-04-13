@@ -55,6 +55,20 @@ pub unsafe fn wrmsr(msr: u32, val: u64) {
          "memory" : "volatile", "intel");
 }
 
+/// Read the time stamp counter
+#[inline]
+pub fn rdtsc() -> u64 {
+    let val_lo: u32;
+    let val_hi: u32;
+
+    unsafe {
+        asm!("rdtsc" : "={edx}"(val_hi), "={eax}"(val_lo) ::
+             "memory" : "volatile", "intel");
+    }
+
+    ((val_hi as u64) << 32) | val_lo as u64
+}
+
 /// Set the GS
 #[inline]
 pub unsafe fn set_gs_base(base: u64) {
