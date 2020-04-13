@@ -20,12 +20,7 @@ use page_table::PhysAddr;
 /// Release the early boot stack such that other cores can use it by marking
 /// it as available
 fn release_early_stack() {
-    use core::sync::atomic::{AtomicU8, Ordering};
-
-    unsafe {
-        (*((0x7e00 + boot_args::KERNEL_PHYS_WINDOW_BASE) as
-           *const AtomicU8)).store(1, Ordering::SeqCst);
-    }
+    unsafe { mm::write_phys(PhysAddr(0x7e00), 1u8); }
 }
 
 #[no_mangle]
