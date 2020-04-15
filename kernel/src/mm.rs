@@ -263,8 +263,7 @@ unsafe impl GlobalAlloc for GlobalAllocator {
         let page_table = page_table.as_mut().unwrap();
 
         // Free the memory
-        page_table.free(&mut pmem, VirtAddr(ptr as u64), alignsize)
-            .expect("Failed to free virtual memory in dealloc");
+        page_table.free(&mut pmem, VirtAddr(ptr as u64), alignsize);
     }
 }
 

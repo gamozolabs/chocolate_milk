@@ -1,19 +1,14 @@
 use core::panic::PanicInfo;
 
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    print!("PANIC:");
-    
-    if let Some(loc) = info.location() {
-        print!(" {}:{}:{}", loc.file(), loc.line(),
-            loc.column());
-    }
-    
-    if let Some(msg) = info.message() {
-        print!(" {}", msg);
-    }
+fn panic(_info: &PanicInfo) -> ! {
+    // Get access to the serial port
+    let mut serial = crate::BOOT_ARGS.serial.lock();
 
-    print!("\n");
+    if let Some(serial) = serial.as_mut() {
+        // Write out the panic message if there is an active serial driver
+        serial.write(b"PANIC in bootloader\n");
+    }
 
     cpu::halt();
 }

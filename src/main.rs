@@ -14,15 +14,22 @@ const BOOTLOADER_BASE: u32 = 0x8100;
 const MAX_BOOTLOADER_SIZE: u64 = 32 * 1024;
 
 /// Create a flattened PE image
-/// Returns a tuple (entry point vaddr, base vaddr, image)
-fn flatten_pe<P: AsRef<Path>>(filename: P) -> Option<(u32, u32, Vec<u8>)> {
+/// Returns a tuple (entry point vaddr, base vaddr, image, reinit data)
+fn flatten_pe<P: AsRef<Path>>(filename: P)
+        -> Option<(u32, u32, Vec<u8>, Vec<u8>)> {
     let pe = std::fs::read(filename).ok()?;
     let pe = PeParser::parse(&pe)?;
+
+    // Holds a stream of [vaddr: u32][size: u32][data to init]
+    // This is expected to be used to re-initialize the writable data sections
+    // in the bootloader such that a soft reboot can reset the bootloader
+    // state to its initial states.
+    let mut reinit = Vec::new();
 
     // Compute the bounds of the _loaded_ image
     let mut image_start = None;
     let mut image_end   = None;
-    pe.sections(|base, size, _raw, _, _, _| {
+    pe.sections(|base, size, raw, _, write, _| {
         // Convert the size from 32-bits to 64-bits
         let size = size as u64;
         let end  = base.checked_add(size.checked_sub(1)?)?;
@@ -31,6 +38,19 @@ fn flatten_pe<P: AsRef<Path>>(filename: P) -> Option<(u32, u32, Vec<u8>)> {
         if image_start.is_none() {
             image_start = Some(base);
             image_end   = Some(end);
+        }
+
+        if write && raw.len() > 0 {
+            // For sections which are writable and have initialized data from
+            // the PE file, we want to record this information so the
+            // bootloader can reinitialize itself.
+            
+            let base: u32 = base.try_into().ok()?;
+            let size: u32 = raw.len().try_into().ok()?;
+
+            reinit.extend_from_slice(&base.to_le_bytes());
+            reinit.extend_from_slice(&size.to_le_bytes());
+            reinit.extend_from_slice(raw);
         }
 
         // Find the lowest base address
@@ -76,7 +96,8 @@ fn flatten_pe<P: AsRef<Path>>(filename: P) -> Option<(u32, u32, Vec<u8>)> {
     Some((
             pe.entry_point.try_into().ok()?,
             image_start.try_into().ok()?,
-            flattened
+            flattened,
+            reinit
     ))
 }
 
@@ -142,7 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Build the assembly routines for the bootloader
     if !Command::new("nasm")
             .args(&["-f", "win32",
-                &format!("-DPROGRAM_BASE={:#x}", BOOTLOADER_BASE),
+                "-DPROGRAM_BASE=0x7c00",
                 Path::new("bootloader").join("src").join("asm_routines.asm")
                 .to_str().unwrap(),
                 "-o", Path::new("build").join("bootloader")
@@ -164,7 +185,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Flatten the PE image
-    let (entry, base, image) =
+    let (entry, base, image, reinit) =
         flatten_pe(bootloader_build_dir.join("i586-pc-windows-msvc")
             .join("release").join("bootloader.exe"))
         .ok_or("Failed to flatten bootloader PE image")?;
@@ -177,6 +198,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Write out the flattened bootloader image
     std::fs::write(Path::new("build").join("chocolate_milk.flat"), image)?;
+
+    // Write out the bootloader reinit information
+    std::fs::write(Path::new("build").join("chocolate_milk.reinit"), reinit)?;
 
     // Build the stage0
     let stage0 = Path::new("bootloader").join("src").join("stage0.asm");

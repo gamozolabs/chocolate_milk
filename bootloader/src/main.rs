@@ -10,7 +10,6 @@ extern crate core_reqs;
 #[allow(unused_imports)]
 #[macro_use] extern crate alloc;
 
-#[macro_use] mod print;
 mod realmode;
 mod mm;
 mod panic;
@@ -24,6 +23,7 @@ use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_STACK_SIZE, KERNEL_STACK_PAD};
 use pe_parser::PeParser;
 use lockcell::LockCell;
 use page_table::{VirtAddr, PageType, PageTable, PAGE_PRESENT, PAGE_WRITE};
+use page_table::{PhysAddr, PAGE_SIZE};
 
 /// Global arguments shared between the kernel and bootloader. It is critical
 /// that every structure in here is identical in shape between both 64-bit
@@ -36,30 +36,42 @@ pub static BOOT_ARGS: BootArgs = BootArgs {
     kernel_entry:          LockCell::new(None),
     stack_vaddr:           AtomicU64::new(KERNEL_STACKS_BASE),
     print_lock:            LockCell::new(()),
+    soft_reboot_addr:      LockCell::new(None),
 };
 
 /// Rust entry point for the bootloader
 ///
 /// * `bootloader_end` - One byte past the end of the bootloader
 #[no_mangle]
-extern fn entry(bootloader_end: usize) -> ! {
+extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
+                _num_boots: u64) -> ! {
     // Initialize the serial driver
     {
         // Get access to the serial driver
         let mut serial = BOOT_ARGS.serial.lock();
 
         if serial.is_none() {
-            // Driver has not yet been set up, initialize the ports
-            *serial = Some(unsafe { SerialPort::new() });
+            // Create a new serial driver
+            let mut driver = unsafe { SerialPort::new() };
 
-            // "clear" the screen
-            core::mem::drop(serial);
+            // "Clear" the screen
             for _ in 0..100 {
-                print!("\n");
+                //driver.write(b"\n");
             }
-    
-            print!("Chocolate Milk bootloader starting...\n");
-            print!("Bootloader end at {:#x}\n", bootloader_end);
+
+            // Print the bootloader banner
+            driver.write(b"Chocolate Milk bootloader starting...\n");
+
+            // Store the driver in the `BOOT_ARGS`
+            *serial = Some(driver);
+        }
+    }
+
+    {
+        // Store information about the soft reboot address
+        let mut sra = BOOT_ARGS.soft_reboot_addr.lock();
+        if sra.is_none() {
+            *sra = Some(PhysAddr(soft_reboot_entry as u64));
         }
     }
 
@@ -78,8 +90,14 @@ extern fn entry(bootloader_end: usize) -> ! {
                 "Page tables set up before kernel!?");
 
             // Download the kernel
-            let kernel = pxe::download("chocolate_milk.kern")
-                .expect("Failed to download chocolate_milk.kern over TFTP");
+            let kernel = loop {
+                if let Some(kern) = pxe::download("chocolate_milk.kern") {
+                    break kern;
+                }
+            
+                BOOT_ARGS.serial.lock().as_mut().unwrap()
+                    .write(b"Kernel download failed, retrying\n");
+            };
 
             // Parse the PE from the kernel
             let pe = PeParser::parse(&kernel).expect("Failed to parse PE");
@@ -114,13 +132,64 @@ extern fn entry(bootloader_end: usize) -> ! {
             // Create a new page table
             let mut table = PageTable::new(&mut pmem);
 
-            // Create a linear map of physical memory
-            for paddr in (0..KERNEL_PHYS_WINDOW_SIZE).step_by(4096) {
-                unsafe {
-                    table.map_raw(&mut pmem,
-                        VirtAddr(KERNEL_PHYS_WINDOW_BASE + paddr),
-                        PageType::Page4K,
-                        paddr | PAGE_WRITE | PAGE_PRESENT).unwrap();
+            // Get the support CPU features
+            let features = cpu::get_cpu_features();
+
+            // Create the linear map of physical memory, using the largest page
+            // size available on this processor
+            if features.gbyte_pages {
+                // Use 1 GiB pages if supported
+                
+                const MAX_PAGE_SIZE: u64 = 1024 * 1024 * 1024;
+                assert!((KERNEL_PHYS_WINDOW_SIZE % MAX_PAGE_SIZE) == 0,
+                    "KERNEL_PHYS_WINDOW_SIZE not mod page size");
+                
+                // Create a linear map of physical memory
+                for paddr in (0..KERNEL_PHYS_WINDOW_SIZE)
+                        .step_by(MAX_PAGE_SIZE as usize) {
+                    unsafe {
+                        table.map_raw(&mut pmem,
+                            VirtAddr(KERNEL_PHYS_WINDOW_BASE + paddr),
+                            PageType::Page1G,
+                            paddr | PAGE_SIZE | PAGE_WRITE | PAGE_PRESENT)
+                            .unwrap();
+                    }
+                }
+            } else if features.pse {
+                // Use 2 MiB pages if supported
+                
+                const MAX_PAGE_SIZE: u64 = 2 * 1024 * 1024;
+                assert!((KERNEL_PHYS_WINDOW_SIZE % MAX_PAGE_SIZE) == 0,
+                    "KERNEL_PHYS_WINDOW_SIZE not mod page size");
+                
+                // Create a linear map of physical memory
+                for paddr in (0..KERNEL_PHYS_WINDOW_SIZE)
+                        .step_by(MAX_PAGE_SIZE as usize) {
+                    unsafe {
+                        table.map_raw(&mut pmem,
+                            VirtAddr(KERNEL_PHYS_WINDOW_BASE + paddr),
+                            PageType::Page2M,
+                            paddr | PAGE_SIZE | PAGE_WRITE | PAGE_PRESENT)
+                            .unwrap();
+                    }
+                }
+            } else {
+                // Fall back to good ol' 4 KiB pages
+                
+                const MAX_PAGE_SIZE: u64 = 4 * 1024;
+                assert!((KERNEL_PHYS_WINDOW_SIZE % MAX_PAGE_SIZE) == 0,
+                    "KERNEL_PHYS_WINDOW_SIZE not mod page size");
+                
+                // Create a linear map of physical memory
+                for paddr in (0..KERNEL_PHYS_WINDOW_SIZE)
+                        .step_by(MAX_PAGE_SIZE as usize) {
+                    unsafe {
+                        table.map_raw(&mut pmem,
+                            VirtAddr(KERNEL_PHYS_WINDOW_BASE + paddr),
+                            PageType::Page4K,
+                            paddr | PAGE_WRITE | PAGE_PRESENT)
+                            .unwrap();
+                    }
                 }
             }
 
@@ -136,17 +205,8 @@ extern fn entry(bootloader_end: usize) -> ! {
                         raw.get(off as usize).copied().unwrap_or(0)
                     }));
 
-                print!("Created map at {:#018x} for {:#018x} bytes | \
-                       perms {}{}{}\n",
-                       vaddr, vsize,
-                       if read    { "R" } else { "-" },
-                       if write   { "W" } else { "-" },
-                       if execute { "X" } else { "-" });
-
                 Some(())
             }).unwrap();
-
-            print!("Entry point is {:#x}\n", pe.entry_point);
 
             // Set up the entry point and page table
             *kernel_entry = Some(pe.entry_point);

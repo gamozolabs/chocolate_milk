@@ -50,7 +50,7 @@ impl SerialPort {
     }
 
     /// Write a byte to a COM port
-    pub fn write_byte(&mut self, port: usize, byte: u8) {
+    fn write_byte(&mut self, port: usize, byte: u8) {
         // Write a CR prior to all LFs
         if byte == b'\n' { self.write_byte(port, b'\r'); }
 

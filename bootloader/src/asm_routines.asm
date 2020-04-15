@@ -23,7 +23,6 @@ section .text
 global _invoke_realmode
 _invoke_realmode:
 	pushad
-	lgdt [rmgdt]
 
 	; Set all selectors to data segments
 	mov ax, 0x10
@@ -120,21 +119,13 @@ _invoke_realmode:
 	pop dword [eax + register_state.ecx]
 	pop dword [eax + register_state.eax]
 
-	; Load data segment for lgdt
-	mov  ax, (PROGRAM_BASE >> 4)
-	mov  ds, ax
-
 	; Enable protected mode
 	mov eax, cr0
 	or  eax, 1
 	mov cr0, eax
 
-	; Load 32-bit protected mode GDT
-	mov  eax, (pmgdt - PROGRAM_BASE)
-	lgdt [eax]
-
 	; Set all segments to data segments
-	mov ax, 0x10
+	mov ax, 0x20
 	mov es, ax
 	mov ds, ax
 	mov fs, ax
@@ -143,7 +134,7 @@ _invoke_realmode:
 
 	; Long jump back to protected mode.
 	pushfd             ; eflags
-	push dword 0x0008  ; cs
+	push dword 0x0018  ; cs
 	push dword backout ; eip
 	iretd
 
@@ -152,7 +143,6 @@ _invoke_realmode:
 global _pxecall
 _pxecall:
 	pushad
-	lgdt [rmgdt]
 
 	; Set all selectors to data segments
 	mov ax, 0x10
@@ -219,21 +209,13 @@ _pxecall:
 	; Clean up the stack from the 3 word parameters we passed to PXE
 	add sp, 6
 
-	; Load data segment for lgdt
-	mov ax, (PROGRAM_BASE >> 4)
-	mov ds, ax
-
 	; Enable protected mode
 	mov eax, cr0
 	or  eax, 1
 	mov cr0, eax
 
-	; Load 32-bit protected mode GDT
-	mov  eax, (pmgdt - PROGRAM_BASE)
-	lgdt [eax]
-
 	; Set all segments to data segments
-	mov ax, 0x10
+	mov ax, 0x20
 	mov es, ax
 	mov ds, ax
 	mov fs, ax
@@ -242,7 +224,7 @@ _pxecall:
 
 	; Jump back to protected mode
 	pushfd             ; eflags
-	push dword 0x0008  ; cs
+	push dword 0x0018  ; cs
 	push dword backout ; eip
 	iretd
 
@@ -250,58 +232,6 @@ _pxecall:
 backout:
 	popad
 	ret
-
-section .data
-
-; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-; 16-bit real mode GDT
-
-align 8
-rmgdt_base:
-	; Null descriptor
-	dq 0x0000000000000000
-
-	; 16-bit RO code, base PROGRAM_BASE, limit 0x0000ffff
-	dq 0x00009a000000ffff | (PROGRAM_BASE << 16)
-
-	; 16-bit RW data, base 0, limit 0x0000ffff
-	dq 0x000092000000ffff
-
-rmgdt:
-	dw (rmgdt - rmgdt_base) - 1
-	dd rmgdt_base
-
-; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-; 32-bit protected mode GDT
-
-align 8
-pmgdt_base:
-	dq 0x0000000000000000 ; Null descriptor
-	dq 0x00CF9A000000FFFF
-	dq 0x00CF92000000FFFF
-
-pmgdt:
-	dw (pmgdt - pmgdt_base) - 1
-	dd pmgdt_base
-
-; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-; 64-bit long mode GDT
-
-align 8
-lmgdt_base:
-	dq 0x0000000000000000 ; Null descriptor
-	dq 0x00209a0000000000 ; 64-bit, present, code
-	dq 0x0000920000000000 ; Present, data r/w
-
-lmgdt:
-	dw (lmgdt - lmgdt_base) - 1
-	dd lmgdt_base
-	dd 0
-
-[bits 32]
 
 global _enter64
 _enter64:
@@ -333,24 +263,21 @@ _enter64:
 	mov cr4, eax
 
 	xor eax, eax
-	and eax, ~(1 <<  2) ; Clear Emulation flag
 	or  eax,  (1 <<  0) ; Protected mode enable
-	or  eax,  (1 <<  1) ; Monitor co-processor
+    or  eax,  (1 <<  1) ; Monitor co-processor
+	and eax, ~(1 <<  2) ; Clear Emulation flag
 	or  eax,  (1 << 16) ; Write protect
 	or  eax,  (1 << 31) ; Paging enable
 	mov cr0, eax
 
-	; Load the 64-bit long mode GDT
-	lgdt [lmgdt]
-
 	; Long jump to enable long mode!
-	jmp 0x0008:lm_entry
+	jmp 0x0028:lm_entry
 
 [bits 64]
 
 lm_entry:
 	; Set all selectors to 64-bit data segments
-	mov ax, 0x10
+	mov ax, 0x30
 	mov es, ax
 	mov ds, ax
 	mov fs, ax

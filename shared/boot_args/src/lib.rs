@@ -14,7 +14,7 @@ use core::sync::atomic::AtomicU64;
 use serial::SerialPort;
 use rangeset::RangeSet;
 use lockcell::LockCell;
-use page_table::PageTable;
+use page_table::{PhysAddr, PageTable};
 
 /// Base vaddr to use for kernel stacks
 pub const KERNEL_STACKS_BASE: u64 = 0x0000_7473_0000_0000;
@@ -77,5 +77,8 @@ pub struct BootArgs {
 
     /// A lock to be used to make `print!()` macros fully atomic
     pub print_lock: LockCell<()>,
+
+    /// Address of the soft reboot entry point
+    pub soft_reboot_addr: LockCell<Option<PhysAddr>>,
 }
 

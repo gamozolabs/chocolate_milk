@@ -118,9 +118,6 @@ pub fn download<P: AsRef<[u8]>>(filename: P) -> Option<Vec<u8>> {
         pkt_buf[0x14..0x18].try_into().ok()?
     };
 
-    print!("TFTP Server IP: {}.{}.{}.{}\n",
-                   server_ip[0], server_ip[1], server_ip[2], server_ip[3]);
-
     // Get the file size for the next stage
     let file_size = {
         const PXE_OPCODE_TFTP_GET_FILE_SIZE: u16 = 0x25;
@@ -165,9 +162,6 @@ pub fn download<P: AsRef<[u8]>>(filename: P) -> Option<Vec<u8>> {
 
         st.file_size as usize
     };
-
-    print!("Requested file \"{}\" is {} bytes\n",
-        core::str::from_utf8(filename).ok()?, file_size);
 
     // Open the file
     {

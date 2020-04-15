@@ -208,8 +208,7 @@ impl PageTable {
 
                     if mapped > 0 {
                         // Free everything that we mapped up until the failure
-                        self.free(phys_mem, orig_vaddr, mapped)
-                            .expect("Failed to free what we just mapped");
+                        self.free(phys_mem, orig_vaddr, mapped);
                     }
 
                     return None;
@@ -225,135 +224,167 @@ impl PageTable {
     /// page tables which no longer contain any mappings will be unlinked from
     /// the table and also freed.
     pub unsafe fn free<P: PhysMem>(&mut self, phys_mem: &mut P,
-                                   vaddr: VirtAddr, size: u64) -> Option<()> {
+                                   vaddr: VirtAddr, size: u64) {
         // Determine the end of the mapping
-        let end = vaddr.0.checked_add(size.checked_sub(1)?)?;
+        let end = vaddr.0.checked_add(
+            size.checked_sub(1).expect("Virtual free of zero bytes"))
+            .expect("Integer overflow on virtual free range");
 
-        // Amount of virtual memory that will be freed by this operation
-        // (in bytes)
-        let mut to_free = 0u64;
+        // Accumulate the number of bytes that have been freed
+        let mut freed = 0u64;
 
-        // We go through the memory range twice. The first time we validate
-        // that all virtual memory in the range requested is present and valid.
-        //
-        // The second time, we actually perform the frees
-        for &validate in &[true, false] {
-            // Translate the initial page
-            let mut cur_page = self.translate(phys_mem, vaddr)?;
-            
-            loop {
-                // Check to see if we're on the validate pass
-                if validate {
-                    // Return failure if the page is not present
-                    if cur_page.page.is_none() { return None; }
+        // Translate the initial page
+        let mut cur_page = self.translate(phys_mem, vaddr).unwrap();
+        
+        loop {
+            // Get the virtual address and size of this page
+            let page_vaddr = cur_page.virt_base().unwrap();
+            let page_size  = cur_page.size().unwrap();
+ 
+            // Get the physical address of the page table entries for
+            // the entry we're about to free
+            let mut table_entries = [PhysAddr(0); 4];
+            let table_entries = match page_size {
+                PageType::Page4K => {
+                    table_entries[0] = cur_page.pml4e.unwrap();
+                    table_entries[1] = cur_page.pdpe.unwrap();
+                    table_entries[2] = cur_page.pde.unwrap();
+                    table_entries[3] = cur_page.pte.unwrap();
+                    &table_entries[..4]
+                }
+                PageType::Page2M => {
+                    table_entries[0] = cur_page.pml4e.unwrap();
+                    table_entries[1] = cur_page.pdpe.unwrap();
+                    table_entries[2] = cur_page.pde.unwrap();
+                    &table_entries[..3]
+                }
+                PageType::Page1G => {
+                    table_entries[0] = cur_page.pml4e.unwrap();
+                    table_entries[1] = cur_page.pdpe.unwrap();
+                    &table_entries[..2]
+                }
+            };
 
-                    // Accumulate the amount of virtual memory we're going to
-                    // free
-                    to_free += cur_page.size()? as u64;
-                } else {
-                    // We should not return failure anywhere inside of this
-                    // stage. We must panic if we cannot do something we want.
-                    // Otherwise we violate the semantics of all-or-none frees.
+            // Go up the page table listing
+            'next_level: for (ii, &entry) in
+                    table_entries.iter().enumerate().rev() {
+                // Convert the table entry into a virtual address
+                let vad = phys_mem.translate(
+                    entry, core::mem::size_of::<u64>());
 
-                    let page_vaddr = cur_page.virt_base().unwrap();
-                    let page_size  = cur_page.size().unwrap();
-                    
-                    // Get the physical address of the page table entries for
-                    // the entry we're about to free
-                    let mut table_entries = [PhysAddr(0); 4];
-                    let table_entries = match page_size {
-                        PageType::Page4K => {
-                            table_entries[0] = cur_page.pml4e.unwrap();
-                            table_entries[1] = cur_page.pdpe.unwrap();
-                            table_entries[2] = cur_page.pde.unwrap();
-                            table_entries[3] = cur_page.pte.unwrap();
-                            &table_entries[..4]
-                        }
-                        PageType::Page2M => {
-                            table_entries[0] = cur_page.pml4e.unwrap();
-                            table_entries[1] = cur_page.pdpe.unwrap();
-                            table_entries[2] = cur_page.pde.unwrap();
-                            &table_entries[..3]
-                        }
-                        PageType::Page1G => {
-                            table_entries[0] = cur_page.pml4e.unwrap();
-                            table_entries[1] = cur_page.pdpe.unwrap();
-                            &table_entries[..2]
-                        }
-                    };
+                // Unmap this entry as it is no longer used
+                core::ptr::write(vad as *mut u64, 0);
+                
+                if ii > 0 {
+                    // If there is a table level above us, then check
+                    // to see how many pages are being described at
+                    // this level. If there are no more mapped pages
+                    // after updated the number of pages, then we can
+                    // free the table itself.
+                
+                    // Get the table above us to get the number of
+                    // pages mapped in that entry
+                    let next_entry = table_entries[ii - 1];
 
-                    // Go up the page table listing
-                    for entry in table_entries.iter().rev() {
-                        // Get the index of the table entry for this level
-                        let idx = (entry.0 & 0xfff) as usize /
-                            core::mem::size_of::<u64>();
+                    // Get the virtual address of the next entry
+                    let nvad = phys_mem.translate(
+                        next_entry, core::mem::size_of::<u64>());
 
-                        // Get the base for the entire 512-entry table for this
-                        // level
-                        let ptable = PhysAddr(entry.0 & !0xfff);
+                    // Read the next entry
+                    let nent = core::ptr::read(nvad as *const u64);
 
-                        // Convert the table into a vitrual address
-                        let vad = phys_mem.translate(ptable, 4096);
+                    // Get the number of pages in use at this level.
+                    // Stored as metadata in the ignored bits of the
+                    // page table entry.
+                    let in_use = (nent >> 52) & 0x3ff;
 
-                        // Convert the page table into a mutable Rust slice
-                        let table = core::slice::from_raw_parts_mut(
-                            vad as *mut u64, 512);
+                    if in_use == 1 {
+                        // We're about to decrement this to zero, thus
+                        // free the table itself, and go to the next
+                        // level as we might want to free the table
+                        // that contains this table!
 
-                        // Overwrite the entry with a zero
-                        table[idx] = 0;
+                        // Free the current page table
+                        phys_mem.free_phys(PhysAddr(entry.0 & !0xfff),
+                                           4096);
+                        
+                        // Continue on freeing tables as we just freed
+                        // one which may have made the level above us
+                        // contain no more active tables.
+                        continue 'next_level;
+                    } else {
+                        // Update number of entries this table
+                        // references
+                        
+                        assert!(in_use > 0 && in_use <= 512,
+                            "Whoa, ref counts broken on page");
 
-                        // Check to see if anyone is still using this table
-                        let in_use = table.iter().any(|x| {
-                            (x & PAGE_PRESENT) != 0
-                        });
+                        // Update the reference count
+                        let nent = (nent & !0x3ff0_0000_0000_0000) |
+                            ((in_use - 1) << 52);
 
-                        if in_use {
-                            // We cannot do anything more
-                            break;
-                        }
-
-                        // Prevent ourselves from freeing the root level of
-                        // the page table.
-                        if ptable != self.table() {
-                            // Nobody is using this table itself, we can free
-                            // it!
-                            phys_mem.free_phys(ptable, 4096);
-                        }
+                        // Write in the new entry
+                        core::ptr::write(nvad as *mut u64, nent);
+                        break 'next_level;
                     }
-
-                    // Free the page
-                    phys_mem.free_phys(
-                        cur_page.page.unwrap().0, page_size as u64);
-
-                    // Invalidate the TLB for this page as we have converted
-                    // something from present to non-present.
-                    cpu::invlpg(page_vaddr.0 as usize);
+                } else {
+                    // Stop freeing table entries as we reached the
+                    // top level table.
+                    break 'next_level;
                 }
-
-                // Compute the address of the next page. This can overflow on
-                // the final page
-                let next_page = cur_page.virt_base()?.0
-                    .checked_add(cur_page.size()? as u64);
-
-                // If we made it to the end of all virtual memory, or we made
-                // it to the end of the free request
-                if next_page.is_none() || next_page.unwrap() > end {
-                    break;
-                }
-
-                // Otherwise, we've got more to do!
-                cur_page =
-                    self.translate(phys_mem, VirtAddr(next_page.unwrap()))?;
             }
 
-            // If we're going to free more virtual memory space than the user
-            // requested, we're going to have problems.
-            if validate && size != to_free {
-                return None;
+            // Free the page
+            phys_mem.free_phys(
+                cur_page.page.unwrap().0, page_size as u64);
+            
+            // Accumulate the amount of virtual memory we're freeing
+            freed += cur_page.size().unwrap() as u64;
+
+            // Compute the address of the next page. This can overflow on
+            // the final page
+            let next_page = page_vaddr.0.checked_add(page_size as u64);
+
+            // If we made it to the end of all virtual memory, or we made
+            // it to the end of the free request
+            if next_page.is_none() || next_page.unwrap() > end {
+                break;
             }
+
+            // Otherwise, we've got more to do!
+            cur_page =
+                self.translate(phys_mem, VirtAddr(next_page.unwrap()))
+                .expect("Failed to translate virtual address during free");
         }
 
-        Some(())
+        // Make sure the caller understood exactly how much virtual memory
+        // would be freed by this request. This effectively enforces the
+        // alignment and page-size awareness such that if a user requests to
+        // free 1 byte, but it's a 4 KiB page, that this will panic because we
+        // freed more than the user expected.
+        assert!(freed == size,
+                "Virtual free request freed more bytes than requested");
+       
+        // Check to see if we're modifying the active page table. If we are
+        // we have to invalidate mappings.
+        let cur_cr3 = cpu::read_cr3();
+        if (cur_cr3 & !0xfff) == self.table().0 {
+            // Invalidate the non-global TLB entries. We don't use global pages
+            // at all thus we can safely do a non-global invalidation. On our
+            // Coffee Lake machine, a write-to-cr3 cost about 200 cycles, where
+            // an `invlpg` costs 150 cycles. Though the full TLB invalidation
+            // will have a runtime performance hit due to TLBs needing to be
+            // repopulated for _all_ page table entries, it seems this will be
+            // much faster overall than invalidating every single page that we
+            // freed.
+            //
+            // In theory, for up to ~10 page frees it's probably faster to
+            // `invlpg` each individual page. But this margin is so small that
+            // we just always issue a write-to-cr3 instead. This dramaticially
+            // reduces the cost of invalidating many pages. For example,
+            // unmapping a ~1 MiB allocation.
+            cpu::write_cr3(cpu::read_cr3());
+        }
     }
 
     /// Translate a virtual address in the `self` page table into its
@@ -401,7 +432,7 @@ impl PageTable {
 
             // Get a virtual address for this entry
             let vad = unsafe { phys_mem.translate(ptp, size_of::<u64>()) };
-            let ent = unsafe { core::ptr::read(vad as *mut u64) };
+            let ent = unsafe { core::ptr::read(vad as *const u64) };
 
             // Check if this page is present
             if (ent & PAGE_PRESENT) == 0 {
@@ -523,6 +554,24 @@ impl PageTable {
                 let ptr = phys_mem.translate(entries[ii - 1].unwrap(),
                     core::mem::size_of::<u64>());
 
+                if ii >= 2 {
+                    // Get access to the entry with the reference count of the
+                    // table we're updating
+                    let ptr = phys_mem.translate(entries[ii - 2].unwrap(),
+                        core::mem::size_of::<u64>());
+                    
+                    // Read the entry
+                    let nent = core::ptr::read(ptr as *const u64);
+
+                    // Update the reference count
+                    let in_use = (nent >> 52) & 0x3ff;
+                    let nent = (nent & !0x3ff0_0000_0000_0000) |
+                        ((in_use + 1) << 52);
+
+                    // Write in the new entry
+                    core::ptr::write(ptr as *mut u64, nent);
+                }
+
                 // Insert the new table at the entry in the tabe above us
                 core::ptr::write(ptr as *mut u64,
                     table.0 | PAGE_USER | PAGE_WRITE | PAGE_PRESENT);
@@ -532,6 +581,24 @@ impl PageTable {
                     table.0 + indicies[ii] * core::mem::size_of::<u64>() as u64
                 ));
             }
+        }
+        
+        {
+            // Get access to the entry with the reference count of the
+            // table we're updating with the new page
+            let ptr = phys_mem.translate(entries[depth - 2].unwrap(),
+                core::mem::size_of::<u64>());
+            
+            // Read the entry
+            let nent = core::ptr::read(ptr as *const u64);
+
+            // Update the reference count
+            let in_use = (nent >> 52) & 0x3ff;
+            let nent = (nent & !0x3ff0_0000_0000_0000) |
+                ((in_use + 1) << 52);
+
+            // Write in the new entry
+            core::ptr::write(ptr as *mut u64, nent);
         }
 
         // At this point, the tables have been created, and the page doesn't
