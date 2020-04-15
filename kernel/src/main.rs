@@ -59,7 +59,6 @@ pub extern fn entry(boot_args: PhysAddr) -> ! {
     if cpu::is_bsp() {
         // One-time initialization for the whole kernel
 
-        /*
         // Bring up all other cores
         unsafe {
             cpu::wrmsr(0x1b, 0xfee0_0000 | (1 << 11) |
@@ -68,19 +67,10 @@ pub extern fn entry(boot_args: PhysAddr) -> ! {
             mm::write_phys(PhysAddr(0xfee0_0300), 0xc4500u32);
             mm::write_phys(PhysAddr(0xfee0_0300), 0xc4608u32);
             mm::write_phys(PhysAddr(0xfee0_0300), 0xc4608u32);
-        }*/
-    }
-
-    print!("Core ID {} online! {}\n", core!().id, cpu::rdtsc());
-
-    if core!().id == 0 {
-        unsafe {
-
-            mm::write_phys(PhysAddr(0xfee0_0300), 0xc4500u32);
-            mm::write_phys(PhysAddr(0xfee0_0300), 0xc4500u32);
-
         }
     }
+
+    print!("Core ID {} online\n", core!().id);
 
     cpu::halt();
 }
