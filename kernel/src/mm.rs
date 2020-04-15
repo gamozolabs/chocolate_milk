@@ -9,6 +9,9 @@ use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
 /// Base address for virtual allocations
 static NEXT_FREE_VADDR: AtomicU64 = AtomicU64::new(KERNEL_VMEM_BASE);
 
+/// Gap between virtual allocations
+const GUARD_PAGE_SIZE: u64 = 32 * 1024;
+
 /// Read a physical address containing a type `T`. This just handles the
 /// windowing and performs a `core::ptr::read_volatile`.
 #[allow(dead_code)]
@@ -226,7 +229,8 @@ impl GlobalAllocator {
         let alignsize = (layout.size().checked_add(0xfff)? & !0xfff) as u64;
 
         // Get a unique address for this mapping
-        let vaddr = NEXT_FREE_VADDR.fetch_add(alignsize, Ordering::SeqCst);
+        let vaddr = NEXT_FREE_VADDR.fetch_add(
+            alignsize.checked_add(GUARD_PAGE_SIZE)?, Ordering::SeqCst);
         
         // Get access to physical memory
         let mut pmem = PhysicalMemory;

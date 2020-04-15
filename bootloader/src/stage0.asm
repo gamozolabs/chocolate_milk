@@ -16,7 +16,7 @@ entry:
     mov ds, ax
 
     ; Load a 32-bit GDT
-    lgdt [ds:gdt]
+    lgdt [gdt]
 
     ; Enable protected mode
 	mov eax, cr0
@@ -104,6 +104,10 @@ soft_reboot:
     ; not have physical memory directly mapped, thus we must switch to the
     ; trampoline CR3 provided
     mov cr3, rcx
+    
+    ; Load the original GDT, since the kernel has relocated the GDT into its
+    ; address space
+    lgdt [gdt]
 
     ; Clear all GPRs. This will cause the high parts of registers to become
     ; zero, which might help with some weird transitional issues when going

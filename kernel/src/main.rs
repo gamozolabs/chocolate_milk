@@ -1,6 +1,6 @@
 //! The main kernel entry point!
 
-#![feature(panic_info_message, alloc_error_handler, asm)]
+#![feature(panic_info_message, alloc_error_handler, asm, global_asm)]
 
 #![no_std]
 #![no_main]
@@ -14,6 +14,7 @@ extern crate core_reqs;
 #[macro_use] mod print;
 mod panic;
 mod mm;
+mod interrupts;
 
 use page_table::PhysAddr;
 
@@ -55,6 +56,11 @@ pub extern fn entry(boot_args: PhysAddr) -> ! {
 
     // Initialize the core locals
     core_locals::init(boot_args);
+
+    // Initialize interrupts for this core
+    unsafe {
+        interrupts::init();
+    }
     
     if cpu::is_bsp() {
         // One-time initialization for the whole kernel
