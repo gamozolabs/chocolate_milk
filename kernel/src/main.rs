@@ -41,7 +41,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     interrupts::init();
 
     // Initialize the APIC
-    apic::init();
+    unsafe { apic::init(); }
     
     if core!().id == 0 {
         // One-time initialization for the whole kernel
