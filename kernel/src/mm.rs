@@ -1,3 +1,5 @@
+//! The virtual and physical memory manager for the kernel
+
 use core::alloc::{Layout, GlobalAlloc};
 use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 use alloc::boxed::Box;
@@ -134,7 +136,10 @@ struct FreeListNode {
 }
 
 impl FreeListNode {
+    /// Create a mutable reference to a `FreeListNode` from a raw physical
+    /// address.
     unsafe fn from_raw<'a>(paddr: PhysAddr) -> &'a mut FreeListNode {
+        // Make sure the physical address is inside of our physical memory map
         let end = paddr.0.checked_add(4096 - 1).unwrap();
         assert!(end < KERNEL_PHYS_WINDOW_SIZE,
                 "Physical address outside of window");
@@ -143,11 +148,15 @@ impl FreeListNode {
     }
 }
 
+/// A free list structure for holding all of the freed physical 4 KiB in size,
+/// 4 KiB aligned pages on the system
 pub struct PageFreeList {
+    /// Physical address of the first entry in the free list
     head: PhysAddr,
 }
 
 impl PageFreeList {
+    /// Create a new, empty free list
     pub fn new() -> Self {
         assert!(core::mem::size_of::<FreeListNode>() == 4096);
         PageFreeList { head: PhysAddr(0) }
@@ -205,6 +214,8 @@ impl PageFreeList {
         }
     }
 
+    /// Put a page back onto the free list. It's up to the caller to make sure
+    /// the page is 4 KiB in size and 4 KiB aligned.
     unsafe fn push(&mut self, page: PhysAddr) {
         // If there is no existing free list or the current one is out of slots
         // to hold pages, then we need to turn this freed page into a new
@@ -300,6 +311,13 @@ static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator;
 struct GlobalAllocator;
 
 impl GlobalAllocator {
+    /// Virtual memory allocation implementation
+    ///
+    /// Performs a virtual memory allocation using a new virtual address and
+    /// constructed with new pages.
+    ///
+    /// Returns `None` if the allocation failed, otherwise it returns a pointer
+    /// to the base of the allocation.
     unsafe fn opt_alloc(&self, layout: Layout) -> Option<*mut u8> {
         // 4-KiB align up the allocation size
         let alignsize = (layout.size().checked_add(0xfff)? & !0xfff) as u64;
@@ -346,6 +364,7 @@ unsafe impl GlobalAlloc for GlobalAllocator {
     }
 }
 
+/// Out-of-memory handler, we just panic
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
     panic!("Out of memory");

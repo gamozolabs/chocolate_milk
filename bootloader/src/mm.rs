@@ -74,6 +74,7 @@ unsafe impl GlobalAlloc for GlobalAllocator {
     }
 }
 
+/// Handler for when we run out of memory, we just simply panic
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
     panic!("Out of memory");

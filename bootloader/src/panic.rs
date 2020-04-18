@@ -1,5 +1,8 @@
+//! Panic handler implementation
+
 use core::panic::PanicInfo;
 
+/// System-wide panic handler
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     {

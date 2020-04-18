@@ -39,10 +39,15 @@ pub trait InterruptState {
 /// A spinlock-guarded variable
 #[repr(C)]
 pub struct LockCell<T: ?Sized, I: InterruptState> {
-    /// The lock is free when this value is `!0`, the lock is taken when this
-    /// value is not `!0`. In this case, the core ID is stored in the lock to
-    /// track who currently owns the lock.
-    lock: AtomicU32,
+    /// A ticket for the lock. You grab this ticket and then wait until
+    /// `release` is set to your ticket
+    ticket: AtomicU32,
+
+    /// Tracks which ticket currently owns the lock
+    release: AtomicU32,
+
+    /// Tracks the core that currently holds the lock
+    owner: AtomicU32,
 
     /// A holder of the `InterruptState` trait for this implementation
     _interrupt_state: PhantomData<I>,
@@ -61,8 +66,10 @@ impl<T, I: InterruptState> LockCell<T, I> {
     /// around ticket spinlocks.
     pub const fn new(val: T) -> Self {
         LockCell {
+            ticket:              AtomicU32::new(0),
+            release:             AtomicU32::new(0),
+            owner:               AtomicU32::new(0),
             val:                 UnsafeCell::new(val),
-            lock:                AtomicU32::new(!0),
             disables_interrupts: false,
             _interrupt_state:    PhantomData,
         }
@@ -72,8 +79,10 @@ impl<T, I: InterruptState> LockCell<T, I> {
     /// time the lock is held.
     pub const fn new_no_preempt(val: T) -> Self {
         LockCell {
+            ticket:              AtomicU32::new(0),
+            release:             AtomicU32::new(0),
+            owner:               AtomicU32::new(0),
             val:                 UnsafeCell::new(val),
-            lock:                AtomicU32::new(!0),
             disables_interrupts: true,
             _interrupt_state:    PhantomData,
         }
@@ -107,31 +116,40 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
             I::enter_lock();
         }
 
-        loop {
-            // Attempt to take the lock
-            let holder = self.lock.compare_and_swap(
-                !0, core_id, Ordering::SeqCst);
+        if try_lock {
+            // Try locks are special, we need to guarantee we will succeed in
+            // taking the lock.
+
+            // Get the number of the ticket that is ready right now
+            let current_release = self.release.load(Ordering::SeqCst);
             
-            if holder == !0 {
-                // We took the lock
-                break;
-            } else if !try_lock && holder == core_id {
-                // Only perform deadlock detection on non-try based locks
-                panic!("Deadlock detected");
-            } else if try_lock {
-                // Could not get lock, return `None`
-        
-                // Mark that we didn't get the lock and thus interrupts can
-                // potentially be re-enabled
+            // Attempt to take the winning ticket. If we cannot get the
+            // winning ticket, then give up.
+            if self.ticket.compare_and_swap(
+                    current_release, current_release.wrapping_add(1),
+                    Ordering::SeqCst) != current_release {
+                // We didn't win the lock, thus return early
                 if self.disables_interrupts {
                     I::exit_lock();
                 }
 
                 return None;
             }
+        } else {
+            // Take a ticket
+            let ticket = self.ticket.fetch_add(1, Ordering::SeqCst);
+            while self.release.load(Ordering::SeqCst) != ticket {
+                // If the current core is the owner of the load
+                if self.owner.load(Ordering::SeqCst) == core_id {
+                    panic!("Deadlock detected");
+                }
 
-            spin_loop_hint();
+                spin_loop_hint();
+            }
         }
+
+        // Note that this core owns the lock
+        self.owner.store(core_id, Ordering::SeqCst);
 
         // At this point we have exclusive access
         Some(LockCellGuard {
@@ -168,8 +186,11 @@ pub struct LockCellGuard<'a, T: ?Sized, I: InterruptState> {
 
 impl<'a, T: ?Sized, I: InterruptState> Drop for LockCellGuard<'a, T, I> {
     fn drop(&mut self) {
+        // Set that there is no owner of the lock
+        self.cell.owner.store(!0, Ordering::SeqCst);
+
         // Release the lock
-        self.cell.lock.store(!0, Ordering::SeqCst);
+        self.cell.release.fetch_add(1, Ordering::SeqCst);
         
         // Enable interrupts if needed
         if self.cell.disables_interrupts {

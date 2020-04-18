@@ -23,14 +23,18 @@ macro_rules! core {
 pub struct AutoAtomicRef(AtomicUsize);
 
 impl AutoAtomicRef {
+    /// Create a new automatically tracked atomic reference counter
     pub const fn new(init: usize) -> Self {
         AutoAtomicRef(AtomicUsize::new(init))
     }
 
+    /// Returns the current number of references
     pub fn count(&self) -> usize {
         self.0.load(Ordering::SeqCst)
     }
 
+    /// Increment the reference count, and return a guard structure which will
+    /// decrement the count once the guard goes out of scope.
     pub fn increment(&self) -> AutoAtomicRefGuard {
         let count = self.0.fetch_add(1, Ordering::SeqCst);
         count.checked_add(1)
@@ -39,11 +43,16 @@ impl AutoAtomicRef {
     }
 }
 
+/// Guard structure that allows automatic reference count decrementing on
+/// `AutoAtomicRef`s when the increment goes out of score
 pub struct AutoAtomicRefGuard<'a>(&'a AutoAtomicRef);
 
 impl<'a> Drop for AutoAtomicRefGuard<'a> {
     fn drop(&mut self) {
+        // Decrement the reference count
         let count = (self.0).0.fetch_sub(1, Ordering::SeqCst);
+
+        // Make sure we didn't end up going negative, this should never happen
         count.checked_sub(1)
             .expect("Integer overflow on AutoAtomicRef decrement");
     }
@@ -66,11 +75,11 @@ impl lockcell::InterruptState for LockInterrupts {
     }
 
     fn enter_lock() {
-        core!().disable_interrupts();
+        unsafe { core!().disable_interrupts(); }
     }
 
     fn exit_lock() {
-        core!().enable_interrupts();
+        unsafe { core!().enable_interrupts(); }
     }
 }
 
@@ -104,7 +113,7 @@ pub struct CoreLocals {
 
     /// Current level of interrupt nesting. Incremented on every interrupt
     /// entry, and decremented on every interrupt return.
-    pub interrupt_depth: AutoAtomicRef,
+    interrupt_depth: AutoAtomicRef,
     
     /// Current level of exception nesting. Incremented on every exception
     /// entry, and decremented on every exception return.
@@ -143,32 +152,48 @@ impl CoreLocals {
         }
     }
 
+    /// Set that we have entered an exception handler
+    /// (increment exception count)
     pub unsafe fn enter_exception(&self) -> AutoAtomicRefGuard {
         self.exception_depth.increment()
     }
 
+    /// Get whether or not we're currently in an exception handler
     pub fn in_exception(&self) -> bool {
         self.exception_depth.count() > 0
     }
 
+    /// Set that we're currently in an interrupt (increments interrupt count)
     pub unsafe fn enter_interrupt(&self) -> AutoAtomicRefGuard {
         self.interrupt_depth.increment()
     }
 
+    /// Get whether or not we're currently in an interrupt handler
     pub fn in_interrupt(&self) -> bool {
         self.interrupt_depth.count() > 0
     }
 
-    pub fn disable_interrupts(&self) {
+    /// Disable interrupts and increase the interrupt disable reference count
+    ///
+    /// Interrupts will always be disabled when this code executes. This will
+    /// increment the number of disable requests, and thus interrupts will not
+    /// be re-enabled until an identical number of `enable_interrupts` are
+    /// called.
+    pub unsafe fn disable_interrupts(&self) {
         let os =
             self.interrupt_disable_outstanding.fetch_add(1, Ordering::SeqCst);
         os.checked_add(1)
             .expect("Integer overflow on disable interrupts increment");
 
-        unsafe { cpu::disable_interrupts() }
+        cpu::disable_interrupts()
     }
 
-    pub fn enable_interrupts(&self) {
+    /// Attempt to enable interrupts
+    ///
+    /// If the reference count for requested interrupt disables drops to zero
+    /// then we actually enable interrupts. Otherwise we just decrement the
+    /// interrupt request number.
+    pub unsafe fn enable_interrupts(&self) {
         let os =
             self.interrupt_disable_outstanding.fetch_sub(1, Ordering::SeqCst);
         os.checked_sub(1)
@@ -176,8 +201,15 @@ impl CoreLocals {
        
         // If we're not already in an interrupt, and we decremented the
         // interrupt outstanding to 0, we can actually enable interrupts.
+        //
+        // Since it's possible interrupts can be enabled when we enter an
+        // interrupt, if we acquire a lock in an interrupt and release it it
+        // may attempt to re-enable interrupts. Thus, we never allow enabling
+        // interrupts from an interrupt handler. This means interrupts will
+        // correctly get re-enabled in this case when the IRET loads the old
+        // interrupt flag.
         if !core!().in_interrupt() && os == 1 {
-            unsafe { cpu::enable_interrupts() }
+            cpu::enable_interrupts();
         }
     }
 }
@@ -204,7 +236,12 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
         cpu::set_gs_base(core_id as u64);
     }
 
+    /// Dummy structure to allow early `LockCell` access prior to having
+    /// the `core!()` macro set up
     struct DummyLockInterrupts;
+
+    // This dummy interrupt state implementation always reports no interrupts
+    // or exceptions, as this code is run during early boot prior to interrupts
     impl lockcell::InterruptState for DummyLockInterrupts {
         fn in_interrupt() -> bool { false }
         fn in_exception() -> bool { false }
@@ -251,6 +288,9 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
     unsafe {
         // Move the core locals into the allocation
         core::ptr::write(core_local_ptr as *mut CoreLocals, core_locals);
+
+        // Set the GS base such that we can get access to core locals in any
+        // context via the `core!()` macro
         cpu::set_gs_base(core_local_ptr as u64);
     }
 }

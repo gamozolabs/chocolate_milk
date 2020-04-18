@@ -1,3 +1,6 @@
+//! PE parser for basic x86_64 and i386 support. Currently this does not
+//! support relocations.
+
 #![no_std]
 
 use core::convert::TryInto;

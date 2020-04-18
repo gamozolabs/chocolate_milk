@@ -5,22 +5,45 @@
 use core::alloc::Layout;
 use core::mem::size_of;
 
-pub const PAGE_PRESENT:       u64 = 1 <<  0;
-pub const PAGE_WRITE:         u64 = 1 <<  1;
-pub const PAGE_USER:          u64 = 1 <<  2;
+/// Page table flag indicating the entry is valid
+pub const PAGE_PRESENT: u64 = 1 <<  0;
+
+/// Page table flag indiciating this page or table is writable
+pub const PAGE_WRITE: u64 = 1 <<  1;
+
+/// Page table flag indiciating this page or table is accessible in user mode
+pub const PAGE_USER: u64 = 1 <<  2;
+
+/// Page table flag indiciating that accesses to the memory described by this
+/// page or table should be strongly uncached
 pub const PAGE_CACHE_DISABLE: u64 = 1 <<  4;
-pub const PAGE_SIZE:          u64 = 1 <<  7;
-pub const PAGE_NX:            u64 = 1 << 63;
+
+/// Page table flag indicating that this page entry is a large page
+pub const PAGE_SIZE: u64 = 1 <<  7;
+
+/// Page table flag indicating the page or table is not to be executable
+pub const PAGE_NX: u64 = 1 << 63;
 
 /// The state of a page table mapping. Contains the information about every
 /// level of the translation. Also contains information about whether the
 /// page is final
 #[derive(Debug, Clone, Copy)]
 pub struct Mapping {
+    /// Physical address of the PML4 entry which maps the translated address
+    /// `None` if there is no table present at this level
     pub pml4e: Option<PhysAddr>,
-    pub pdpe:  Option<PhysAddr>,
-    pub pde:   Option<PhysAddr>,
-    pub pte:   Option<PhysAddr>,
+    
+    /// Physical address of the PDP entry which maps the translated address
+    /// `None` if there is no table present at this level
+    pub pdpe: Option<PhysAddr>,
+    
+    /// Physical address of the PD entry which maps the translated address
+    /// `None` if there is no table present at this level
+    pub pde: Option<PhysAddr>,
+    
+    /// Physical address of the PT entry which maps the translated address
+    /// `None` if there is no table present at this level
+    pub pte: Option<PhysAddr>,
 
     /// Actual address of the base of the page and the offset into it
     pub page: Option<(PhysAddr, u64)>,
@@ -69,6 +92,19 @@ pub struct PhysAddr(pub u64);
 #[repr(C)]
 pub struct VirtAddr(pub u64);
 
+/// A trait that allows generic access to physical memory
+///
+/// This allows the user of the page table to handle the physical to virtual
+/// translations that the page table uses during walks.
+///
+/// This also allows the user to provide mechanisms for the page table code
+/// to allocate and free physical memory such that page tables and pages can
+/// be freed when they are unmapped.
+///
+/// A user can control the physical translations such that this can be used to
+/// perform nested paging lookups given the `PhysMem` implementation for the
+/// guest `cr3` correctly uses the EPT for the VM to provide guest physical to
+/// host physical translations.
 pub trait PhysMem {
     /// Provide a virtual address to memory which contains the raw physical
     /// memory at `paddr` for `size` bytes

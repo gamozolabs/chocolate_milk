@@ -1,3 +1,7 @@
+//! Microsoft specific (MSVC convention) intrinsics. We translate the MSVC
+//! intrinsics to LLVM intrinsics to get support for 64-bit integer arithmetic
+//! in a 32-bit bootloader.
+
 // ---------------------------------------------------------------------------
 // Microsoft specific intrinsics
 //

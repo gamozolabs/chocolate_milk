@@ -1,4 +1,4 @@
-//! print macro support
+//! `print!()` macro support
 
 /// Dummy type to implement `core::fmt::Write` for `print!` macros
 pub struct SerialWriter;
@@ -25,6 +25,7 @@ impl core::fmt::Write for SerialWriter {
     }
 }
 
+/// Serial port formatted printing
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{

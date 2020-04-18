@@ -115,7 +115,7 @@ pub unsafe fn cpuid(eax: u32, ecx: u32) -> (u32, u32, u32, u32) {
     (oeax, oebx, oecx, oedx)
 }
 
-/// Read cr2
+/// Read `cr2`
 #[inline]
 pub fn read_cr2() -> u64 {
     let val: u64;
@@ -125,13 +125,13 @@ pub fn read_cr2() -> u64 {
     val
 }
 
-/// Write to cr2
+/// Write to `cr2`
 #[inline]
 pub unsafe fn write_cr2(val: u64) {
     asm!("mov cr2, $0" :: "r"(val) : "memory" : "volatile", "intel");
 }
 
-/// Read cr3
+/// Read `cr3`
 #[inline]
 pub fn read_cr3() -> u64 {
     let val: u64;
@@ -141,7 +141,7 @@ pub fn read_cr3() -> u64 {
     val
 }
 
-/// Write to cr3
+/// Write to `cr3`
 #[inline]
 pub unsafe fn write_cr3(val: u64) {
     asm!("mov cr3, $0" :: "r"(val) : "memory" : "volatile", "intel");

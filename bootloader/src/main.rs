@@ -1,4 +1,5 @@
-//! Main Rust entry point for the chocolate milk bootloader
+//! Bootloader for BIOS-based x86 implementations using PXE to download a
+//! second stage x86_64 PE file which will be loaded and executed in long mode
 
 #![feature(panic_info_message, rustc_private, alloc_error_handler, global_asm)]
 #![no_std]
@@ -60,7 +61,9 @@ pub static BOOT_ARGS: BootArgs<LockInterrupts> = BootArgs {
 
 /// Rust entry point for the bootloader
 ///
-/// * `bootloader_end` - One byte past the end of the bootloader
+/// * `bootloader_end`    - One byte past the end of the bootloader
+/// * `soft_reboot_entry` - Long mode soft reboot entry point
+/// * `_num_boots`        - Number of boots that has occurred, starts at 1
 #[no_mangle]
 extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
                 _num_boots: u64) -> ! {
@@ -75,7 +78,7 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
 
             // "Clear" the screen
             for _ in 0..100 {
-                //driver.write(b"\n");
+                driver.write(b"\n");
             }
 
             // Print the bootloader banner
@@ -102,20 +105,26 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
 
         // If no kernel entry is set yet, download the kernel and load it
         if kernel_entry.is_none() {
+            // Make sure the trampoline table hasn't been set yet
             let tramp_table = BOOT_ARGS.trampoline_page_table
                 .load(Ordering::SeqCst);
             assert!(page_table.is_none() && tramp_table == 0,
                 "Page tables set up before kernel!?");
 
+            // Print that we're about to start downloading the kernel. This
+            // is a common point for things to "freeze" if the PXE boot code
+            // breaks or the PXE server is unreachable
             BOOT_ARGS.serial.lock().as_mut().unwrap()
                 .write(b"Downloading kernel...\n");
 
-            // Download the kernel
             let kernel = loop {
+                // Download the kernel
                 if let Some(kern) = pxe::download("chocolate_milk.kern") {
+                    // Downloaded the kernel, return it out of the loop
                     break kern;
                 }
-            
+    
+                // Print that we failed
                 BOOT_ARGS.serial.lock().as_mut().unwrap()
                     .write(b"Kernel download failed, retrying\n");
             };
@@ -271,15 +280,19 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
         )
     };
 
-    extern {
-        fn enter64(entry_point: u64, stack: u64, param: u64, cr3: u32,
-                   tramp_cr3: u32, phys_window_base: u64, core_id: u32) -> !;
-    }
 
     // Update the core ID count and get a unique 0-indexed core ID
     let core_id = CORE_ID.fetch_add(1, Ordering::SeqCst);
 
     unsafe {
+        extern {
+            /// Entry point for the kernel transition
+            fn enter64(entry_point: u64, stack: u64, param: u64, cr3: u32,
+                       tramp_cr3: u32, phys_window_base: u64,
+                       core_id: u32) -> !;
+        }
+
+        // Jump into the 64-bit kernel!
         enter64(entry_point, stack, &BOOT_ARGS as *const _ as u64,
                 cr3, tramp_cr3, KERNEL_PHYS_WINDOW_BASE, core_id);
     }

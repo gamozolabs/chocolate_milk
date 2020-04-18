@@ -1,6 +1,8 @@
+//! Panic handlers and soft reboots for the kernel
+
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicBool, Ordering};
 
 use crate::acpi::{self, ApicState};
 use crate::apic::Apic;
@@ -15,21 +17,24 @@ use page_table::PhysAddr;
 static PANIC_PENDING: AtomicPtr<PanicInfo> =
     AtomicPtr::new(core::ptr::null_mut());
 
+/// Records if a soft reboot has been requested. If it has been, we will
+/// soft reboot as soon as we can.
+static SOFT_REBOOT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Attempt a soft reboot by checking to see if there is a command on the
 /// serial port to soft reboot.
 pub unsafe fn attempt_soft_reboot() {
-    // Only allow soft reboots from core 0
-    if core!().id != 0 { return; }
-
     // Attempt to get a byte from the serial port
     let byte = core!().boot_args.serial.try_lock()
         .map(|mut x| x.as_mut().unwrap().read_byte()).flatten();
 
     // Check if we got a 'Z' from the serial port.
     if let Some(b'Z') = byte {
-        // Soft reboot!
-        let mut apic = core!().apic.lock();
-        soft_reboot(apic.as_mut().unwrap());
+        // Request a soft reboot
+        SOFT_REBOOT_REQUESTED.store(true, Ordering::SeqCst);
+
+        // Force a panic
+        panic!("Soft reboot requested from timer");
     }
 }
 
@@ -88,13 +93,17 @@ pub unsafe fn soft_reboot(apic: &mut Apic) -> ! {
     soft_reboot(trampoline_cr3);
 }
 
+/// Panic implementation for the kernel
 #[panic_handler]
 pub fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts, we're never coming back from this point.
-    core!().disable_interrupts();
-    cpu::delay(5_000_000_000);
+    unsafe { core!().disable_interrupts(); }
 
     if core!().id == 0 {
+        // If we had a panic on the BSP, we handle it quite uniquely. We'll
+        // shut down all other processors by sending them NMIs and waiting for
+        // them to check into a halted state.
+        
         let our_info: *const PanicInfo = info;
 
         let other_info: *const PanicInfo =
@@ -106,7 +115,8 @@ pub fn panic(info: &PanicInfo) -> ! {
             let apic = &mut *core!().apic.shatter();
             let apic = apic.as_mut().unwrap();
             
-            // Disable all other cores
+            // Disable all other cores, waiting for them to check-in notifying
+            // us that they've gone into a permanent halt state.
             disable_all_cores(apic);
 
             apic
@@ -115,7 +125,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         // Lock the old serial port so nobody can use it anymore. This is just
         // to prevent accidential use of the old serial driver since we create
         // a new one.
-        //let _old_serial = core!().boot_args.serial.try_lock();
+        let _old_serial = core!().boot_args.serial.try_lock();
 
         // Create our emergency serial port. We disabled all other cores so
         // we re-initialize the serial port to make sure it's in a sane state.
@@ -137,10 +147,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 
         // Wrap up the serial driver in our writer
         let mut eserial = EmergencySerial(serial);
-        
-        unsafe {
-            soft_reboot(apic);
-        }
  
         // Create some space, in case we're splicing an existing line
         let _ = write!(eserial, "\n\n\n");
@@ -168,20 +174,16 @@ pub fn panic(info: &PanicInfo) -> ! {
             }
         }
 
-        for apic_id in 0..acpi::MAX_CORES as u32 {
-            let state = acpi::core_state(apic_id);
-            if state != ApicState::None {
-                let _ =
-                    write!(eserial, "Apic {:#06x} | {:?}\n", apic_id, state);
+        // Wait for a soft reboot to be requested
+        while SOFT_REBOOT_REQUESTED.load(Ordering::SeqCst) != true {
+            if eserial.0.read_byte() == Some(b'Z') {
+                SOFT_REBOOT_REQUESTED.store(true, Ordering::SeqCst);
             }
         }
 
-        loop {
-            if eserial.0.read_byte() == Some(b'Z') {
-                let _ = write!(eserial, "Soft reboot requested\n");
-                unsafe { soft_reboot(apic); }
-            }
-        }
+        // Start a soft reboot
+        let _ = write!(eserial, "Starting soft reboot...\n");
+        unsafe { soft_reboot(apic); }
     } else {
         // Save the panic info for this core
         PANIC_PENDING.store(info as *const _ as *mut _, Ordering::SeqCst);

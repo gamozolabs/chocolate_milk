@@ -1,3 +1,5 @@
+//! Module to provide programming and use of interrupts on x86 processors
+
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
@@ -379,6 +381,13 @@ Registers at exception:
         regs.xmm12, regs.xmm13, regs.xmm14, regs.xmm15);
 }
 
+/// A table containing all of the raw entry points for the interrupts on the
+/// system
+///
+/// We have to have a different entry point for every interrupt as x86 does not
+/// provide a mechanism to get the interrupt number. Thus we generate new code
+/// for each interrupt handler which assigns the interrupt number to a fixed
+/// register which is then passed to a generic routine.
 const INT_HANDLERS: [unsafe extern fn(); 256] = [
     vec_interrupt_0,  vec_interrupt_1,  vec_interrupt_2,
     vec_interrupt_3,  vec_interrupt_4,  vec_interrupt_5,

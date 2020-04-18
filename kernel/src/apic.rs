@@ -1,3 +1,6 @@
+//! Local APIC implementation providing support to access the APIC in either
+//! xapic or x2apic mode depending on what is supported
+
 use core::mem::size_of;
 use core::convert::TryInto;
 
@@ -21,6 +24,9 @@ const APIC_BASE: u64 = 0xfee0_0000;
 
 /// Interrupt vector to program the APIC time to use
 const APIC_TIMER_VECTOR: u8 = 0xe0;
+
+/// The mask bit for LVT entries
+const LVT_MASK: u32 = 1 << 16;
 
 /// APIC registers (offsets into MMIO space)
 #[derive(Clone, Copy)]
@@ -129,7 +135,10 @@ pub struct Apic {
 
 /// The different modes of the APIC
 enum ApicMode {
+    /// APIC has been set to normal APIC mode
     Apic(&'static mut [u32]),
+
+    /// APIC supports and has been programmed to use x2apic mode
     X2Apic,
 }
 
@@ -328,6 +337,10 @@ impl Apic {
     /// Disable the APIC timer
     #[allow(unused)]
     pub unsafe fn disable_timer(&mut self) {
+        // Mask timer interrupts
+        self.write_apic(Register::LvtTimer,
+            LVT_MASK | self.read_apic(Register::LvtTimer));
+
         // Disable the timer by setting the initial count to zero
         self.write_apic(Register::InitialCount, 0);
         
@@ -342,42 +355,49 @@ impl Apic {
 impl Drop for Apic {
     fn drop(&mut self) {
         unsafe {
-            // Disable the APIC timer
-            self.write_apic(Register::InitialCount, 0);
+            // Mask timer interrupts
+            self.write_apic(Register::LvtTimer,
+                LVT_MASK | self.read_apic(Register::LvtTimer));
 
-            // At this point, the APIC has been restored to the orignal state
-            // the BIOS gave us execution with. Now we'll drain any interrupts
-            // that we handle that may be pending
-            crate::interrupts::DRAINING_EOIS.store(true, core::sync::atomic::Ordering::SeqCst);
-            let mut handled_something = false;
+            // It is possible that we're dropping the `Apic` from a timer
+            // interrupt handler. In this case, there may be an interrupt which
+            // is currently in the servicing state. We will EOI on behalf of
+            // the timer as we're tearing down.
             loop {
-                let irr = self.irr();
+                // Get the current interrupt vectors being serviced
                 let isr = self.isr();
-                let can_eoi = crate::interrupts::eoi_required();
 
-                print!("IRR {:0128b}{:0128b}\n", irr[1], irr[0]);
-                print!("ISR {:0128b}{:0128b}\n", isr[1], isr[0]);
-                print!("HDL {:0128b}{:0128b}\n", can_eoi[1], can_eoi[0]);
-
-                // Are there pending interrupts which we have EOI handlers
-                // registered for. If so, we are the ones responsible for
-                // these interrupts and we must drain them. In the case of a
-                // pending interrupt from an interrupt caused by the BIOS and
-                // not anything we generate or program, we will simply leave
-                // those pending as the BIOS should be able to handle it's own
-                // interrupts.
-                let pending_handleable =
-                    ((irr[0] | isr[0]) & can_eoi[0]) != 0 ||
-                    ((irr[1] | isr[1]) & can_eoi[1]) != 0;
-
-                if !pending_handleable {
-                    // Nothing more to handle, break out of the loop
-                    print!("Handled interrupts {}\n", handled_something);
+                if isr[0] == 0 && isr[1] == 0 {
+                    // No interrupts are being serviced
                     break;
                 }
 
-                handled_something = true;
-                
+                // At this point, we know there is at least one interrupt
+                // being serviced. EOI the APIC, and try again
+                Self::eoi();
+            }
+            
+            // Put the interrupt handler into draining mode
+            crate::interrupts::DRAINING_EOIS
+                .store(true, core::sync::atomic::Ordering::SeqCst);
+
+            // At this point the APIC has been software disabled. Check if
+            // there are any pending interrupts that we may have caused, and
+            // drain them from the pendings.
+            loop {
+                let irr     = self.irr();
+                let can_eoi = crate::interrupts::eoi_required();
+
+                // Check if there are any pending interrupts that we have
+                // registered EOI-expecting handlers for.
+                let pending_handleable =
+                    (irr[0] & can_eoi[0]) != 0 || (irr[1] & can_eoi[1]) != 0;
+
+                if !pending_handleable {
+                    // Nothing more to handle, break out of the loop
+                    break;
+                }
+
                 // Unconditionally enable interrupts
                 cpu::enable_interrupts();
             }
@@ -386,21 +406,6 @@ impl Drop for Apic {
             // during the drain process.
             cpu::disable_interrupts();
             
-            print!("Done draining\n");
-
-            cpu::delay(1_000_000_000);
-
-                let irr = self.irr();
-                let isr = self.isr();
-                let can_eoi = crate::interrupts::eoi_required();
-
-                print!("after IRR {:0128b}{:0128b}\n", irr[1], irr[0]);
-                print!("after ISR {:0128b}{:0128b}\n", isr[1], isr[0]);
-                print!("after HDL {:0128b}{:0128b}\n", can_eoi[1], can_eoi[0]);
-                if irr[1] != 0 || irr[0] != 0 {
-                    cpu::halt();
-                }
-
             // Restore the original APIC timer state
             {
                 // Load the original state, ending in the initial count
@@ -411,11 +416,10 @@ impl Drop for Apic {
                 self.write_apic(Register::InitialCount,
                                 self.orig_timer_state.icr);
             }
-            
-            // Restore the original SVR. This contains the software enablement
-            // state, which may have previously been off.
-            self.write_apic(Register::SpuriousInterruptVector, self.orig_svr);
 
+            // Load the original SVR
+            self.write_apic(Register::SpuriousInterruptVector, self.orig_svr);
+            
             // We do this assert when we first launch the APIC. The BIOS should
             // never be disabling the APIC. We just added this assert here as
             // an additional check incase we end up removing the other code.
@@ -447,7 +451,7 @@ impl Drop for Apic {
 
 /// Initialize the local APIC for the current running core. This will enable
 /// the APIC, and if supported, will enable the x2apic.
-pub fn init() {
+pub unsafe fn init() {
     // Make sure the APIC base is valid
     assert!(APIC_BASE > 0 && APIC_BASE == (APIC_BASE & 0x0000_000f_ffff_f000),
             "Invalid APIC base address");
@@ -463,7 +467,7 @@ pub fn init() {
     assert!(cpu_features.apic, "APIC is not available on this system");
 
     // Enable and normalize the APIC base
-    let (orig_ia32_apic_base, orig_pic_a1, orig_pic_21) = unsafe {
+    let (orig_ia32_apic_base, orig_pic_a1, orig_pic_21) = {
         // Load the previous IA32_APIC_BASE
         let orig_ia32_apic_base = cpu::rdmsr(IA32_APIC_BASE);
 
@@ -516,7 +520,7 @@ pub fn init() {
         let mut page_table = core!().boot_args.page_table.lock();
         let page_table = page_table.as_mut().unwrap();
 
-        let mapping = unsafe {
+        let mapping = {
             // Map `vaddr` to the APIC base, as non-executable, writable,
             // readable, and cache disabled
             page_table.map_raw(&mut pmem, vaddr, PageType::Page4K,
@@ -545,25 +549,21 @@ pub fn init() {
     };
 
     // Save off the original SVR
-    new_apic.orig_svr = unsafe {
-        new_apic.read_apic(Register::SpuriousInterruptVector)
-    };
+    new_apic.orig_svr = new_apic.read_apic(Register::SpuriousInterruptVector);
 
     // Save the original APIC timer state
-    new_apic.orig_timer_state = unsafe { TimerState {
+    new_apic.orig_timer_state = TimerState {
         dcr: new_apic.read_apic(Register::DivideConfiguration),
         icr: new_apic.read_apic(Register::InitialCount),
         lvt: new_apic.read_apic(Register::LvtTimer),
-    }};
+    };
 
-    unsafe {
-        // Software enable the APIC, set spurious interrupt vector to 0xff
-        new_apic.write_apic(
-            Register::SpuriousInterruptVector, (1 << 8) | 0xff);
+    // Software enable the APIC, set spurious interrupt vector to 0xff
+    new_apic.write_apic(
+        Register::SpuriousInterruptVector, (1 << 8) | 0xff);
 
-        // Program the core's APIC ID
-        core!().set_apic_id(new_apic.apic_id());
-    }
+    // Program the core's APIC ID
+    core!().set_apic_id(new_apic.apic_id());
 
     // Set the core's APIC reference
     *apic = Some(new_apic);

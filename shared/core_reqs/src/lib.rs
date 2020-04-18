@@ -119,6 +119,8 @@ global_asm!(r#"
         ud2
 "#);
 
+/// Whether or not floats are used. This is used by the MSVC calling convention
+/// and it just has to exist.
 #[export_name="_fltused"]
 pub static FLTUSED: usize = 0;
 

@@ -1,4 +1,4 @@
-//! The main kernel entry point!
+//! A kernel written all in Rust
 
 #![feature(panic_info_message, alloc_error_handler, asm, global_asm)]
 #![feature(const_in_array_repeat_expressions)]
@@ -28,6 +28,7 @@ fn release_early_stack() {
     unsafe { mm::write_phys(PhysAddr(0x7e00), 1u8); }
 }
 
+/// Entry point of the kernel!
 #[no_mangle]
 pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // Release the early boot stack, now that we have our own stack
@@ -51,33 +52,24 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         unsafe { acpi::init() }
     }
 
+    // Enable the APIC timer
+    unsafe { core!().apic.lock().as_mut().unwrap().enable_timer(); }
+
+    // Now we're ready for interrupts!
+    unsafe { core!().enable_interrupts(); }
+    
     // Let ACPI know that we've booted, it'll be happy to know we're here!
+    // This will also serialize until all cores have come up. Once all cores
+    // are online this will release all of the cores. This ensures that no
+    // kernel task ends up hogging locks which are needed during bootloader
+    // stack creation on other cores. This makes sure that by the time cores
+    // get free reign of execution, we've intialized all cores to a state where
+    // NMIs and soft reboots work.
     acpi::core_checkin();
-
-    if core!().id == 0 {
-        // Enable the APIC timer
-        unsafe { core!().apic.lock().as_mut().unwrap().enable_timer(); }
-        //core!().enable_interrupts();
-    }
-
-    //print!("Core online {}\n", core!().id);
 
     if core!().id == acpi::num_cores() - 1 {
         print!("We made it! All cores online! {}\n", core!().id + 1);
     }
-
-    if core!().id == 0 {
-        panic!("OH NO I MYSELF DIED");
-    }
-
-    //loop {
-        //let mut freemem = core!().boot_args.free_memory.lock();
-        //let freemem = freemem.as_mut().unwrap();
-
-
-        //let alc = freemem.allocate_prefer(4096, 4096, mm::memory_range());
-        //core::mem::drop(freemem);
-    //}
 
     cpu::halt();
 }
