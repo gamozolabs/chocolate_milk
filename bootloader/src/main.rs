@@ -1,6 +1,6 @@
 //! Main Rust entry point for the chocolate milk bootloader
 
-#![feature(panic_info_message, rustc_private, alloc_error_handler)]
+#![feature(panic_info_message, rustc_private, alloc_error_handler, global_asm)]
 #![no_std]
 #![no_main]
 
@@ -16,27 +16,46 @@ mod panic;
 mod pxe;
 mod intrins;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use serial::SerialPort;
 use boot_args::{BootArgs, KERNEL_PHYS_WINDOW_SIZE, KERNEL_STACKS_BASE};
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_STACK_SIZE, KERNEL_STACK_PAD};
 use pe_parser::PeParser;
 use lockcell::LockCell;
 use page_table::{VirtAddr, PageType, PageTable, PAGE_PRESENT, PAGE_WRITE};
-use page_table::{PhysAddr, PAGE_SIZE};
+use page_table::PAGE_SIZE;
+
+/// Empty structure to implement locking semantics for pre-emptable locks
+pub struct LockInterrupts;
+
+/// Current running core ID. The entire bootloader is protected with a lock
+/// preventing 2 cores from every running in the bootloader at the same time.
+/// This is due to the fact that during the bootloader process, cores use a
+/// fixed address for the stack. Thus the `stage0.asm` has a state variable
+/// called `stack_avail` which makes the stack, and thus the entire Rust
+/// bootloader exclusive.
+static CORE_ID: AtomicU32 = AtomicU32::new(0);
+
+impl lockcell::InterruptState for LockInterrupts {
+    fn in_interrupt() -> bool { false }
+    fn in_exception() -> bool { false }
+    fn core_id() -> u32 { CORE_ID.load(Ordering::SeqCst) }
+    fn enter_lock() {}
+    fn exit_lock() {}
+}
 
 /// Global arguments shared between the kernel and bootloader. It is critical
 /// that every structure in here is identical in shape between both 64-bit
 /// and 32-bit representations.
-pub static BOOT_ARGS: BootArgs = BootArgs {
+pub static BOOT_ARGS: BootArgs<LockInterrupts> = BootArgs {
     free_memory:           LockCell::new(None),
-    serial:                LockCell::new(None),
+    serial:                LockCell::new_no_preempt(None),
     page_table:            LockCell::new(None),
-    trampoline_page_table: LockCell::new(None),
+    trampoline_page_table: AtomicU64::new(0),
     kernel_entry:          LockCell::new(None),
     stack_vaddr:           AtomicU64::new(KERNEL_STACKS_BASE),
-    print_lock:            LockCell::new(()),
-    soft_reboot_addr:      LockCell::new(None),
+    print_lock:            LockCell::new_no_preempt(()),
+    soft_reboot_addr:      AtomicU64::new(0),
 };
 
 /// Rust entry point for the bootloader
@@ -52,7 +71,7 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
 
         if serial.is_none() {
             // Create a new serial driver
-            let mut driver = unsafe { SerialPort::new() };
+            let mut driver = unsafe { SerialPort::new(0x400 as *const u16) };
 
             // "Clear" the screen
             for _ in 0..100 {
@@ -69,10 +88,8 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
 
     {
         // Store information about the soft reboot address
-        let mut sra = BOOT_ARGS.soft_reboot_addr.lock();
-        if sra.is_none() {
-            *sra = Some(PhysAddr(soft_reboot_entry as u64));
-        }
+        BOOT_ARGS.soft_reboot_addr.store(
+            soft_reboot_entry as u64, Ordering::SeqCst);
     }
 
     // Initialize the MMU
@@ -82,12 +99,16 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
     let (entry_point, stack, cr3, tramp_cr3) = {
         let mut kernel_entry = BOOT_ARGS.kernel_entry.lock();
         let mut page_table   = BOOT_ARGS.page_table.lock();
-        let mut tramp_table  = BOOT_ARGS.trampoline_page_table.lock();
 
         // If no kernel entry is set yet, download the kernel and load it
         if kernel_entry.is_none() {
-            assert!(page_table.is_none() && tramp_table.is_none(),
+            let tramp_table = BOOT_ARGS.trampoline_page_table
+                .load(Ordering::SeqCst);
+            assert!(page_table.is_none() && tramp_table == 0,
                 "Page tables set up before kernel!?");
+
+            BOOT_ARGS.serial.lock().as_mut().unwrap()
+                .write(b"Downloading kernel...\n");
 
             // Download the kernel
             let kernel = loop {
@@ -98,6 +119,9 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
                 BOOT_ARGS.serial.lock().as_mut().unwrap()
                     .write(b"Kernel download failed, retrying\n");
             };
+            
+            BOOT_ARGS.serial.lock().as_mut().unwrap()
+                .write(b"Kernel download complete!\n");
 
             // Parse the PE from the kernel
             let pe = PeParser::parse(&kernel).expect("Failed to parse PE");
@@ -210,8 +234,11 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
 
             // Set up the entry point and page table
             *kernel_entry = Some(pe.entry_point);
-            *tramp_table  = Some(trampoline_table);
             *page_table   = Some(table);
+           
+            // Save the trampoline table address
+            BOOT_ARGS.trampoline_page_table.store(trampoline_table.table().0,
+                                                  Ordering::SeqCst);
         }
 
         // Get exclusive access to physical memory
@@ -231,23 +258,30 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
         page_table.map(&mut pmem,
                        VirtAddr(stack_addr), PageType::Page4K,
                        KERNEL_STACK_SIZE, true, true, false).unwrap();
+        
+        // Get the address of the trampoline table
+        let tramp_table = BOOT_ARGS.trampoline_page_table
+            .load(Ordering::SeqCst);
 
         (
             *kernel_entry.as_ref().unwrap(),
             stack_addr + KERNEL_STACK_SIZE,
             page_table.table().0 as u32,
-            tramp_table.as_ref().unwrap().table().0 as u32,
+            tramp_table as u32,
         )
     };
 
     extern {
         fn enter64(entry_point: u64, stack: u64, param: u64, cr3: u32,
-                   tramp_cr3: u32, phys_window_base: u64) -> !;
+                   tramp_cr3: u32, phys_window_base: u64, core_id: u32) -> !;
     }
 
+    // Update the core ID count and get a unique 0-indexed core ID
+    let core_id = CORE_ID.fetch_add(1, Ordering::SeqCst);
+
     unsafe {
-        enter64(entry_point, stack, &BOOT_ARGS as *const BootArgs as u64,
-                cr3, tramp_cr3, KERNEL_PHYS_WINDOW_BASE);
+        enter64(entry_point, stack, &BOOT_ARGS as *const _ as u64,
+                cr3, tramp_cr3, KERNEL_PHYS_WINDOW_BASE, core_id);
     }
 }
 

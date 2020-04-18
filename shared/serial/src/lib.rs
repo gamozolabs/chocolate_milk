@@ -12,10 +12,11 @@ pub struct SerialPort {
 
 impl SerialPort {
     /// Initialize the serial ports on the system to 115200n1. This should only
-    /// ever be called once, hence, it is marked unsafe. This also assumes that
-    /// memory is identity mapped, such that `0x400` is a valid pointer to the
-    /// bios data area.
-    pub unsafe fn new() -> Self {
+    /// ever be called once, hence, it is marked unsafe.
+    /// `bda_base` is the virtual address of the BIOS data area. This is at
+    /// physical address `0x400`, however it's up to the caller to make sure
+    /// that `bda_base` is the virtual address which represents this.
+    pub unsafe fn new(bda_base: *const u16) -> Self {
         // Create a new serial port driver
         let mut ret = SerialPort {
             devices: [None; 4]
@@ -24,7 +25,7 @@ impl SerialPort {
         // Go through each possible COM port
         for (com_id, device) in ret.devices.iter_mut().enumerate() {
             // Get the COM port I/O address from the BIOS data area (BDA)
-            let port = *(0x400 as *const u16).offset(com_id as isize);
+            let port = *bda_base.offset(com_id as isize);
 
             // If the port address is zero, it is not present as reported by
             // the BIOS
@@ -46,7 +47,33 @@ impl SerialPort {
             *device = Some(port);
         }
 
+        // Drain the all serial ports of all inbound bytes
+        while let Some(_) = ret.read_byte() {}
+
         ret
+    }
+
+    /// Read a byte from whatever COM port has a byte available
+    pub fn read_byte(&mut self) -> Option<u8> {
+        // Go through each device
+        for port in &self.devices {
+            // If the device is present
+            if let &Some(port) = port {
+                unsafe {
+                    // Check if there is a byte available
+                    if (cpu::in8(port + 5) & 1) == 0 {
+                        // No byte available
+                        continue;
+                    }
+
+                    // Read the byte that was present on this port
+                    return Some(cpu::in8(port));
+                }
+            }
+        }
+
+        // No bytes available
+        None
     }
 
     /// Write a byte to a COM port

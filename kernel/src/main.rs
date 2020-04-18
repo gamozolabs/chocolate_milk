@@ -1,6 +1,7 @@
 //! The main kernel entry point!
 
 #![feature(panic_info_message, alloc_error_handler, asm, global_asm)]
+#![feature(const_in_array_repeat_expressions)]
 
 #![no_std]
 #![no_main]
@@ -15,6 +16,9 @@ extern crate core_reqs;
 mod panic;
 mod mm;
 mod interrupts;
+mod apic;
+mod acpi;
+mod intrinsics;
 
 use page_table::PhysAddr;
 
@@ -24,59 +28,56 @@ fn release_early_stack() {
     unsafe { mm::write_phys(PhysAddr(0x7e00), 1u8); }
 }
 
-/// INIT all processors, shutdown the kernel, download a new kernel, and boot
-/// into it without resetting the actual CPU.
-pub unsafe fn soft_reboot() {
-    // INIT the other processors
-    mm::write_phys(PhysAddr(0xfee0_0300), 0xc4500u32);
-    mm::write_phys(PhysAddr(0xfee0_0300), 0xc4500u32);
-
-    // Get access to the soft reboot address as well as the trampoline page
-    // table.
-    let soft_reboot = core!().boot_args.soft_reboot_addr.lock().unwrap();
-    let trampoline_cr3 = core!().boot_args.trampoline_page_table.lock()
-        .as_ref().unwrap().table();
-
-    // Compute the virtual address of the soft reboot entry point based
-    // on the physical address
-    let vaddr = boot_args::KERNEL_PHYS_WINDOW_BASE + soft_reboot.0;
-
-    // Convert the soft reboot virtual address into a function pointer that
-    // takes one `PhysAddr` argument, which is the trampoline cr3
-    let soft_reboot = *(&vaddr as *const u64 as *const extern fn(PhysAddr));
-
-    // Perform the soft reboot!
-    soft_reboot(trampoline_cr3);
-}
-
 #[no_mangle]
-pub extern fn entry(boot_args: PhysAddr) -> ! {
+pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // Release the early boot stack, now that we have our own stack
     release_early_stack();
 
-    // Initialize the core locals
-    core_locals::init(boot_args);
-
-    // Initialize interrupts for this core
-    unsafe {
-        interrupts::init();
-    }
+    // Initialize the core locals, this must happen first.
+    core_locals::init(boot_args, core_id);
     
-    if cpu::is_bsp() {
+    // Initialize interrupts
+    interrupts::init();
+
+    // Initialize the APIC
+    apic::init();
+    
+    if core!().id == 0 {
         // One-time initialization for the whole kernel
 
-        // Bring up all other cores
-        unsafe {
-            cpu::wrmsr(0x1b, 0xfee0_0000 | (1 << 11) |
-                       ((cpu::is_bsp() as u64) << 8));
-
-            mm::write_phys(PhysAddr(0xfee0_0300), 0xc4500u32);
-            mm::write_phys(PhysAddr(0xfee0_0300), 0xc4608u32);
-            mm::write_phys(PhysAddr(0xfee0_0300), 0xc4608u32);
-        }
+        // Bring up all APICs on the system and also initialize NUMA
+        // information with the memory manager through the use of the ACPI
+        // information.
+        unsafe { acpi::init() }
     }
 
-    print!("Core ID {} online\n", core!().id);
+    // Let ACPI know that we've booted, it'll be happy to know we're here!
+    acpi::core_checkin();
+
+    if core!().id == 0 {
+        // Enable the APIC timer
+        unsafe { core!().apic.lock().as_mut().unwrap().enable_timer(); }
+        //core!().enable_interrupts();
+    }
+
+    //print!("Core online {}\n", core!().id);
+
+    if core!().id == acpi::num_cores() - 1 {
+        print!("We made it! All cores online! {}\n", core!().id + 1);
+    }
+
+    if core!().id == 0 {
+        panic!("OH NO I MYSELF DIED");
+    }
+
+    //loop {
+        //let mut freemem = core!().boot_args.free_memory.lock();
+        //let freemem = freemem.as_mut().unwrap();
+
+
+        //let alc = freemem.allocate_prefer(4096, 4096, mm::memory_range());
+        //core::mem::drop(freemem);
+    //}
 
     cpu::halt();
 }

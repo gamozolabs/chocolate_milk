@@ -94,79 +94,132 @@ pm_entry:
 [bits 64]
 
 ; Entry point for a soft reboot. When a soft reboot is requested, it is
-; expected that the kernel has INIT all other processors on the system.
+; expected that the kernel has halted all other processors on the system.
 ; The kernel must also disable any devices which may be performing DMA or
 ; interrupts that it set up since the bootloader gave it execution.
 ; At this stage, we transition back from long mode into real mode, and jump
 ; right into the bootloader entry
 soft_reboot:
+    ; Disable interrupts
+    cli
+
     ; We're currently running in the kernel virtual memory space. This does
     ; not have physical memory directly mapped, thus we must switch to the
     ; trampoline CR3 provided
     mov cr3, rcx
-    
-    ; Load the original GDT, since the kernel has relocated the GDT into its
-    ; address space
-    lgdt [gdt]
 
     ; Clear all GPRs. This will cause the high parts of registers to become
     ; zero, which might help with some weird transitional issues when going
     ; back to 16-bit mode
-    xor eax,  eax
-    xor ebx,  ebx
-    xor ecx,  ecx
-    xor edx,  edx
-    xor edi,  edi
-    xor esi,  esi
-    xor esp,  esp
-    xor ebp,  ebp
-    xor r8d,  r8d
-    xor r9d,  r9d
-    xor r10d, r10d
-    xor r11d, r11d
-    xor r12d, r12d
-    xor r13d, r13d
-    xor r14d, r14d
-    xor r15d, r15d
+	xor rax, rax
+	mov rbx, rax
+	mov rcx, rax
+	mov rdx, rax
+	mov rsi, rax
+	mov rdi, rax
+	mov rbp, rax
+	mov  r8, rax
+	mov  r9, rax
+	mov r10, rax
+	mov r11, rax
+	mov r12, rax
+	mov r13, rax
+	mov r14, rax
+	mov r15, rax
 
-    ; Jump to 32-bit mode
-    jmp far [.jpoint]
+    ; Load the original GDT, since the kernel has relocated the GDT into its
+    ; address space
+    lgdt [gdt]
+    
+    ; Load a stack
+    mov rsp, 0x7c00
 
-; 64-bit far jump
-.jpoint:
-    dq .down_to_protected_mode ; rip
-    dw 0x0018                  ; cs
+    ; Unblock NMIs
+    push qword 0x0030
+    push qword 0x7c00
+    pushfq
+    push qword 0x0028
+    push qword .unblock_nmis
+    iretq
 
-[bits 32]
-.down_to_protected_mode:
-    ; Disable paging
-    mov eax, cr0
-    and eax, ~(1 << 31)
-    mov cr0, eax
+.unblock_nmis:
 
-    ; Load the 16-bit selectors
-    mov ax, 0x0010
-    mov es, ax
-    mov ds, ax
-    mov fs, ax
-    mov gs, ax
-    mov ss, ax
-
-    ; Switch to a 16-bit code selector
-    jmp 0x0008:(.down_to_real_mode - 0x7c00)
+	; Must be far dword for Intel/AMD compatibility. AMD does not support
+	; 64-bit offsets in far jumps in long mode, Intel does however. Force
+	; it to be 32-bit as it works in both.
+	jmp far dword [reentry_longjmp]
 
 [bits 16]
-.down_to_real_mode:
-    ; Disable protected mode
-    mov eax, cr0
-    and eax, ~(1 << 0)
-    mov cr0, eax
 
+align 16
+rmmode_again:
+	; Disable paging
+	mov eax, cr0
+	btr eax, 31
+	mov cr0, eax
+
+	; Disable long mode
+	mov ecx, 0xc0000080
+	rdmsr
+	btr eax, 8
+	wrmsr
+
+	; Load up the segments to be 16-bit segments
+	mov ax, 0x10
+	mov es, ax
+	mov ds, ax
+	mov fs, ax
+	mov gs, ax
+	mov ss, ax
+
+	; Disable protected mode
+	mov eax, cr0
+	btr eax, 0
+	mov cr0, eax
+
+    pushfw
+    push word 0
+    push word .enable_nmis
+    iretw
+
+.enable_nmis:
+	; Zero out all GPRs (clear out high parts for when we go into 16-bit)
+	xor eax, eax
+	mov ebx, eax
+	mov ecx, eax
+	mov edx, eax
+	mov esi, eax
+	mov edi, eax
+	mov ebp, eax
+	mov esp, 0x7c00
+
+	; Reset the GDT and IDT to their original boot states
+	lgdt [rm_gdt]
+	lidt [rm_idt]
+    
     ; Set up that we're in a fresh boot
     mov byte [fresh_boot], 1
+    
+    ; Set up that the stack is available for use
+    mov byte [stack_avail], 1
 
-    ; Jump to entry
-    jmp entry
+	; Jump back to the start of the bootloader
+	jmp 0x0000:0x7c00
+
+align 8
+reentry_longjmp:
+	dd (rmmode_again - 0x7c00)
+	dw 0x0008
+
+align 8
+rm_idt:
+	dw 0xffff
+	dq 0
+
+align 8
+rm_gdt:
+	dw 0xffff
+	dq 0
 
 times 510-($-$$) db 0
 dw 0xaa55

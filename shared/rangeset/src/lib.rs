@@ -16,11 +16,11 @@ pub struct Range {
 }
 
 /// A set of non-overlapping inclusive `u64` ranges
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RangeSet {
     /// Fixed array of ranges in the set
-    ranges: [Range; 32],
+    ranges: [Range; 256],
 
     /// Number of in use entries in `ranges`
     ///
@@ -34,7 +34,7 @@ impl RangeSet {
     /// Create a new empty RangeSet
     pub const fn new() -> RangeSet {
         RangeSet {
-            ranges: [Range { start: 0, end: 0 }; 32],
+            ranges: [Range { start: 0, end: 0 }; 256],
             in_use: 0,
         }
     }
@@ -75,8 +75,15 @@ impl RangeSet {
                 // Note that we do a saturated add of one to each range.
                 // This is done so that two ranges that are 'touching' but
                 // not overlapping will be combined.
-                if !overlaps(range.start, range.end.saturating_add(1),
-                        ent.start, ent.end.saturating_add(1)) {
+                if overlaps(
+                        Range {
+                            start: range.start,
+                            end:   range.end.saturating_add(1),
+                        },
+                        Range {
+                            start: ent.start,
+                            end:   ent.end.saturating_add(1)
+                        }).is_none() {
                     continue;
                 }
 
@@ -118,13 +125,13 @@ impl RangeSet {
 
                 // If there is no overlap, there is nothing to do with this
                 // range.
-                if !overlaps(range.start, range.end, ent.start, ent.end) {
+                if overlaps(range, ent).is_none() {
                     continue;
                 }
 
                 // If this entry is entirely contained by the range to remove,
                 // then we can just delete it.
-                if contains(ent.start, ent.end, range.start, range.end) {
+                if contains(ent, range) {
                     self.delete(ii);
                     continue 'try_subtractions;
                 }
@@ -181,6 +188,17 @@ impl RangeSet {
 
     /// Allocate `size` bytes of memory with `align` requirement for alignment
     pub fn allocate(&mut self, size: u64, align: u64) -> Option<usize> {
+        // Allocate anywhere from the `RangeSet`
+        self.allocate_prefer(size, align, None)
+    }
+
+    /// Allocate `size` bytes of memory with `align` requirement for alignment
+    /// Preferring to allocate from the `region`. If an allocation cannot be
+    /// satisfied from `region` the allocation will come from whatever is next
+    /// best. If `region` is `None`, then the allocation will be satisfied from
+    /// anywhere.
+    pub fn allocate_prefer(&mut self, size: u64, align: u64,
+                           region: Option<Range>) -> Option<usize> {
         // Don't allow allocations of zero size
         if size == 0 {
             return None;
@@ -196,7 +214,7 @@ impl RangeSet {
 
         // Go through each memory range in the `RangeSet`
         let mut allocation = None;
-        for ent in self.entries() {
+        'allocation_search: for ent in self.entries() {
             // Determine number of bytes required for front padding to satisfy
             // alignment requirements.
             let align_fix = (align - (ent.start & alignmask)) & alignmask;
@@ -218,6 +236,43 @@ impl RangeSet {
                 continue;
             }
 
+            // If there was a specific region the caller wanted to use
+            if let Some(region) = region {
+                // Check if there is overlap with this region
+                if let Some(overlap) = overlaps(*ent, region) {
+                    // Compute the rounded-up alignment from the overlapping
+                    // region
+                    let align_overlap =
+                        (overlap.start.wrapping_add(alignmask)) & !alignmask;
+
+                    if align_overlap >= overlap.start &&
+                            align_overlap <= overlap.end &&
+                            (overlap.end - align_overlap) >= (size - 1) {
+                        // Alignment did not cause an overflow AND
+                        // Alignment did not cause exceeding the end AND
+                        // Amount of aligned overlap can satisfy the allocation
+
+                        // Compute the inclusive end of this proposed
+                        // allocation
+                        let overlap_alc_end = align_overlap + (size - 1);
+                        
+                        // Make sure the allocation fits in the current
+                        // addressable address space
+                        if align_overlap > core::usize::MAX as u64 ||
+                                overlap_alc_end > core::usize::MAX as u64 {
+                            continue 'allocation_search;
+                        }
+
+                        // We know the allocation can be satisfied starting at
+                        // `align_overlap`
+                        allocation = Some((align_overlap,
+                                           overlap_alc_end,
+                                           align_overlap as usize));
+                        break 'allocation_search;
+                    }
+                }
+            }
+
             // Compute the "best" allocation size to date
             let prev_size = allocation.map(|(base, end, _)| end - base);
 
@@ -237,35 +292,52 @@ impl RangeSet {
     }
 }
 
-/// Determines of the two ranges [x1, x2] and [y1, y2] have any overlap
-fn overlaps(mut x1: u64, mut x2: u64, mut y1: u64, mut y2: u64) -> bool {
-    // Make sure x2 is always > x1
-    if x1 > x2 {
-        core::mem::swap(&mut x1, &mut x2);
+/// Determines overlap of `a` and `b`. If there is overlap, returns the range
+/// of the overlap
+///
+/// In this overlap, returns:
+///
+/// [a.start -------------- a.end]
+///            [b.start -------------- b.end]
+///            |                 |
+///            ^-----------------^
+///            [ Return value    ]
+///
+fn overlaps(mut a: Range, mut b: Range) -> Option<Range> {
+    // Make sure range `a` is always lowest to biggest
+    if a.start > a.end {
+        core::mem::swap(&mut a.end, &mut a.start);
     }
 
-    // Make sure y2 is always > y1
-    if y1 > y2 {
-        core::mem::swap(&mut y1, &mut y2);
+    // Make sure range `b` is always lowest to biggest
+    if b.start > b.end {
+        core::mem::swap(&mut b.end, &mut b.start);
     }
 
     // Check if there is overlap
-    x1 <= y2 && y1 <= x2
+    if a.start <= b.end && b.start <= a.end {
+        Some(Range {
+            start: core::cmp::max(a.start, b.start),
+            end:   core::cmp::min(a.end,   b.end)
+        })
+    } else {
+        None
+    }
 }
 
-/// Returns true if the entirity of [x1, x2] is contained inside [y1, y2], else
+/// Returns true if the entirity of `a` is contained inside `b`, else
 /// returns false.
-fn contains(mut x1: u64, mut x2: u64, mut y1: u64, mut y2: u64) -> bool {
-    // Make sure x2 is always > x1
-    if x1 > x2 {
-        core::mem::swap(&mut x1, &mut x2);
+fn contains(mut a: Range, mut b: Range) -> bool {
+    // Make sure range `a` is always lowest to biggest
+    if a.start > a.end {
+        core::mem::swap(&mut a.end, &mut a.start);
     }
 
-    // Make sure y2 is always > y1
-    if y1 > y2 {
-        core::mem::swap(&mut y1, &mut y2);
+    // Make sure range `b` is always lowest to biggest
+    if b.start > b.end {
+        core::mem::swap(&mut b.end, &mut b.start);
     }
 
-    x1 >= y1 && x2 <= y2
+    a.start >= b.start && a.end <= b.end
 }
 

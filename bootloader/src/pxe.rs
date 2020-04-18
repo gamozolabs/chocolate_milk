@@ -9,7 +9,7 @@ use crate::realmode::{invoke_realmode, pxecall, RegisterState};
 use lockcell::LockCell;
 
 /// A guard to prevent multiple uses of the PXE API at the same time
-static PXE_GUARD: LockCell<()> = LockCell::new(());
+static PXE_GUARD: LockCell<(), crate::LockInterrupts> = LockCell::new(());
 
 /// Convert a 16-bit `seg:off` pointer into a linear address
 fn segoff_to_linear(seg: u16, off: u16) -> usize {

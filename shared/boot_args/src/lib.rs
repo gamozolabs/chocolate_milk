@@ -13,8 +13,8 @@ use core::sync::atomic::AtomicU64;
 
 use serial::SerialPort;
 use rangeset::RangeSet;
-use lockcell::LockCell;
-use page_table::{PhysAddr, PageTable};
+use lockcell::{LockCell, InterruptState};
+use page_table::PageTable;
 
 /// Base vaddr to use for kernel stacks
 pub const KERNEL_STACKS_BASE: u64 = 0x0000_7473_0000_0000;
@@ -43,17 +43,17 @@ pub const KERNEL_PHYS_WINDOW_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 /// re-ordering of non-repr-C structures to fit alignment demands without
 /// padding.
 #[repr(C)]
-pub struct BootArgs {
+pub struct BootArgs<I: InterruptState> {
     /// All memory which is available for use by the kernel and bootloader.
     /// This structure is potentially used at the same time by both the
     /// bootloader and the kernel.
-    pub free_memory: LockCell<Option<RangeSet>>,
+    pub free_memory: LockCell<Option<RangeSet>, I>,
 
     /// The serial driver
-    pub serial: LockCell<Option<SerialPort>>,
+    pub serial: LockCell<Option<SerialPort>, I>,
 
     /// The page table used for the kernel
-    pub page_table: LockCell<Option<PageTable>>,
+    pub page_table: LockCell<Option<PageTable>, I>,
     
     /// The trampoline page table to be used during the paging transition from
     /// the bootloader to the kernel. This will have [0..bootloader_end] mapped
@@ -64,10 +64,13 @@ pub struct BootArgs {
     /// page table can be switched while executing in the low-memory physical
     /// addresses of the bootloader, and then we can jump to the kernel
     /// physical mapping.
-    pub trampoline_page_table: LockCell<Option<PageTable>>,
+    ///
+    /// This holds the physical address of the base of the trampoline page
+    /// table.
+    pub trampoline_page_table: AtomicU64,
 
     /// Address of the kernel entry point
-    pub kernel_entry: LockCell<Option<u64>>,
+    pub kernel_entry: LockCell<Option<u64>, I>,
 
     /// The virtual address of the "next available stack". This is just used to
     /// give unique stack addresses to each core as they come online. This
@@ -76,9 +79,9 @@ pub struct BootArgs {
     pub stack_vaddr: AtomicU64,
 
     /// A lock to be used to make `print!()` macros fully atomic
-    pub print_lock: LockCell<()>,
+    pub print_lock: LockCell<(), I>,
 
-    /// Address of the soft reboot entry point
-    pub soft_reboot_addr: LockCell<Option<PhysAddr>>,
+    /// Address of the soft reboot entry point (0 means uninitialized)
+    pub soft_reboot_addr: AtomicU64,
 }
 

@@ -5,24 +5,25 @@
 use core::alloc::Layout;
 use core::mem::size_of;
 
-pub const PAGE_PRESENT: u64 = 1 <<  0;
-pub const PAGE_WRITE:   u64 = 1 <<  1;
-pub const PAGE_USER:    u64 = 1 <<  2;
-pub const PAGE_SIZE:    u64 = 1 <<  7;
-pub const PAGE_NX:      u64 = 1 << 63;
+pub const PAGE_PRESENT:       u64 = 1 <<  0;
+pub const PAGE_WRITE:         u64 = 1 <<  1;
+pub const PAGE_USER:          u64 = 1 <<  2;
+pub const PAGE_CACHE_DISABLE: u64 = 1 <<  4;
+pub const PAGE_SIZE:          u64 = 1 <<  7;
+pub const PAGE_NX:            u64 = 1 << 63;
 
 /// The state of a page table mapping. Contains the information about every
 /// level of the translation. Also contains information about whether the
 /// page is final
 #[derive(Debug, Clone, Copy)]
 pub struct Mapping {
-    pml4e: Option<PhysAddr>,
-    pdpe:  Option<PhysAddr>,
-    pde:   Option<PhysAddr>,
-    pte:   Option<PhysAddr>,
+    pub pml4e: Option<PhysAddr>,
+    pub pdpe:  Option<PhysAddr>,
+    pub pde:   Option<PhysAddr>,
+    pub pte:   Option<PhysAddr>,
 
     /// Actual address of the base of the page and the offset into it
-    page: Option<(PhysAddr, u64)>,
+    pub page: Option<(PhysAddr, u64)>,
 }
 
 impl Mapping {
@@ -390,7 +391,7 @@ impl PageTable {
     /// Translate a virtual address in the `self` page table into its
     /// components. This will include entries for every level in the table as
     /// well as the final page result if the page is mapped and present.
-    pub fn translate<P: PhysMem>(&mut self, phys_mem: &mut P,
+    pub fn translate<P: PhysMem>(&self, phys_mem: &mut P,
                                  vaddr: VirtAddr) -> Option<Mapping> {
         // Start off with an empty mapping
         let mut ret = Mapping {

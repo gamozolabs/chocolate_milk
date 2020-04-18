@@ -1,9 +1,59 @@
 use core::mem::ManuallyDrop;
+use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 
+use crate::apic::Apic;
+use crate::acpi::{set_core_state, ApicState};
+
+/// If a given interrupt requires an EOI when it is handled, the corresponding
+/// offset into this table will indicate `true`.
+static EOI_REQUIRED: [AtomicBool; 256] = [AtomicBool::new(false); 256];
+
+/// If set to `true`, EOIs will be handled where `EOI_REQUIRED` is set, and
+/// no handler will be invoked.
+pub static DRAINING_EOIS: AtomicBool = AtomicBool::new(false);
+
 /// Type for an interrupt gate for 64-bit mode
 const X64_INTERRUPT_GATE: u32 = 0xe;
+
+/// Dispatch routine definition
+/// Arguments are (interrupt number, frame, error code, register state at int)
+///
+/// Returns `true` if the interrupt was handled, and execution should continue
+type InterruptDispatch =
+    unsafe fn(u8, &mut InterruptFrame, usize, &mut AllRegs) -> bool;
+
+/// Structure to hold different dispatch routines for interrupts
+pub struct Interrupts {
+    /// Dispatch routines for interrupts
+    dispatch: [Option<InterruptDispatch>; 256],
+}
+
+impl Interrupts {
+    /// Register an interrupt handler for interrupt `num`
+    pub unsafe fn add_handler(&mut self, num: u8, handler: InterruptDispatch,
+                              needs_eoi: bool) {
+        assert!(self.dispatch[num as usize].is_none(),
+            "Interrupt handler already installed for INT #{}", num);
+        self.dispatch[num as usize] = Some(handler);
+        
+        // Potentially enable EOIs for the interrupt number
+        EOI_REQUIRED[num as usize].store(needs_eoi, Ordering::SeqCst);
+    }
+    
+    /// De-register an interrupt handler for interrupt `num`
+    pub unsafe fn remove_handler(&mut self, num: u8,
+                                 handler: InterruptDispatch) {
+        assert!(self.dispatch[num as usize].map(|x| x as usize) == 
+                Some(handler as usize),
+            "Handler not installed or did not match for deregister");
+        self.dispatch[num as usize] = None;
+
+        // Disable EOIs for the interrupt number
+        EOI_REQUIRED[num as usize].store(false, Ordering::SeqCst);
+    }
+}
 
 /// Descriptor pointer used to load with `lidt` and `lgdt`
 #[repr(C, packed)]
@@ -48,10 +98,36 @@ impl IDTEntry {
     }
 }
 
+/// Returns a bitmask of the interrupts which are handled with EOIs in the
+/// current state. This is racey as we're going to construct the bitmaps from
+/// the list of atomic bools, and thus must be only used in situations where
+/// the `EOI_REQUIRED` table is not changing, or the code is not sensitive to
+/// the correctness of this output.
+///
+/// This is a safe function as it doesn't do anything dangerous, it's just some
+/// data.
+pub fn eoi_required() -> [u128; 2] {
+    let mut ret = [0; 2];
+
+    // Accumulate the EOI required states into two 128 bits representing the
+    // entire interrupt vector space
+    for ii in 0..256 {
+        let idx = ii / 128;
+        let bit = ii % 128;
+        let val = EOI_REQUIRED[ii as usize].load(Ordering::SeqCst);
+        ret[idx] |= (val as u128) << bit;
+    }
+
+    ret
+}
+
 /// Switch to a kernel-based GDT, load a TSS with a critical stack for
 /// #DF, #MC, and NMI interrupts. Then set up a IDT with all interrupts passing
 /// through to the `interrupt_handler` Rust function.
-pub unsafe fn init() {
+pub fn init() {
+    let mut interrupts = core!().interrupts.lock();
+    assert!(interrupts.is_none(), "Interrupts have already been initialized");
+
     // Create a new, empty TSS
 	let mut tss: ManuallyDrop<Box<Tss>> =
         ManuallyDrop::new(Box::new(Tss::default()));
@@ -89,16 +165,18 @@ pub unsafe fn init() {
         gdt.as_ptr() as u64,
     );
 
-    // Update to use a GDT in the current virtual space
-    asm!(r#"
-            // Load the GDT
-            lgdt [$0]
+    unsafe {
+        // Update to use a GDT in the current virtual space
+        asm!(r#"
+                // Load the GDT
+                lgdt [$0]
 
-            // Load the TSS
-            mov cx, 0x38
-            ltr cx
-    "# :: "r"(&gdt_ptr as *const TablePtr) : "memory", "rcx" :
-        "volatile", "intel");
+                // Load the TSS
+                mov cx, 0x38
+                ltr cx
+        "# :: "r"(&gdt_ptr as *const TablePtr) : "memory", "rcx" :
+            "volatile", "intel");
+    }
     
     // Create a new IDT
     let mut idt = ManuallyDrop::new(Vec::with_capacity(256));
@@ -126,9 +204,16 @@ pub unsafe fn init() {
     // The IDT pointer which has the (limit, address of IDT)
     let idt_ptr = TablePtr(0xfff, idt.as_ptr() as u64);
   
-    // Load the IDT!
-    asm!("lidt [$0]" :: "r"(&idt_ptr as *const TablePtr) :
-         "memory" : "volatile", "intel");
+    unsafe {
+        // Load the IDT!
+        asm!("lidt [$0]" :: "r"(&idt_ptr as *const TablePtr) :
+             "memory" : "volatile", "intel");
+    }
+
+    // Create the interrupts structure
+    *interrupts = Some(Interrupts {
+        dispatch: [None; 256],
+    });
 }
 
 /// Shape of a raw 64-bit interrupt frame
@@ -183,10 +268,75 @@ pub struct AllRegs {
 /// Entry point for all interrupts and exceptions
 #[no_mangle]
 pub unsafe extern fn interrupt_handler(
-        number: usize, frame: &mut InterruptFrame, error: usize,
+        number: u8, frame: &mut InterruptFrame, error: usize,
         regs: &mut AllRegs) {
-    print!(
-r#"Interrupt {:#x}, error code {:#x}
+    // Increment the level of interrupt depth. This will automatically get
+    // decremented when the scope ends.
+    let _interrupt_ref = core!().enter_interrupt();
+
+    // Increment the exception refcount if this was an exception and not an
+    // interrupt
+    let _exception_ref = if number < 32 {
+        Some(core!().enter_exception())
+    } else {
+        None
+    };
+
+    // Handle NMIs specially
+    if number == 2 {
+        // If this is core ID 0, other cores have paniced and are informing us
+        // of their panic.
+        if core!().id == 0  {
+            // NMI, signalled that another core has paniced
+            panic!("Panic occured on another core");
+        } else {
+            // Mark that we're in the halted state
+            set_core_state(core!().apic_id().unwrap(), ApicState::Halted);
+
+            // Halt forever
+            cpu::halt();
+        }
+    }
+    
+    // Track if we handled the interrupt
+    let mut handled = false;
+
+    // Only dispatch if we're not in EOI draining mode
+    let draining_eois = DRAINING_EOIS.load(Ordering::SeqCst);
+    if !draining_eois {
+        // Attempt to get the dispatch handler for this exception.
+        let handler = core!().interrupts.try_lock()
+            .expect("Failed to get interrupts lock")
+            .as_ref().unwrap().dispatch[number as usize];
+        
+        // Invoke the dynamically installed interrupt handler if it exists
+        if let Some(handler) = handler {
+            if handler(number, frame, error, regs) {
+                // Handler said this interrupt was handled
+                handled = true;
+            }
+        }
+    }
+    
+    // EOI the APIC if this vector warrants EOIs
+    if EOI_REQUIRED[number as usize].load(Ordering::SeqCst) {
+        Apic::eoi();
+
+        // If we're only handling EOIs, return out as we have handled what
+        // was requested.
+        if draining_eois {
+            return;
+        }
+    }
+
+    // If the interrupt was handled, return out
+    if handled {
+        return;
+    }
+
+    // At this point the interrupt is fatal (unhandled)
+    panic!(
+r#"Interrupt {:#x}, error code {:#x} on core {}
 Registers at exception:
     rax {:016x} rcx {:016x} rdx {:016x} rbx {:016x}
     rsp {:016x} rbp {:016x} rsi {:016x} rdi {:016x}
@@ -194,6 +344,7 @@ Registers at exception:
     r12 {:016x} r13 {:016x} r14 {:016x} r15 {:016x}
     rfl {:016x}
     rip {:016x}
+    cr2 {:016x}
 
     xmm0  {:032x}
     xmm1  {:032x}
@@ -212,7 +363,7 @@ Registers at exception:
     xmm14 {:032x}
     xmm15 {:032x}
 "#,
-        number, error,
+        number, error, core!().id,
 
         regs.rax,  regs.rcx, regs.rdx, regs.rbx,
         frame.rsp, regs.rbp, regs.rsi, regs.rdi,
@@ -220,13 +371,12 @@ Registers at exception:
         regs.r12,  regs.r13, regs.r14, regs.r15,
         frame.rflags,
         frame.rip,
+        cpu::read_cr2(),
 
         regs.xmm0,  regs.xmm1,  regs.xmm2,  regs.xmm3,
         regs.xmm4,  regs.xmm5,  regs.xmm6,  regs.xmm7,
         regs.xmm8,  regs.xmm9,  regs.xmm10, regs.xmm11,
         regs.xmm12, regs.xmm13, regs.xmm14, regs.xmm15);
-    
-    panic!("Fatal exception");
 }
 
 const INT_HANDLERS: [unsafe extern fn(); 256] = [

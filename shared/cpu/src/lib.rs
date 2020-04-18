@@ -3,17 +3,8 @@
 #![feature(asm)]
 #![no_std]
 
-/// MSR for APIC base
-const IA32_APIC_BASE: u32 = 0x1b;
-
 /// MSR for active GS base
 const IA32_GS_BASE: u32 = 0xc0000101;
-
-/// Returns true if the current CPU is the BSP, otherwise returns false.
-#[inline]
-pub fn is_bsp() -> bool {
-    (unsafe { rdmsr(IA32_APIC_BASE) } & (1 << 8)) != 0
-}
 
 /// Output `val` to I/O port `addr`
 #[inline]
@@ -33,6 +24,18 @@ pub unsafe fn in8(addr: u16) -> u8 {
 #[inline]
 pub unsafe fn invlpg(vaddr: usize) {
     asm!("invlpg [$0]" :: "r"(vaddr) : "memory" : "volatile", "intel");
+}
+
+/// Enable interrupts
+#[inline]
+pub unsafe fn enable_interrupts() {
+    asm!("sti" ::: "memory", "cc" : "volatile", "intel");
+}
+
+/// Disable interrupts
+#[inline]
+pub unsafe fn disable_interrupts() {
+    asm!("cli" ::: "memory", "cc" : "volatile", "intel");
 }
 
 /// Read an MSR
@@ -69,19 +72,24 @@ pub fn rdtsc() -> u64 {
     ((val_hi as u64) << 32) | val_lo as u64
 }
 
-/// Set the GS
+/// Get the GS base
+#[inline]
+pub unsafe fn gs_base() -> u64 {
+    rdmsr(IA32_GS_BASE)
+}
+
+/// Set the GS base
 #[inline]
 pub unsafe fn set_gs_base(base: u64) {
     wrmsr(IA32_GS_BASE, base);
 }
 
-/// Disable interrupts and halt forever
+/// Halt forever
 #[inline]
 pub fn halt() -> ! {
     unsafe {
         loop {
             asm!(r#"
-                cli
                 hlt
             "# :::: "volatile", "intel");
         }
@@ -107,6 +115,22 @@ pub unsafe fn cpuid(eax: u32, ecx: u32) -> (u32, u32, u32, u32) {
     (oeax, oebx, oecx, oedx)
 }
 
+/// Read cr2
+#[inline]
+pub fn read_cr2() -> u64 {
+    let val: u64;
+    unsafe {
+        asm!("mov $0, cr2" : "=r"(val) :: "memory" : "volatile", "intel");
+    }
+    val
+}
+
+/// Write to cr2
+#[inline]
+pub unsafe fn write_cr2(val: u64) {
+    asm!("mov cr2, $0" :: "r"(val) : "memory" : "volatile", "intel");
+}
+
 /// Read cr3
 #[inline]
 pub fn read_cr3() -> u64 {
@@ -121,6 +145,31 @@ pub fn read_cr3() -> u64 {
 #[inline]
 pub unsafe fn write_cr3(val: u64) {
     asm!("mov cr3, $0" :: "r"(val) : "memory" : "volatile", "intel");
+}
+
+/// Get the current flags
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn flags() -> u64 {
+    let val: u64;
+    asm!("pushfq ; pop $0" : "=r"(val) :: "memory" : "volatile", "intel");
+    val
+}
+
+/// Busy delay loop
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub fn delay(cycles: u64) {
+    if cycles <= 0 { return; }
+
+    unsafe {
+        asm!(r#"
+            mov rax, $0
+        2:
+            dec rax
+            jnz 2b
+        "# :: "r"(cycles) : "rax", "memory", "cc" : "volatile", "intel");
+    }
 }
 
 /// Structure representing the various CPU features which are supported on this
@@ -144,6 +193,7 @@ pub struct CPUFeatures {
     pub ssse3: bool,
     pub sse4_1: bool,
     pub sse4_2: bool,
+    pub x2apic: bool,
     pub xsave: bool,
     pub avx: bool,
     pub apic: bool,
@@ -172,7 +222,7 @@ pub fn get_cpu_features() -> CPUFeatures {
         features.max_extended_cpuid = cpuid(0x80000000, 0).0;
 
         if features.max_cpuid >= 1 {
-            let cpuid_1 = cpuid(1, 0);
+            let cpuid_1   = cpuid(1, 0);
             features.fpu  = ((cpuid_1.3 >>  0) & 1) == 1;
             features.vme  = ((cpuid_1.3 >>  1) & 1) == 1;
             features.de   = ((cpuid_1.3 >>  2) & 1) == 1;
@@ -190,6 +240,7 @@ pub fn get_cpu_features() -> CPUFeatures {
             features.ssse3   = ((cpuid_1.2 >>  9) & 1) == 1;
             features.sse4_1  = ((cpuid_1.2 >> 19) & 1) == 1;
             features.sse4_2  = ((cpuid_1.2 >> 20) & 1) == 1;
+            features.x2apic  = ((cpuid_1.2 >> 21) & 1) == 1;
             features.xsave   = ((cpuid_1.2 >> 26) & 1) == 1;
             features.avx     = ((cpuid_1.2 >> 28) & 1) == 1;
         }

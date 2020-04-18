@@ -241,6 +241,7 @@ _enter64:
 	; dword [esp + 0x1c] - Kernel cr3
 	; dword [esp + 0x20] - Trampoline cr3
     ; qword [esp + 0x24] - Physical window address
+    ; dword [esp + 0x2c] - 0-indexed core ID (0 indicates BSP)
 
 	; Get the parameters passed in to this function
 	mov esi, [esp+0x20] ; Trampoline cr3
@@ -292,6 +293,7 @@ lm_entry:
    
 .addr:
 	mov rcx, qword [rsp + 0x14] ; Parameter
+	mov edx, dword [rsp + 0x2c] ; Core ID
 	mov rdi, qword [rsp + 0x04] ; Entry point
 	mov rsp, qword [rsp + 0x0c] ; Stack
 

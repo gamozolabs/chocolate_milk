@@ -1,16 +1,90 @@
 use core::alloc::{Layout, GlobalAlloc};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+
+use crate::acpi::MAX_CORES;
 
 use rangeset::Range;
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::KERNEL_VMEM_BASE;
 use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
 
-/// Base address for virtual allocations
-static NEXT_FREE_VADDR: AtomicU64 = AtomicU64::new(KERNEL_VMEM_BASE);
+/// Table which is indexed by an APIC identifier to map to a physical range
+/// which is local to it its NUMA node
+static APIC_TO_MEMORY_RANGE: AtomicPtr<[Option<Range>; MAX_CORES]> =
+    AtomicPtr::new(core::ptr::null_mut());
 
-/// Gap between virtual allocations
-const GUARD_PAGE_SIZE: u64 = 32 * 1024;
+/// Get the preferred memory range for the currently running APIC. Returns
+/// `None` if we have no valid APIC ID yet, or we do not have NUMA knowledge
+/// of the current APIC ID
+pub fn memory_range() -> Option<Range> {
+    // Check to see if the `APIC_TO_MEMORY_RANGE` has been initialized
+    let atmr = APIC_TO_MEMORY_RANGE.load(Ordering::SeqCst);
+    if atmr.is_null() {
+        return None;
+    }
+
+    // Cast the memory range structure to something we can access
+    let atmr = unsafe { &*atmr };
+
+    // Based on our current APIC ID look up the memory range
+    core!().apic_id().and_then(|x| atmr[x as usize])
+}
+
+/// Establish the `APIC_TO_MEMORY_RANGE` global with the APIC IDs to their
+/// corresponding NUMA-local memory regions
+pub unsafe fn register_numa_nodes(apic_to_domain: BTreeMap<u32, u32>,
+        domain_to_mem: BTreeMap<u32, (PhysAddr, u64)>) {
+    // Create a heap-based database
+    let mut apic_mappings = Box::new([None; MAX_CORES]);
+
+    // Go through each APIC to domain mapping
+    for (&apic, domain) in apic_to_domain.iter() {
+        apic_mappings[apic as usize] = domain_to_mem.get(domain)
+            .and_then(|&(paddr, size)| {
+                Some(Range {
+                    start: paddr.0,
+                    end:   paddr.0.checked_add(size.checked_sub(1)?)?,
+                })
+            });
+    }
+
+    // Store the apic mapping database into the global!
+    APIC_TO_MEMORY_RANGE.store(Box::into_raw(apic_mappings), Ordering::SeqCst);
+}
+
+/// Find a free region of virtual memory that can hold `size` bytes and return
+/// the virtual address
+///
+/// This is only valid for virtual requests for 4 KiB mappings
+pub fn alloc_virt_addr_4k(size: u64) -> VirtAddr {
+    /// Base address for virtual allocations
+    static NEXT_FREE_VADDR: AtomicU64 = AtomicU64::new(KERNEL_VMEM_BASE);
+
+    /// Gap between virtual allocations
+    const GUARD_PAGE_SIZE: u64 = 32 * 1024;
+
+    assert!(size > 0 && (size & 0xfff) == 0,
+        "Invalid size for virtual region allocation");
+
+    // Compute the amount of virtual memory to reserve, including the guard
+    // size.
+    let reserve_size = GUARD_PAGE_SIZE.checked_add(size as u64)
+        .expect("Integer overflow on virtual region size");
+    
+    // Get a new virtual region that is free
+    let ret = VirtAddr(
+        NEXT_FREE_VADDR.fetch_add(reserve_size, Ordering::SeqCst)
+    );
+
+    // If we cannot add the reserve size from the return value, then the
+    // virtual memory wrapped the 64-bit boundary
+    ret.0.checked_add(reserve_size)
+        .expect("Integer overflow on virtual address range");
+
+    ret
+}
 
 /// Read a physical address containing a type `T`. This just handles the
 /// windowing and performs a `core::ptr::read_volatile`.
@@ -95,7 +169,8 @@ impl PageFreeList {
                 let phys_mem     = phys_mem.as_mut().unwrap();
 
                 // Bulk allocate some memory to populate the empty free list
-                phys_mem.allocate(FREE_LIST_BATCH, 4096)
+                phys_mem.allocate_prefer(FREE_LIST_BATCH, 4096,
+                                         memory_range())
                     .expect("Failed to allocate physical memory") as u64
             };
 
@@ -188,8 +263,9 @@ impl PhysMem for PhysicalMemory {
 
             // Could not satisfy allocation from free list, allocate
             // directly from the physical memory pool
-            let alc = phys_mem.allocate(layout.size() as u64,
-                                        layout.align() as u64)
+            let alc = phys_mem.allocate_prefer(layout.size() as u64,
+                                               layout.align() as u64,
+                                               memory_range())
                 .expect("Failed to allocate physical memory");
             PhysAddr(alc as u64)
         }
@@ -228,9 +304,8 @@ impl GlobalAllocator {
         // 4-KiB align up the allocation size
         let alignsize = (layout.size().checked_add(0xfff)? & !0xfff) as u64;
 
-        // Get a unique address for this mapping
-        let vaddr = NEXT_FREE_VADDR.fetch_add(
-            alignsize.checked_add(GUARD_PAGE_SIZE)?, Ordering::SeqCst);
+        // Get a unique virtual address for this allocation
+        let vaddr = alloc_virt_addr_4k(alignsize);
         
         // Get access to physical memory
         let mut pmem = PhysicalMemory;
@@ -240,12 +315,12 @@ impl GlobalAllocator {
         let page_table = page_table.as_mut()?;
 
         // Map in the memory as RW
-        page_table.map(&mut pmem, VirtAddr(vaddr), PageType::Page4K,
+        page_table.map(&mut pmem, vaddr, PageType::Page4K,
             alignsize, true, true, false)?;
 
         // Allocation success, `vaddr` now is valid as read-write for
         // `alignsize` bytes!
-        Some(vaddr as *mut u8)
+        Some(vaddr.0 as *mut u8)
     }
 }
 
