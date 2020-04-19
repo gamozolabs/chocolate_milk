@@ -6,7 +6,7 @@
 /// MSR for active GS base
 const IA32_GS_BASE: u32 = 0xc0000101;
 
-/// Output `val` to I/O port `addr`
+/// Output an 8-bit `val` to I/O port `addr`
 #[inline]
 pub unsafe fn out8(addr: u16, val: u8) {
     asm!("out dx, al" :: "{dx}"(addr), "{al}"(val) :: "volatile", "intel");
@@ -17,6 +17,20 @@ pub unsafe fn out8(addr: u16, val: u8) {
 pub unsafe fn in8(addr: u16) -> u8 {
     let val: u8;
     asm!("in al, dx" : "={al}"(val) : "{dx}"(addr) :: "volatile", "intel");
+    val
+}
+
+/// Output a 32-bit `val` to I/O port `addr`
+#[inline]
+pub unsafe fn out32(addr: u16, val: u32) {
+    asm!("out dx, eax" :: "{dx}"(addr), "{eax}"(val) :: "volatile", "intel");
+}
+
+/// Read an 32-bit value from I/O port `addr`
+#[inline]
+pub unsafe fn in32(addr: u16) -> u32 {
+    let val: u32;
+    asm!("in eax, dx" : "={eax}"(val) : "{dx}"(addr) :: "volatile", "intel");
     val
 }
 

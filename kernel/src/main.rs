@@ -19,6 +19,8 @@ mod interrupts;
 mod apic;
 mod acpi;
 mod intrinsics;
+mod pci;
+mod e1000;
 
 use page_table::PhysAddr;
 
@@ -45,6 +47,9 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     
     if core!().id == 0 {
         // One-time initialization for the whole kernel
+
+        // Initialize PCI devices
+        unsafe { pci::init() }
 
         // Bring up all APICs on the system and also initialize NUMA
         // information with the memory manager through the use of the ACPI
