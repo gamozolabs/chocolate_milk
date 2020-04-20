@@ -21,6 +21,9 @@ mod acpi;
 mod intrinsics;
 mod pci;
 mod e1000;
+mod net;
+mod dhcp;
+mod time;
 
 use page_table::PhysAddr;
 
@@ -35,6 +38,9 @@ fn release_early_stack() {
 pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // Release the early boot stack, now that we have our own stack
     release_early_stack();
+
+    // Calibrate the TSC so we can use `time` routines
+    if core_id == 0 { unsafe { time::calibrate(); } }
 
     // Initialize the core locals, this must happen first.
     core_locals::init(boot_args, core_id);
@@ -73,7 +79,8 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     acpi::core_checkin();
 
     if core!().id == acpi::num_cores() - 1 {
-        print!("We made it! All cores online! {}\n", core!().id + 1);
+        print!("[{:16.8}] We made it! All cores online! {}\n",
+               time::uptime(), core!().id + 1);
     }
 
     cpu::halt();

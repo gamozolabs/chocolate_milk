@@ -1,5 +1,8 @@
 //! The virtual and physical memory manager for the kernel
 
+use core::marker::PhantomData;
+use core::mem::{size_of, align_of};
+use core::ops::{Deref, DerefMut};
 use core::alloc::{Layout, GlobalAlloc};
 use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 use alloc::boxed::Box;
@@ -11,6 +14,7 @@ use rangeset::Range;
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::KERNEL_VMEM_BASE;
 use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
+use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_NX};
 
 /// Table which is indexed by an APIC identifier to map to a physical range
 /// which is local to it its NUMA node
@@ -92,7 +96,7 @@ pub fn alloc_virt_addr_4k(size: u64) -> VirtAddr {
 /// windowing and performs a `core::ptr::read_volatile`.
 #[allow(dead_code)]
 pub unsafe fn read_phys<T>(paddr: PhysAddr) -> T {
-    let end = (core::mem::size_of::<T>() as u64).checked_sub(1).and_then(|x| {
+    let end = (size_of::<T>() as u64).checked_sub(1).and_then(|x| {
         x.checked_add(paddr.0)
     }).expect("Integer overflow on read_phys");
     assert!(end < KERNEL_PHYS_WINDOW_SIZE,
@@ -104,7 +108,7 @@ pub unsafe fn read_phys<T>(paddr: PhysAddr) -> T {
 /// Write to a physical address containing a type `T`. This just handles the
 /// windowing and performs a `core::ptr::write_volatile`.
 pub unsafe fn write_phys<T>(paddr: PhysAddr, val: T) {
-    let end = (core::mem::size_of::<T>() as u64).checked_sub(1).and_then(|x| {
+    let end = (size_of::<T>() as u64).checked_sub(1).and_then(|x| {
         x.checked_add(paddr.0)
     }).expect("Integer overflow on write_phys");
     assert!(end < KERNEL_PHYS_WINDOW_SIZE,
@@ -158,7 +162,7 @@ pub struct PageFreeList {
 impl PageFreeList {
     /// Create a new, empty free list
     pub fn new() -> Self {
-        assert!(core::mem::size_of::<FreeListNode>() == 4096);
+        assert!(size_of::<FreeListNode>() == 4096);
         PageFreeList { head: PhysAddr(0) }
     }
 
@@ -265,7 +269,7 @@ impl PhysMem for PhysicalMemory {
     }
 
     fn alloc_phys(&mut self, layout: Layout) -> PhysAddr {
-        if layout.size() == 4096 && layout.align() == 4096 {
+        if layout.size() == 4096 && layout.align() >= 4096 {
             unsafe { core!().free_list.lock().pop() }
         } else {
             // Get access to physical memory
@@ -361,6 +365,119 @@ unsafe impl GlobalAlloc for GlobalAllocator {
 
         // Free the memory
         page_table.free(&mut pmem, VirtAddr(ptr as u64), alignsize);
+    }
+}
+
+/// Allocation containing a physically contiguous allocation
+pub struct PhysContig<T> {
+    /// Virtual address of the allocation
+    vaddr: VirtAddr,
+
+    /// Physical address of the allocation
+    paddr: PhysAddr,
+
+    /// Mark that this "holds" a `T`
+    _phantom: PhantomData<T>,
+}
+
+impl<T> PhysContig<T> {
+    /// Allocate physically contiguous memory large enough to hold `val` and
+    /// move `val` into it
+    pub fn new(val: T) -> PhysContig<T> {
+        assert!(size_of::<T>() > 0, "Cannot use ZST for PhysContig");
+
+        // If the allocation is smaller than 4 KiB, then round it up to 4 KiB.
+        // This allows us to take advantage of our page free lists, and
+        // relieves some pressure on the physical memory allocator as the free
+        // lists are per-core and do not require a global lock.
+        let alc_size = core::cmp::max(4096, size_of::<T>());
+
+        // Get access to physical memory allocations
+        let mut pmem = PhysicalMemory;
+
+        // Allocate physical memory for this allocation which is minimum
+        // 4 KiB aligned
+        let paddr = pmem.alloc_phys(Layout::from_size_align(
+            alc_size, core::cmp::max(4096, align_of::<T>())).unwrap());
+        
+        // Allocate a virtual address for this mapping
+        let vaddr = alloc_virt_addr_4k(alc_size as u64);
+        
+        // Get access to the current page table
+        let mut page_table = core!().boot_args.page_table.lock();
+        let page_table = page_table.as_mut().unwrap();
+
+        // Map in each page from the allocation
+        for offset in (0..alc_size as u64).step_by(4096) {
+            unsafe {
+                // Map the memory as RW
+                page_table.map_raw(&mut pmem, VirtAddr(vaddr.0 + offset),
+                                   PageType::Page4K,
+                                   (paddr.0 + offset) | PAGE_NX | PAGE_WRITE | 
+                                   PAGE_PRESENT)
+                    .expect("Failed to map PhysContig memory");
+
+            }
+        }
+        
+        unsafe {
+            // Initialize the memory
+            core::ptr::write(vaddr.0 as *mut T, val);
+        }
+
+        // Create the `PhysContig` structure
+        PhysContig {
+            vaddr,
+            paddr,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Get the physical address of the allocation
+    pub fn phys_addr(&self) -> PhysAddr {
+        self.paddr
+    }
+}
+
+impl<T> Drop for PhysContig<T> {
+    fn drop(&mut self) {
+        unsafe {
+            // Drop the contents of the allocation
+            core::ptr::drop_in_place(self.vaddr.0 as *mut T);
+
+            // Get access to physical memory
+            let mut pmem = PhysicalMemory;
+        
+            // 4-KiB align up the allocation size
+            let alignsize =
+                (size_of::<T>().checked_add(0xfff).unwrap() & !0xfff) as u64;
+
+            // Get access to virtual memory
+            let mut page_table = core!().boot_args.page_table.lock();
+            let page_table = page_table.as_mut().unwrap();
+
+            // Free the memory and page tables used to map it
+            page_table.free(&mut pmem,
+                            VirtAddr(self.vaddr.0 as u64), alignsize);
+        }
+    }
+}
+
+impl<T> Deref for PhysContig<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            &*(self.vaddr.0 as *const T)
+        }
+    }
+}
+
+impl<T> DerefMut for PhysContig<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            &mut *(self.vaddr.0 as *mut T)
+        }
     }
 }
 
