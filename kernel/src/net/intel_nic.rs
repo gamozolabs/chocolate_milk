@@ -194,9 +194,9 @@ pub fn probe(device: &PciDevice) -> Option<Arc<NetDevice>> {
         // Check if the VID:DID match what we support
         if device.header.vendor_id == vid && device.header.device_id == did {
             // Create the new device
-            return Some(Arc::new(
+            return Some(
                 NetDevice::new(Box::new(IntelGbit::new(*device, regs)))
-            ));
+            );
         }
     }
 
@@ -236,13 +236,26 @@ struct TxState {
     
     /// Packets held by the transmit descriptors. When the descriptor is free
     /// these will be `None`
-    buffers: [Option<Packet>; NUM_TX_DESCS],
+    buffers: Vec<Option<Packet>>,
 
     /// Current index of the transmit descriptors that has not yet been sent
     head: usize,
     
     /// Current index of the transmit descriptors that has been sent
     tail: usize,
+}
+
+/// Receive logic state
+struct RxState {
+    /// Virtually mapped RX descriptors
+    descriptors: PhysContig<[LegacyRxDesc; NUM_RX_DESCS]>,
+
+    /// Receive buffers corresponding to their descriptors
+    buffers: Vec<Packet>,
+
+    /// Current index of the receive buffer which is next-in-line to get a
+    /// packet from the NIC
+    head: usize,
 }
 
 /// Intel gigabit network driver
@@ -254,21 +267,14 @@ struct IntelGbit {
     /// These devices map 128 KiB of memory
     mmio: &'static mut [u32; 32 * 1024],
 
-    /// Virtually mapped RX descriptors
-    rx_descriptors: PhysContig<[LegacyRxDesc; NUM_RX_DESCS]>,
+    /// Receive logic state
+    rx_state: LockCell<RxState, LockInterrupts>,
 
-    /// Receive buffers corresponding to their descriptors
-    rx_buffers: Vec<Packet>,
-
-    /// Current index of the receive buffer which is next-in-line to get a
-    /// packet from the NIC
-    rx_head: usize,
-   
     /// Transmit logic state
     tx_state: LockCell<TxState, LockInterrupts>,
 
     /// Free list of packets
-    packets: Vec<Packet>,
+    packets: LockCell<Vec<Packet>, LockInterrupts>,
 
     /// Mac address of this device
     mac: [u8; 6],
@@ -372,16 +378,19 @@ impl<'a> IntelGbit {
         let mut nic = IntelGbit {
             regs,
             mmio,
-            rx_descriptors,
-            rx_buffers,
-            rx_head: 0,
+            rx_state: LockCell::new(RxState {
+                descriptors: rx_descriptors,
+                buffers:     rx_buffers,
+                head:        0,
+            }),
             tx_state: LockCell::new(TxState {
                 descriptors: tx_descriptors,
-                head: 0,
-                tail: 0, 
-                buffers: [None; NUM_TX_DESCS],
+                head:        0,
+                tail:        0, 
+                buffers:     (0..NUM_TX_DESCS).map(|_| None).collect(),
             }),
-            packets: Vec::with_capacity(NUM_TX_DESCS + NUM_RX_DESCS),
+            packets: LockCell::new(
+                         Vec::with_capacity(NUM_TX_DESCS + NUM_RX_DESCS)),
             mac: [0u8; 6],
         };
 
@@ -411,15 +420,17 @@ impl<'a> IntelGbit {
 
             // Initialize the NIC for receive
             {
+                let rx_state = nic.rx_state.lock();
+
                 // Program the receive descriptor base
                 nic.write(nic.regs.rdbah,
-                    (nic.rx_descriptors.phys_addr().0 >> 32) as u32); // high
+                    (rx_state.descriptors.phys_addr().0 >> 32) as u32); // high
                 nic.write(nic.regs.rdbal,
-                    (nic.rx_descriptors.phys_addr().0 >>  0) as u32); // low
+                    (rx_state.descriptors.phys_addr().0 >>  0) as u32); // low
 
                 // Write in the size of the RX descriptor queue
                 let queue_size = core::mem::size_of_val(
-                    &nic.rx_descriptors[..]);
+                    &rx_state.descriptors[..]);
                 nic.write(nic.regs.rdlen, queue_size as u32);
                 
                 if let Some(fctrl) = nic.regs.fctrl {
@@ -441,7 +452,7 @@ impl<'a> IntelGbit {
                 
                 // Set the RX head and tail
                 nic.write(nic.regs.rdh, 0);
-                nic.write(nic.regs.rdt, nic.rx_descriptors.len() as u32 - 1);
+                nic.write(nic.regs.rdt, rx_state.descriptors.len() as u32 - 1);
             
                 if let Some(rxctrl) = nic.regs.rxctrl {
                     // Enable receives by setting RXCTRL.RXEN
@@ -522,11 +533,14 @@ impl NetDriver for IntelGbit {
         self.mac
     }
     
-    fn recv<'a, 'b: 'a>(&'b mut self) -> Option<PacketLease<'a>> {
+    fn recv<'a, 'b: 'a>(&'b self) -> Option<PacketLease<'a>> {
+        // Get access to the RX state
+        let mut rx_state = self.rx_state.lock();
+
         unsafe {
             // Check if there is a packet that is ready to read
             let present = (read_volatile(
-                &self.rx_descriptors[self.rx_head].status) & 1) != 0;
+                &rx_state.descriptors[rx_state.head].status) & 1) != 0;
             if !present {
                 // No packet present
                 return None;
@@ -535,7 +549,7 @@ impl NetDriver for IntelGbit {
             // Get the length of the rxed buffer and copy into the caller
             // supplied buffer
             let rxed = read_volatile(
-                &self.rx_descriptors[self.rx_head].len) as usize;
+                &rx_state.descriptors[rx_state.head].len) as usize;
 
             // Allocate a new packet for this descriptor
             let mut packet = self.allocate_packet();
@@ -545,21 +559,22 @@ impl NetDriver for IntelGbit {
 
             // Swap in the new packet in place of the old packet in the
             // buffer list
+            let head = rx_state.head;
             core::mem::swap(&mut packet,
-                            &mut self.rx_buffers[self.rx_head]);
+                            &mut rx_state.buffers[head]);
 
             // Clear the status to put this descriptor back up for use
-            write_volatile(&mut self.rx_descriptors[self.rx_head],
+            write_volatile(&mut rx_state.descriptors[head],
                LegacyRxDesc {
                    buffer: new_packet_phys.0,
                    ..Default::default()
                });
             
             // Let the NIC know this buffer is available for use again
-            self.write(self.regs.rdt, self.rx_head as u32);
+            self.write(self.regs.rdt, rx_state.head as u32);
 
             // Bump the RX head
-            self.rx_head = (self.rx_head + 1) % self.rx_descriptors.len();
+            rx_state.head = (rx_state.head + 1) % rx_state.descriptors.len();
             
             // Set the length of the packet
             packet.set_len(rxed);
@@ -618,9 +633,7 @@ impl NetDriver for IntelGbit {
         // Free the old packet, if we replaced an existing packet
         if let Some(old_packet) = packet {
             // Put the packet onto our free list
-            unsafe {
-                (*(self as *const Self as *mut Self)).release_packet(old_packet);
-            }
+            self.release_packet(old_packet);
         }
 
         // Increment the tail
@@ -635,17 +648,19 @@ impl NetDriver for IntelGbit {
         }
     }
 
-    fn allocate_packet(&mut self) -> Packet {
-        self.packets.pop().unwrap_or_else(|| Packet::new())
+    fn allocate_packet(&self) -> Packet {
+        self.packets.lock().pop().unwrap_or_else(|| Packet::new())
     }
 
-    fn release_packet(&mut self, packet: Packet) {
+    fn release_packet(&self, packet: Packet) {
+        let mut packets = self.packets.lock();
+
         // If we have room in our free list, push the packet into it.
         // Otherwise, we'll just free the packet entirely, putting it back up
         // for use for the whole system
-        if self.packets.len() < self.packets.capacity() {
+        if packets.len() < packets.capacity() {
             // Put the packet back into the free list
-            self.packets.push(packet);
+            packets.push(packet);
         }
     }
 }

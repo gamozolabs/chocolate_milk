@@ -96,7 +96,7 @@ const PCI_ADDRESS_ENABLE: u32 = 1 << 31;
 ///
 /// This is a list of all of the driver structures returned by the successful
 /// `probe` routines from the `DRIVERS` list.
-pub static DEVICES: LockCell<Vec<Arc<dyn Device>>, LockInterrupts> =
+static DEVICES: LockCell<Vec<Arc<dyn Device>>, LockInterrupts> =
     LockCell::new(Vec::new());
 
 /// Common PCI header for the PCI configuration space of any device or bridge

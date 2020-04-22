@@ -81,6 +81,9 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                time::uptime(), core!().id + 1);
     }
 
+    let netdev = net::NetDevice::get();
+    print!("{:?}\n", netdev.as_ref().map(|x| x.dhcp_lease));
+
     cpu::halt();
 }
 

@@ -7,6 +7,8 @@ use core::fmt::{self, Formatter, Debug};
 use core::convert::TryInto;
 use core::ops::{Deref, DerefMut};
 
+use alloc::vec::Vec;
+use alloc::sync::Arc;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 
@@ -17,6 +19,10 @@ use crate::core_locals::LockInterrupts;
 
 use lockcell::LockCell;
 use page_table::PhysAddr;
+
+/// List of all network devices with valid DHCP leases on the system
+static NET_DEVICES: LockCell<Vec<Arc<NetDevice>>, LockInterrupts> =
+    LockCell::new(Vec::new());
 
 /// IPv4 ethernet frame type
 const ETHTYPE_IPV4: u16 = 0x0800;
@@ -72,14 +78,14 @@ impl<'a> Drop for UDPBind<'a> {
 /// an underlying driver to send and recv from.
 pub struct NetDevice {
     /// Driver that provides raw RX and TX to the network
-    driver: LockCell<Box<dyn NetDriver>, LockInterrupts>,
+    driver: Box<dyn NetDriver>,
 
     /// MAC address for the network card
     mac: [u8; 6],
 
     /// The DHCP lease that was obtained during `init`. May be `None` if no
     /// DHCP lease was obtained
-    dhcp_lease: Option<Lease>,
+    pub dhcp_lease: Option<Lease>,
 
     /// Packet queues for bound UDP ports
     ///
@@ -89,16 +95,53 @@ pub struct NetDevice {
 }
 
 impl NetDevice {
+    /// Get the least condended network device on the system
+    pub fn get() -> Option<Arc<Self>> {
+        // Least contended network device on the system
+        let mut ret: Option<Arc<Self>> = None;
+
+        // Go through all network devices on the system looking for the least
+        // contended network device
+        for net_device in NET_DEVICES.lock().iter() {
+            // Compute the current best strong count for a net device. We
+            // subtract 1 because storing it in `ret` increases the strong
+            // count unconditonally by 1.
+            let cur_best_strong_count =
+                ret.as_ref().map(|x| Arc::strong_count(x) - 1).unwrap_or(!0);
+
+            // If the network device we're iterating has fewer references than
+            // the current best strong count, then we want to use that network
+            // device.
+            if Arc::strong_count(&net_device) < cur_best_strong_count {
+                ret = Some(net_device.clone());
+            }
+        }
+
+        ret
+    }
+
     /// Wrap up a driver in a `NetDevice`
-    fn new(driver: Box<dyn NetDriver>) -> Self {
+    fn new(driver: Box<dyn NetDriver>) -> Arc<Self> {
+        // Create a new `NetDevice`
         let mut nd = NetDevice {
             mac: driver.mac(),
             udp_binds:  LockCell::new(BTreeMap::new()),
-            driver:     LockCell::new(driver),
+            driver:     driver,
             dhcp_lease: None,
         };
 
+        // Attempt to get a DHCP lease for this device
         nd.dhcp_lease = dhcp::get_lease(&nd);
+
+        // Wrap up the network device in an `Arc`
+        let nd = Arc::new(nd);
+
+        // Check to see if we got a DHCP lease
+        if nd.dhcp_lease.is_some() {
+            // Save this network device to the list of network devices
+            NET_DEVICES.lock().push(nd.clone());
+        }
+
         nd
     }
 
@@ -129,12 +172,9 @@ impl NetDevice {
         // Get access to the UDP binds
         let queued_packets = self.udp_binds.lock().remove(&port).unwrap();
         
-        // Get access to the driver
-        let mut driver = self.driver.lock();
-
         // Give the packet back to the driver
         for packet in queued_packets {
-            driver.release_packet(packet);
+            self.driver.release_packet(packet);
         }
     }
 
@@ -143,9 +183,6 @@ impl NetDevice {
             where F: FnOnce(&Packet, Udp) -> Option<T> {
         // Get access to the UDP binds
         let mut udp_binds = self.udp_binds.lock();
-        
-        // Get access to the driver
-        let mut driver = self.driver.lock();
 
         {
             // Get access to the UDP queue for this port
@@ -153,13 +190,13 @@ impl NetDevice {
             if !ent.is_empty() {
                 let packet = ent.pop_front().unwrap();
                 let ret = func(&packet, packet.udp().unwrap());
-                driver.release_packet(packet);
+                self.driver.release_packet(packet);
                 return ret;
             }
         }
 
         // Recv a packet, it could be any raw packet
-        let packet = driver.recv()?;
+        let packet = self.driver.recv()?;
 
         // Attempt to parse the packet as UDP
         if let Some(udp) = packet.udp() {
@@ -183,12 +220,12 @@ impl NetDevice {
     /// `packet` does not include the FCS, that must be computed or inserted
     /// by the driver.
     pub fn send(&self, packet: Packet, flush: bool) {
-        self.driver.lock().send(packet, flush);
+        self.driver.send(packet, flush);
     }
 
     /// Allocate a new packet for use
     pub fn allocate_packet(&self) -> Packet {
-        self.driver.lock().allocate_packet()
+        self.driver.allocate_packet()
     }
 
     /// Get the MAC address for this network device
@@ -214,7 +251,7 @@ pub trait NetDriver {
     ///
     /// The received packet length should not include the FCS and the FCS
     /// should be validated by the driver
-    fn recv<'a, 'b: 'a>(&'b mut self) -> Option<PacketLease<'a>>;
+    fn recv<'a, 'b: 'a>(&'b self) -> Option<PacketLease<'a>>;
 
     /// Send a raw frame over the network containing the bytes `packet`. This
     /// `packet` does not include the FCS, that must be computed or inserted
@@ -229,14 +266,14 @@ pub trait NetDriver {
     /// It is strongly recommended that a NIC implements it's own packet free
     /// list as creating and freeing packets requires physical memory
     /// allocations and virtual memory mappings
-    fn allocate_packet(&mut self) -> Packet {
+    fn allocate_packet(&self) -> Packet {
         // By default, create a new packet out of the global allocator
         Packet::new()
     }
 
     /// When the network stack is done with a packet lease, it will give it
     /// back to the NIC that it got the packet from.
-    fn release_packet(&mut self, _packet: Packet) {
+    fn release_packet(&self, _packet: Packet) {
         // By default, do nothing with the packet, causing it to get freed back
         // to the global allocator
     }
@@ -602,7 +639,7 @@ impl Packet {
 /// the `owner` of the packet via the `NetDriver::release_packet()` function
 pub struct PacketLease<'a> {
     /// Owner of the packet
-    owner: &'a mut dyn NetDriver,
+    owner: &'a dyn NetDriver,
 
     /// Packet that was leased out
     packet: Option<Packet>,
@@ -612,7 +649,7 @@ impl<'a> PacketLease<'a> {
     /// Create a new packet lease with `owner` as the owner of the packet.
     /// When this packet lease goes out of scope, the `owner` will get the
     /// packet back
-    pub fn new(owner: &'a mut dyn NetDriver,
+    pub fn new(owner: &'a dyn NetDriver,
                packet: Packet) -> PacketLease {
         PacketLease {
             owner,

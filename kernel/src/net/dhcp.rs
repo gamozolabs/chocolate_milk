@@ -14,7 +14,7 @@ const DHCP_TIMEOUT: u64 = 5_000_000;
 /// The magic DHCP cookie
 const DHCP_COOKIE: u32 = 0x63825363;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Lease {
     pub client_ip:    Ipv4Addr,
     pub server_ip:    Ipv4Addr,
