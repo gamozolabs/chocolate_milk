@@ -83,11 +83,28 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
 
     {
         if let Some(netdev) = net::NetDevice::get() {
-            netdev.bind_udp((core!().id + 13370) as u16);
+            let our_port = (core!().id + 13370) as u16;
 
-            netdev.arp("192.168.101.1");
+            // Bind to our port
+            netdev.bind_udp(our_port);
 
-            loop { netdev.recv(); }
+            print!("Got lease {:#?}\n", netdev.dhcp_lease);
+
+            // Resolve the target
+            let server = net::UdpAddress::resolve(
+                &netdev, our_port, "192.168.1.76:5000")
+                .expect("Couldn't resolve target address");
+
+            let mut packet = netdev.allocate_packet();
+            let message = format!("Hello from {:02x?} {:?}\n",
+                                  netdev.mac(),
+                                  netdev.dhcp_lease.as_ref().unwrap().client_ip);
+            let ins_point = packet.create_udp(&server, message.as_bytes().len());
+            packet.raw_mut()[ins_point..ins_point + message.as_bytes().len()]
+                .copy_from_slice(message.as_bytes());
+            netdev.send(packet, true);
+    
+            cpu::halt();
         }
     }
 

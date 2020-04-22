@@ -584,9 +584,14 @@ impl NetDriver for IntelGbit {
         }
     }
     
-    fn send(&self, packet: Packet, flush: bool) {
+    fn send(&self, mut packet: Packet, flush: bool) {
         // Get access to the transmit state
         let mut tx_state = self.tx_state.lock();
+
+        // Set the packet length to 64 bytes minimum
+        if packet.len() < 64 {
+            packet.set_len(64);
+        }
 
         // Check for sent packets by the NIC
         loop {

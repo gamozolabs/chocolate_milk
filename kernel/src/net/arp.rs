@@ -26,7 +26,7 @@ impl NetDevice {
         // Get our own IP
         let our_ip = self.dhcp_lease.as_ref().unwrap().client_ip;
 
-        'send_arp: for _ in 0..8 {
+        'send_arp: for _ in 0..10000 {
             // Allocate a packet
             let mut packet = self.allocate_packet();
 

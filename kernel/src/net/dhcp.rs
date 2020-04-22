@@ -4,7 +4,7 @@ use core::mem::size_of;
 use core::convert::TryInto;
 use alloc::vec::Vec;
 use crate::time;
-use crate::net::{NetDevice, Packet, Udp, Ipv4Addr};
+use crate::net::{NetDevice, Packet, Udp, Ipv4Addr, UdpAddress};
 
 /// Amount of time to wait for a DHCP response from the server in microseconds.
 /// If the DHCP process takes longer than this we will give up and return
@@ -267,9 +267,14 @@ fn parse_dhcp_packet<'a>(xid: u32, udp: Udp<'a>) ->
 fn create_dhcp_packet(packet: &mut Packet, xid: u32,
                       mac: [u8; 6], options: &[u8]) {
     // Initialize the packet for a UDP DHCP packet
-    let offset = packet.create_udp_raw(
-        mac, [0xff; 6], 0.into(), (!0).into(), 68, 67,
-        core::mem::size_of::<Header>() + options.len());
+    let offset = packet.create_udp(&UdpAddress {
+        src_eth:  mac,
+        dst_eth:  [0xff; 6],
+        src_ip:   0.into(),
+        dst_ip:   (!0).into(),
+        src_port: 68,
+        dst_port: 67,
+    }, core::mem::size_of::<Header>() + options.len());
 
     {
         // Get access to the header portion of the payload

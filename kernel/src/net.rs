@@ -31,6 +31,39 @@ const ETHTYPE_IPV4: u16 = 0x0800;
 /// UDP protocol for the IP header
 const IPPROTO_UDP: u8 = 0x11;
 
+/// UDP address
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UdpAddress {
+    pub src_eth:  [u8; 6],
+    pub dst_eth:  [u8; 6],
+    pub src_ip:   Ipv4Addr,
+    pub dst_ip:   Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+impl UdpAddress {
+    /// Convert a `src_port` and destination string in the form "1.2.3.4:1337"
+    /// into a `UdpAddress`
+    pub fn resolve(device: &NetDevice, src_port: u16, dst: &str)
+            -> Option<UdpAddress> {
+        let mut iter = dst.split(":");
+        let dst_ip   = Ipv4Addr::from(iter.next().unwrap());
+        let dst_port = u16::from_str_radix(iter.next().unwrap(), 10)
+            .expect("Invalid UDP address:port string");
+        assert!(iter.next().is_none(), "Invalid UDP address:port string");
+
+        Some(UdpAddress {
+            src_eth:  device.mac(),
+            dst_eth:  device.arp(dst_ip)?,
+            src_ip:   device.dhcp_lease.as_ref().unwrap().client_ip,
+            dst_ip:   dst_ip,
+            src_port: src_port,
+            dst_port: dst_port,
+        })
+    }
+}
+
 /// IPv4 address
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(C)]
@@ -208,7 +241,6 @@ impl NetDevice {
                             arp.opcode     == arp::Opcode::Request as u16 &&
                             arp.target_ip  == our_ip {
                         // Reply to the ARP
-                        print!("Someone asked for our IP\n");
                         self.arp_reply(arp.sender_ip, arp.sender_mac);
                         return None;
                     }
@@ -568,16 +600,13 @@ impl Packet {
 
     /// Create a new raw UDP packet
     /// Returns the index into the packet where the message should be placed.
-    pub fn create_udp_raw(&mut self,
-                          src_eth:  [u8; 6],  dst_eth:  [u8; 6],
-                          src_ip:   Ipv4Addr, dst_ip:   Ipv4Addr,
-                          src_port: u16,      dst_port: u16,
-                          message_len: usize) -> usize {
+    pub fn create_udp(&mut self, addr: &UdpAddress,
+                      message_len: usize) -> usize {
         {
             // Set up the ethernet header
             let eth = &mut self.raw[..14];
-            eth[0x0..0x6].copy_from_slice(&dst_eth);
-            eth[0x6..0xc].copy_from_slice(&src_eth);
+            eth[0x0..0x6].copy_from_slice(&addr.dst_eth);
+            eth[0x6..0xc].copy_from_slice(&addr.src_eth);
             eth[0xc..0xe].copy_from_slice(&ETHTYPE_IPV4.to_be_bytes());
         }
         
@@ -608,8 +637,8 @@ impl Packet {
             ip[10..12].copy_from_slice(&[0; 2]);
 
             // Copy in the source and dest IPs
-            ip[12..16].copy_from_slice(&src_ip.0.to_be_bytes());
-            ip[16..20].copy_from_slice(&dst_ip.0.to_be_bytes());
+            ip[12..16].copy_from_slice(&addr.src_ip.0.to_be_bytes());
+            ip[16..20].copy_from_slice(&addr.dst_ip.0.to_be_bytes());
 
             // Compute the checksum and fill in the checksum field
             let checksum = Self::checksum(0, ip);
@@ -621,8 +650,8 @@ impl Packet {
             let udp = &mut self.raw[14 + 20..14 + 20 + 8];
 
             // Copy in the source and dest ports
-            udp[0..2].copy_from_slice(&src_port.to_be_bytes());
-            udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+            udp[0..2].copy_from_slice(&addr.src_port.to_be_bytes());
+            udp[2..4].copy_from_slice(&addr.dst_port.to_be_bytes());
 
             // Compute and copy in the UDP size + header
             let udp_size = (8 + message_len) as u16;
