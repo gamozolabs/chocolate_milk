@@ -65,9 +65,9 @@ pub unsafe fn disable_all_cores(apic: &mut Apic) {
 pub unsafe fn soft_reboot(apic: &mut Apic) -> ! {
     // Get access to the soft reboot address as well as the trampoline page
     // table.
-    let soft_reboot = core!().boot_args.soft_reboot_addr
+    let soft_reboot = core!().boot_args.soft_reboot_addr_ref()
         .load(Ordering::SeqCst);
-    let trampoline_cr3 = PhysAddr(core!().boot_args.trampoline_page_table
+    let trampoline_cr3 = PhysAddr(core!().boot_args.trampoline_page_table_ref()
         .load(Ordering::SeqCst));
 
     // Compute the virtual address of the soft reboot entry point based

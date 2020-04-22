@@ -56,7 +56,7 @@ struct GlobalAllocator;
 unsafe impl GlobalAlloc for GlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Get access to physical memory
-        let mut pmem = BOOT_ARGS.free_memory.lock();
+        let mut pmem = BOOT_ARGS.free_memory_ref().lock();
         pmem.as_mut().and_then(|x| {
             x.allocate(layout.size() as u64, layout.align() as u64)
         }).unwrap_or(0) as *mut u8
@@ -64,7 +64,7 @@ unsafe impl GlobalAlloc for GlobalAllocator {
     
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // Get access to physical memory
-        let mut pmem = BOOT_ARGS.free_memory.lock();
+        let mut pmem = BOOT_ARGS.free_memory_ref().lock();
         pmem.as_mut().and_then(|x| {
             let end = (ptr as u64)
                 .checked_add(layout.size().checked_sub(1)? as u64)?;
@@ -87,7 +87,7 @@ fn alloc_error(_layout: Layout) -> ! {
 pub fn init() {
     // Create a `RangeSet` to hold the memory that is marked free by the
     // BIOS
-    let mut pmem = BOOT_ARGS.free_memory.lock();
+    let mut pmem = unsafe { BOOT_ARGS.free_memory_ref().lock() };
 
     // If physical memory has already been initialized, just return out!
     if pmem.is_some() {

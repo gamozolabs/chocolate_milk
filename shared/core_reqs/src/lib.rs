@@ -1,7 +1,7 @@
 //! Requirements for Rust libcore. These are just basic libc `mem*()` routines
 //! as well as some intrinsics to get access to 64-bit integers in 32-bit land
 
-#![feature(global_asm, asm)]
+#![feature(global_asm, llvm_asm)]
 
 #![no_std]
 
@@ -63,7 +63,7 @@ pub unsafe extern fn memmove(dest: *mut u8, src: *const u8, n: usize)
 #[no_mangle]
 #[cfg(target_arch = "x86")]
 pub unsafe extern fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
-    asm!(r#"
+    llvm_asm!(r#"
         rep stosb
     "# :: "{edi}"(s), "{ecx}"(n), "{eax}"(c) : "memory" : "volatile", "intel");
 
@@ -81,7 +81,7 @@ pub unsafe extern fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
 #[no_mangle]
 #[cfg(target_arch = "x86_64")]
 pub unsafe extern fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
-    asm!(r#"
+    llvm_asm!(r#"
         rep stosb
     "# :: "{rdi}"(s), "{rcx}"(n), "{eax}"(c) : "memory" : "volatile", "intel");
 

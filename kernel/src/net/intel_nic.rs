@@ -1,22 +1,25 @@
-//! Intel 1gbit network card driver
+//! Intel network card driver(s) for both 1gbit and 10gbit
 
 use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
 use alloc::vec::Vec;
+use alloc::sync::Arc;
 use alloc::boxed::Box;
 
+use lockcell::LockCell;
 use page_table::{PAGE_NX, PAGE_CACHE_DISABLE};
 use page_table::{PhysAddr, VirtAddr, PageType, PAGE_PRESENT, PAGE_WRITE};
 
 use crate::mm::{alloc_virt_addr_4k, PhysContig};
 use crate::net::{NetDriver, NetDevice, Packet, PacketLease};
-use crate::pci::{Device, PciDevice, BarType};
+use crate::pci::{PciDevice, BarType};
+use crate::core_locals::LockInterrupts;
 
 /// Number of receive descriptors to allocate per device (max is 256)
-const NUM_RX_DESCS: usize = 8;
+const NUM_RX_DESCS: usize = 256;
 
 /// Number of transmit descriptors to allocate per device (max is 256)
-const NUM_TX_DESCS: usize = 16;
+const NUM_TX_DESCS: usize = 256;
 
 /// Network register offsets
 ///
@@ -24,10 +27,6 @@ const NUM_TX_DESCS: usize = 16;
 /// register list for each.
 #[derive(Clone, Copy)]
 struct NicRegisters {
-    /// If `true`, this NIC requires setting the transmit and receive queue
-    /// enable bits in the RXDCTL and TXDCTL (bits 25)
-    queue_enable: bool,
-
     /// Device control register
     ctrl: usize,
 
@@ -71,41 +70,60 @@ struct NicRegisters {
     rah0: usize,
 
     /// Receive control
-    rctl: usize,
+    rctl: Option<usize>,
 
     /// Transmit control
-    tctl: usize,
+    tctl: Option<usize>,
 
     /// Receive descriptor control
-    rxdctl: usize,
+    rxdctl: Option<usize>,
+
+    /// Receive control (x540)
+    rxctrl: Option<usize>,
 
     /// Transmit descriptor control
-    txdctl: usize,
+    txdctl: Option<usize>,
+
+    /// Split receive control register
+    srrctl: Option<usize>,
+
+    /// DMA transmit control
+    dmatxctl: Option<usize>,
+
+    /// Filter control register
+    fctrl: Option<usize>,
+
+    /// Extended control
+    ctrl_ext: Option<usize>,
 }
 
 /// Checks to see if the PCI device being probed is a device that we can handle
 /// with our driver
-pub fn probe(device: &PciDevice) -> Option<Box<dyn Device>> {
+pub fn probe(device: &PciDevice) -> Option<Arc<NetDevice>> {
     const E1000_REGS: NicRegisters = NicRegisters {
-        queue_enable: false,
-        ctrl:   0x0000,
-        imc:    0x00d8,
-        rdbal:  0x2800,
-        rdbah:  0x2804,
-        rdlen:  0x2808,
-        rdh:    0x2810,
-        rdt:    0x2818,
-        tdbal:  0x3800,
-        tdbah:  0x3804,
-        tdlen:  0x3808,
-        tdh:    0x3810,
-        tdt:    0x3818,
-        ral0:   0x5400,
-        rah0:   0x5404,
-        rctl:   0x0100,
-        tctl:   0x0400,
-        rxdctl: 0x2828,
-        txdctl: 0x3828,
+        ctrl:     0x0000,
+        imc:      0x00d8,
+        rdbal:    0x2800,
+        rdbah:    0x2804,
+        rdlen:    0x2808,
+        rdh:      0x2810,
+        rdt:      0x2818,
+        tdbal:    0x3800,
+        tdbah:    0x3804,
+        tdlen:    0x3808,
+        tdh:      0x3810,
+        tdt:      0x3818,
+        ral0:     0x5400,
+        rah0:     0x5404,
+        rctl:     Some(0x0100),
+        tctl:     Some(0x0400),
+        rxdctl:   None,
+        txdctl:   None,
+        srrctl:   None,
+        dmatxctl: None,
+        fctrl:    None,
+        rxctrl:   None,
+        ctrl_ext: None,
     };
     
     /// The different (vendor, device IDs) we support
@@ -118,26 +136,57 @@ pub fn probe(device: &PciDevice) -> Option<Box<dyn Device>> {
 
         // I210 Gigabit Network Connection
         (0x8086, 0x1533, NicRegisters {
-            queue_enable: true,
-            ctrl:   0x0000,
-            imc:    0x00d8,
-            rdbal:  0x2800,
-            rdbah:  0x2804,
-            rdlen:  0x2808,
-            rdh:    0x2810,
-            rdt:    0x2818,
-            tdbal:  0x3800,
-            tdbah:  0x3804,
-            tdlen:  0x3808,
-            tdh:    0x3810,
-            tdt:    0x3818,
-            ral0:   0x5400,
-            rah0:   0x5404,
-            rctl:   0x0100,
-            tctl:   0x0400,
-            rxdctl: 0x2828,
-            txdctl: 0x3828,
+            ctrl:     0x0000,
+            imc:      0x00d8,
+            rdbal:    0x2800,
+            rdbah:    0x2804,
+            rdlen:    0x2808,
+            rdh:      0x2810,
+            rdt:      0x2818,
+            tdbal:    0x3800,
+            tdbah:    0x3804,
+            tdlen:    0x3808,
+            tdh:      0x3810,
+            tdt:      0x3818,
+            ral0:     0x5400,
+            rah0:     0x5404,
+            rctl:     Some(0x0100),
+            tctl:     Some(0x0400),
+            rxdctl:   Some(0x2828),
+            txdctl:   Some(0x3828),
+            srrctl:   None,
+            dmatxctl: None,
+            fctrl:    None,
+            rxctrl:   None,
+            ctrl_ext: Some(0x0018),
         }),
+
+        // Ethernet Converged Network Adapter X540-T1
+        (0x8086, 0x1528, NicRegisters {
+            ctrl:     0x0000,
+            imc:      0x0888, // Technically the EIMC
+            rdbal:    0x1000,
+            rdbah:    0x1004,
+            rdlen:    0x1008,
+            rdh:      0x1010,
+            rdt:      0x1018,
+            tdbal:    0x6000,
+            tdbah:    0x6004,
+            tdlen:    0x6008,
+            tdh:      0x6010,
+            tdt:      0x6018,
+            ral0:     0xa200,
+            rah0:     0xa204,
+            rctl:     None,
+            tctl:     None,
+            rxdctl:   Some(0x1028),
+            txdctl:   Some(0x6028),
+            srrctl:   Some(0x1014),
+            dmatxctl: Some(0x4a80),
+            fctrl:    Some(0x5080),
+            rxctrl:   Some(0x3000),
+            ctrl_ext: Some(0x0018),
+        })
     ];
 
     // Check if we can handle this device
@@ -145,7 +194,7 @@ pub fn probe(device: &PciDevice) -> Option<Box<dyn Device>> {
         // Check if the VID:DID match what we support
         if device.header.vendor_id == vid && device.header.device_id == did {
             // Create the new device
-            return Some(Box::new(
+            return Some(Arc::new(
                 NetDevice::new(Box::new(IntelGbit::new(*device, regs)))
             ));
         }
@@ -180,6 +229,22 @@ struct LegacyTxDesc {
     special:  u16,
 }
 
+/// Transmit logic state
+struct TxState {
+    /// Virtually mapped TX descriptors
+    descriptors: PhysContig<[LegacyTxDesc; NUM_TX_DESCS]>,
+    
+    /// Packets held by the transmit descriptors. When the descriptor is free
+    /// these will be `None`
+    buffers: [Option<Packet>; NUM_TX_DESCS],
+
+    /// Current index of the transmit descriptors that has not yet been sent
+    head: usize,
+    
+    /// Current index of the transmit descriptors that has been sent
+    tail: usize,
+}
+
 /// Intel gigabit network driver
 struct IntelGbit {
     /// Per-NIC registers for the different registers we use
@@ -198,12 +263,9 @@ struct IntelGbit {
     /// Current index of the receive buffer which is next-in-line to get a
     /// packet from the NIC
     rx_head: usize,
-    
-    /// Virtually mapped TX descriptors
-    tx_descriptors: PhysContig<[LegacyTxDesc; NUM_TX_DESCS]>,
-
-    /// Current index of the next free transmit buffer slot
-    tx_head: usize,
+   
+    /// Transmit logic state
+    tx_state: LockCell<TxState, LockInterrupts>,
 
     /// Free list of packets
     packets: Vec<Packet>,
@@ -216,7 +278,7 @@ impl<'a> IntelGbit {
     fn new(device: PciDevice, regs: NicRegisters) -> Self {
         // The BAR0 should be a memory bar
         assert!((device.bar0 & 1) == 0,
-            "Intel gbit BAR0 was not a memory BAR");
+            "Intel NIC BAR0 was not a memory BAR");
 
         // Get the type of memory bar
         let bar_type = BarType::from((device.bar0 >> 1) & 3);
@@ -236,7 +298,7 @@ impl<'a> IntelGbit {
 
         // Not sure if this can ever happen, but make sure the physical address
         // is 4 KiB aligned
-        assert!((bar.0 & 0xfff) == 0, "Non-4 KiB aligned Intel gbit nic?!");
+        assert!((bar.0 & 0xfff) == 0, "Non-4 KiB aligned Intel NIC?!");
 
         // Map in the physical MMIO space into uncacheable virtual memory
         let mmio = {
@@ -262,7 +324,7 @@ impl<'a> IntelGbit {
                                        PageType::Page4K,
                                        paddr | PAGE_NX | PAGE_WRITE | 
                                        PAGE_CACHE_DISABLE | PAGE_PRESENT)
-                        .expect("Failed to map in Intel gbit MMIO to \
+                        .expect("Failed to map in Intel NIC MMIO to \
                                  virtual memory");
                 }
             }
@@ -283,7 +345,7 @@ impl<'a> IntelGbit {
                 NUM_RX_DESCS > 0 &&
                 NUM_TX_DESCS <= 256 && (NUM_TX_DESCS % 8) == 0 &&
                 NUM_TX_DESCS > 0,
-            "Invalid Intel gbit constant configuration");
+            "Invalid Intel NIC constant configuration");
 
         // Create the RX descriptors
         let mut rx_descriptors =
@@ -313,28 +375,38 @@ impl<'a> IntelGbit {
             rx_descriptors,
             rx_buffers,
             rx_head: 0,
-            tx_descriptors,
-            tx_head: 0,
-            packets: Vec::with_capacity(128),
+            tx_state: LockCell::new(TxState {
+                descriptors: tx_descriptors,
+                head: 0,
+                tail: 0, 
+                buffers: [None; NUM_TX_DESCS],
+            }),
+            packets: Vec::with_capacity(NUM_TX_DESCS + NUM_RX_DESCS),
             mac: [0u8; 6],
         };
 
         unsafe {
+            // Write all `f`s to the IMC to disable all interrupts
+            nic.write(nic.regs.imc, !0);
+
             // Reset the NIC
             nic.write(nic.regs.ctrl, nic.read(nic.regs.ctrl) | (1 << 26));
 
             // Wait for the reset to clear
             while (nic.read(nic.regs.ctrl) & (1 << 26)) != 0 {}
+	        crate::time::sleep(20000);
 
             // Write all `f`s to the IMC to disable all interrupts
             nic.write(nic.regs.imc, !0);
-            
-            if nic.regs.queue_enable {
-                // Enable RX and TX queues if the NIC requires this enablement
-                nic.write(nic.regs.rxdctl,
-                          (1 << 25) | nic.read(nic.regs.rxdctl));
-                nic.write(nic.regs.txdctl,
-                          (1 << 25) | nic.read(nic.regs.txdctl));
+ 
+            if let Some(dmatxctl) = nic.regs.dmatxctl {
+                // DMA transmit enable
+                nic.write(dmatxctl, nic.read(dmatxctl) | 1);
+            }
+           
+            if let Some(ctrl_ext) = nic.regs.ctrl_ext {
+                // Disable no snoop globally
+                nic.write(ctrl_ext, 1 << 16);
             }
 
             // Initialize the NIC for receive
@@ -349,32 +421,69 @@ impl<'a> IntelGbit {
                 let queue_size = core::mem::size_of_val(
                     &nic.rx_descriptors[..]);
                 nic.write(nic.regs.rdlen, queue_size as u32);
+                
+                if let Some(fctrl) = nic.regs.fctrl {
+                    // Accept broadcast packets
+                    nic.write(fctrl, 1 << 10);
+                }
 
-                // Set the RX head
+                if let Some(srrctl) = nic.regs.srrctl {
+                    // Program the receive control
+                    // Drop enable, legacy descriptors, 2 KiB packets
+                    nic.write(srrctl, (1 << 28) | (4 << 8) | (2 << 0));
+                }
+                
+                if let Some(rxdctl) = nic.regs.rxdctl {
+                    // Enable the RX queue
+                    nic.write(rxdctl, (1 << 25) | nic.read(rxdctl));
+                    while (nic.read(rxdctl) & (1 << 25)) == 0 {}
+                }
+                
+                // Set the RX head and tail
                 nic.write(nic.regs.rdh, 0);
-
-                // Set the RX tail
                 nic.write(nic.regs.rdt, nic.rx_descriptors.len() as u32 - 1);
+            
+                if let Some(rxctrl) = nic.regs.rxctrl {
+                    // Enable receives by setting RXCTRL.RXEN
+                    nic.write(rxctrl, 1);
+                }
+
+                if let Some(rctl) = nic.regs.rctl {
+                    // Strip ethernet CRC, 2 KiB RX buffers,
+                    // and accept broadcast packets, and enable RX
+                    nic.write(rctl, (1 << 26) | (1 << 15) | (1 << 1));
+                }
             }
 
             // Initialize the NIC for transmit
             {
+                let tx_state = nic.tx_state.lock();
+
                 // Program the transmit descriptor base
                 nic.write(nic.regs.tdbah,
-                    (nic.tx_descriptors.phys_addr().0 >> 32) as u32); // high
+                    (tx_state.descriptors.phys_addr().0 >> 32) as u32); // high
                 nic.write(nic.regs.tdbal,
-                    (nic.tx_descriptors.phys_addr().0 >>  0) as u32); // low
+                    (tx_state.descriptors.phys_addr().0 >>  0) as u32); // low
 
                 // Write in the size of the TX descriptor queue
                 let queue_size = core::mem::size_of_val(
-                    &nic.tx_descriptors[..]);
+                    &tx_state.descriptors[..]);
                 nic.write(nic.regs.tdlen, queue_size as u32);
-            
-                // Set the TX head
+                
+                if let Some(txdctl) = nic.regs.txdctl {
+                    // Enable the TX queue
+                    nic.write(txdctl, (1 << 25) | nic.read(txdctl));
+                    while (nic.read(txdctl) & (1 << 25)) == 0 {}
+                }
+ 
+                // Set the TX head and tail
                 nic.write(nic.regs.tdh, 0);
-
-                // Set the TX tail
                 nic.write(nic.regs.tdt, 0);
+
+                if let Some(tctl) = nic.regs.tctl {
+                    // Enable TX
+                    nic.write(tctl, 1 << 1);
+                }
             }
 
             // Read the receive address high and low for the first entry
@@ -387,13 +496,6 @@ impl<'a> IntelGbit {
             mac[0..4].copy_from_slice(&ral.to_le_bytes());
             mac[4..6].copy_from_slice(&(rah as u16).to_le_bytes());
             nic.mac = mac;
-
-            // Strip ethernet CRC, 2 KiB RX buffers,
-            // and accept broadcast packets, and enable RX
-            nic.write(nic.regs.rctl, (1 << 26) | (1 << 15) | (1 << 1));
-            
-            // Enable TX
-            nic.write(nic.regs.tctl, 1 << 1);
         }
 
         nic
@@ -408,9 +510,10 @@ impl<'a> IntelGbit {
 
     /// Write `val` to the MMIO Intel register at `reg_offset`. This is the
     /// offset into MMIO space in bytes, not the register ID
-    unsafe fn write(&mut self, reg_offset: usize, val: u32) {
+    unsafe fn write(&self, reg_offset: usize, val: u32) {
         let reg = reg_offset / size_of::<u32>();
-        core::ptr::write_volatile(&mut self.mmio[reg], val);
+        core::ptr::write_volatile(
+            &self.mmio[reg] as *const u32 as *mut u32, val);
     }
 }
 
@@ -466,37 +569,74 @@ impl NetDriver for IntelGbit {
         }
     }
     
-    fn send(&mut self, packet: Packet) {
-        unsafe {
-            // Compute the tail index for this transmit
-            let tail = (self.tx_head + 1) % self.tx_descriptors.len();
+    fn send(&self, packet: Packet, flush: bool) {
+        // Get access to the transmit state
+        let mut tx_state = self.tx_state.lock();
 
-            // Fill in the TX descriptor
-            write_volatile(&mut self.tx_descriptors[self.tx_head],
-                LegacyTxDesc {
-                    buffer: packet.phys_addr().0,
-                    cmd:    (1 << 3) | (1 << 1) | (1 << 0),
-                    len:    packet.raw().len() as u16,
-                    ..Default::default()
-                });
+        // Check for sent packets by the NIC
+        loop {
+            // Determine number of queued packets
+            let queued = tx_state.tail - tx_state.head;
+            if queued < (tx_state.descriptors.len() - 1) {
+                // Queue has room for our packet
+                break;
+            }
 
-            // Bump the tail pointer on the NIC
-            self.write(self.regs.tdt, tail as u32);
+            // No room for the packet in the queue, update the head for each
+            // packet which was sent by the NIC previously.
+            for end in (tx_state.head..tx_state.tail).rev() {
+                // Get the status for the queued packet at the head
+                let head_idx = end % tx_state.descriptors.len();
+                let status = unsafe {
+                    read_volatile(&tx_state.descriptors[head_idx].status)
+                };
 
-            // Wait for the NIC to actually transmit the packet
-            while (read_volatile(
-                &self.tx_descriptors[self.tx_head].status) & 1) == 0 {}
+                // Check if the packet at the head has been sent by the NIC
+                if (status & 1) != 0 {
+                    tx_state.head = end + 1;
+                    break;
+                }
+            }
+        }
 
-            // Bump the TX head as we've used this slot
-            self.tx_head = tail;
+        // Get the index for the tail
+        let tail_idx = tx_state.tail % tx_state.descriptors.len();
+        
+        // Fill in the TX descriptor
+        tx_state.descriptors[tail_idx] =
+            LegacyTxDesc {
+                buffer: packet.phys_addr().0,
+                cmd:    (1 << 3) | (1 << 1) | (1 << 0),
+                len:    packet.len() as u16,
+                ..Default::default()
+            };
+ 
+        // Swap the new packet into the TX buffer list
+        let mut packet = Some(packet);
+        core::mem::swap(&mut packet, &mut tx_state.buffers[tail_idx]);
 
+        // Free the old packet, if we replaced an existing packet
+        if let Some(old_packet) = packet {
             // Put the packet onto our free list
-            self.release_packet(packet);
+            unsafe {
+                (*(self as *const Self as *mut Self)).release_packet(old_packet);
+            }
+        }
+
+        // Increment the tail
+        tx_state.tail = tx_state.tail.wrapping_add(1);
+
+        if flush || (tx_state.tail - tx_state.head) ==
+                    (tx_state.descriptors.len() - 1) {
+            unsafe {
+                self.write(self.regs.tdt,
+                    (tx_state.tail % tx_state.descriptors.len()) as u32);
+            }
         }
     }
 
     fn allocate_packet(&mut self) -> Packet {
-        self.packets.pop().unwrap_or(Packet::new())
+        self.packets.pop().unwrap_or_else(|| Packet::new())
     }
 
     fn release_packet(&mut self, packet: Packet) {

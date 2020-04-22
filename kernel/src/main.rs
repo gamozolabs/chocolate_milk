@@ -1,6 +1,6 @@
 //! A kernel written all in Rust
 
-#![feature(panic_info_message, alloc_error_handler, asm, global_asm)]
+#![feature(panic_info_message, alloc_error_handler, llvm_asm, global_asm)]
 #![feature(const_in_array_repeat_expressions)]
 
 #![no_std]
@@ -20,9 +20,7 @@ mod apic;
 mod acpi;
 mod intrinsics;
 mod pci;
-mod e1000;
 mod net;
-mod dhcp;
 mod time;
 
 use page_table::PhysAddr;
@@ -39,11 +37,11 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // Release the early boot stack, now that we have our own stack
     release_early_stack();
 
-    // Calibrate the TSC so we can use `time` routines
-    if core_id == 0 { unsafe { time::calibrate(); } }
-
     // Initialize the core locals, this must happen first.
     core_locals::init(boot_args, core_id);
+     
+    // Calibrate the TSC so we can use `time` routines
+    if core_id == 0 { unsafe { time::calibrate(); } }
     
     // Initialize interrupts
     interrupts::init();
@@ -68,7 +66,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
 
     // Now we're ready for interrupts!
     unsafe { core!().enable_interrupts(); }
-    
+
     // Let ACPI know that we've booted, it'll be happy to know we're here!
     // This will also serialize until all cores have come up. Once all cores
     // are online this will release all of the cores. This ensures that no

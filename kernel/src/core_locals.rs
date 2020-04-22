@@ -1,5 +1,6 @@
 //! This file is used to hold and access all of the core locals
 
+use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 
 use crate::apic::Apic;
@@ -8,7 +9,8 @@ use crate::interrupts::Interrupts;
 
 use lockcell::LockCell;
 use page_table::PhysAddr;
-use boot_args::{BootArgs, KERNEL_PHYS_WINDOW_BASE};
+use boot_args::{BootArgs, PersistStore, KERNEL_PHYS_WINDOW_BASE};
+use boot_args::KERNEL_PHYS_WINDOW_SIZE;
 
 /// A shortcut to get access to the core locals
 #[macro_export]
@@ -137,7 +139,26 @@ pub struct CoreLocals {
 trait CoreGuard: Sync + Sized {}
 impl CoreGuard for CoreLocals {}
 
+/// Type of the `PersistStore`
+type Persist = PersistStore<LockInterrupts>;
+
 impl CoreLocals {
+    /// Get access to the persistent storage
+    pub unsafe fn persist_store(&self) -> &'static Persist {
+        // Get the physical address of the persist store
+        let addr = self.boot_args.persist_store();
+        assert!(addr.0 != 0, "Invalid persist store address");
+
+        // Make sure the persist store is within the physical window
+        let persist_store_end = addr.0.checked_add(size_of::<Persist>() as u64)
+            .unwrap();
+        assert!(persist_store_end <= KERNEL_PHYS_WINDOW_SIZE,
+            "Persist store out of bounds of physical window");
+
+        // Return a reference to the persist store
+        &*((KERNEL_PHYS_WINDOW_BASE + addr.0) as *const Persist)
+    }
+
     /// Set the current core's APIC ID
     pub unsafe fn set_apic_id(&self, apic_id: u32) {
         self.apic_id.store(apic_id, Ordering::SeqCst);
@@ -222,7 +243,7 @@ pub fn get_core_locals() -> &'static CoreLocals {
 
         // Get the first `u64` from `CoreLocals`, which given we don't change
         // the structure shape, should be the address of the core locals.
-        asm!("mov $0, gs:[0]" :
+        llvm_asm!("mov $0, gs:[0]" :
              "=r"(ptr) :: "memory" : "volatile", "intel");
 
         &*(ptr as *const CoreLocals)
@@ -255,10 +276,15 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
         &*((boot_args.0 + KERNEL_PHYS_WINDOW_BASE) as
            *const BootArgs<DummyLockInterrupts>)
     };
+    
+    // Make sure the structure size is the same betewen the bootloader and
+    // kernel
+    assert!(boot_args.struct_size == core::mem::size_of_val(boot_args) as u64,
+        "Bootloader struct size mismatch");
 
     let core_local_ptr = {
         // Get access to the physical memory allocator
-        let mut pmem = boot_args.free_memory.lock();
+        let mut pmem = unsafe { boot_args.free_memory_ref().lock() };
         let pmem = pmem.as_mut().unwrap();
         
         // Allocate the core locals

@@ -169,7 +169,7 @@ pub fn init() {
 
     unsafe {
         // Update to use a GDT in the current virtual space
-        asm!(r#"
+        llvm_asm!(r#"
                 // Load the GDT
                 lgdt [$0]
 
@@ -208,7 +208,7 @@ pub fn init() {
   
     unsafe {
         // Load the IDT!
-        asm!("lidt [$0]" :: "r"(&idt_ptr as *const TablePtr) :
+        llvm_asm!("lidt [$0]" :: "r"(&idt_ptr as *const TablePtr) :
              "memory" : "volatile", "intel");
     }
 

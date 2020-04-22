@@ -1,13 +1,20 @@
 //! Driver agnostic networking utilities
 
+pub mod dhcp;
+pub mod intel_nic;
+
 use core::fmt::{self, Formatter, Debug};
 use core::convert::TryInto;
 use core::ops::{Deref, DerefMut};
+
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
+
 use crate::pci::Device;
 use crate::mm::PhysContig;
+use crate::net::dhcp::Lease;
 use crate::core_locals::LockInterrupts;
+
 use lockcell::LockCell;
 use page_table::PhysAddr;
 
@@ -66,9 +73,13 @@ impl<'a> Drop for UDPBind<'a> {
 pub struct NetDevice {
     /// Driver that provides raw RX and TX to the network
     driver: LockCell<Box<dyn NetDriver>, LockInterrupts>,
-    
+
     /// MAC address for the network card
     mac: [u8; 6],
+
+    /// The DHCP lease that was obtained during `init`. May be `None` if no
+    /// DHCP lease was obtained
+    dhcp_lease: Option<Lease>,
 
     /// Packet queues for bound UDP ports
     ///
@@ -79,19 +90,16 @@ pub struct NetDevice {
 
 impl NetDevice {
     /// Wrap up a driver in a `NetDevice`
-    pub fn new(driver: Box<dyn NetDriver>) -> Self {
-        let device = NetDevice {
+    fn new(driver: Box<dyn NetDriver>) -> Self {
+        let mut nd = NetDevice {
             mac: driver.mac(),
-            udp_binds: LockCell::new(BTreeMap::new()),
-            driver: LockCell::new(driver),
+            udp_binds:  LockCell::new(BTreeMap::new()),
+            driver:     LockCell::new(driver),
+            dhcp_lease: None,
         };
 
-        {
-            let lease = crate::dhcp::get_lease(&device);
-            print!("{:#?}\n", lease);
-        }
-
-        device
+        nd.dhcp_lease = dhcp::get_lease(&nd);
+        nd
     }
 
     /// Bind to listen for all UDP packets destined to `port`
@@ -174,8 +182,8 @@ impl NetDevice {
     /// Send a raw frame over the network containing the bytes `packet`. This
     /// `packet` does not include the FCS, that must be computed or inserted
     /// by the driver.
-    pub fn send(&self, packet: Packet) {
-        self.driver.lock().send(packet);
+    pub fn send(&self, packet: Packet, flush: bool) {
+        self.driver.lock().send(packet, flush);
     }
 
     /// Allocate a new packet for use
@@ -190,8 +198,9 @@ impl NetDevice {
 }
 
 impl Device for NetDevice {
-    unsafe fn purge(&mut self) {
-        panic!("Implement purge for net device");
+    unsafe fn purge(&self) {
+        // TODO
+        //panic!("Implement purge for net device");
     }
 }
 
@@ -210,7 +219,7 @@ pub trait NetDriver {
     /// Send a raw frame over the network containing the bytes `packet`. This
     /// `packet` does not include the FCS, that must be computed or inserted
     /// by the driver.
-    fn send(&mut self, packet: Packet);
+    fn send(&self, packet: Packet, flush: bool);
     
     /// Get a packet from the NIC's packet free list. This allows us to give
     /// ownership of a packet during the `send` process, which the NIC can then
@@ -557,12 +566,18 @@ impl Packet {
         self.raw.phys_addr()
     }
 
+    /// Get the length of the raw payload
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
     /// Get the raw packet contents
     #[inline]
     pub fn raw(&self) -> &[u8] {
         &self.raw[..self.length]
     }
-    
+
     /// Get the raw packet contents as mutable
     #[inline]
     pub fn raw_mut(&mut self) -> &mut [u8] {

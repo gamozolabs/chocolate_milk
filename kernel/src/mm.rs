@@ -178,7 +178,7 @@ impl PageFreeList {
             // Get some bulk memory
             let alc = {
                 // Get access to physical memory
-                let mut phys_mem = core!().boot_args.free_memory.lock();
+                let mut phys_mem = core!().boot_args.free_memory_ref().lock();
                 let phys_mem     = phys_mem.as_mut().unwrap();
 
                 // Bulk allocate some memory to populate the empty free list
@@ -273,8 +273,10 @@ impl PhysMem for PhysicalMemory {
             unsafe { core!().free_list.lock().pop() }
         } else {
             // Get access to physical memory
-            let mut phys_mem = core!().boot_args.free_memory.lock();
-            let phys_mem     = phys_mem.as_mut().unwrap();
+            let mut phys_mem = unsafe {
+                core!().boot_args.free_memory_ref().lock()
+            };
+            let phys_mem = phys_mem.as_mut().unwrap();
 
             // Could not satisfy allocation from free list, allocate
             // directly from the physical memory pool
@@ -297,8 +299,10 @@ impl PhysMem for PhysicalMemory {
             }).expect("Integer overflow on free_phys");
 
             // Get access to physical memory
-            let mut phys_mem = core!().boot_args.free_memory.lock();
-            let phys_mem     = phys_mem.as_mut().unwrap();
+            let mut phys_mem = unsafe {
+                core!().boot_args.free_memory_ref().lock()
+            };
+            let phys_mem = phys_mem.as_mut().unwrap();
             phys_mem.insert(Range { start: phys.0, end: end });
         }
     }
