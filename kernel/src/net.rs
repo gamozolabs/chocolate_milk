@@ -1,5 +1,6 @@
 //! Driver agnostic networking utilities
 
+pub mod arp;
 pub mod dhcp;
 pub mod intel_nic;
 
@@ -37,6 +38,21 @@ pub struct Ipv4Addr(u32);
 
 impl From<u32> for Ipv4Addr {
     fn from(val: u32) -> Self { Ipv4Addr(val) }
+}
+
+impl From<&str> for Ipv4Addr {
+    fn from(val: &str) -> Self {
+        let mut bytes = [0u8; 4];
+
+        assert!(val.split(".").count() == 4, "Invalid IPv4 address");
+
+        for (ii, component) in val.split(".").enumerate() {
+            bytes[ii] = u8::from_str_radix(component, 10)
+                .expect("Invalid IPv4 address");
+        }
+
+        Ipv4Addr(u32::from_be_bytes(bytes))
+    }
 }
 
 impl From<Ipv4Addr> for u32 {
@@ -178,6 +194,31 @@ impl NetDevice {
         }
     }
 
+    /// Receive a raw packet from the network
+    pub fn recv(&self) -> Option<PacketLease> {
+        self.driver.recv().and_then(|packet| {
+            // We want to automatically respond to ARPs
+            if let Some(lease) = &self.dhcp_lease {
+                let our_ip = lease.client_ip;
+                if let Some(arp) = packet.arp() {
+                    if arp.hw_type == arp::HWTYPE_ETHERNET &&
+                            arp.proto_type == ETHTYPE_IPV4 &&
+                            arp.hw_size    == 6 &&
+                            arp.proto_size == 4 &&
+                            arp.opcode     == arp::Opcode::Request as u16 &&
+                            arp.target_ip  == our_ip {
+                        // Reply to the ARP
+                        print!("Someone asked for our IP\n");
+                        self.arp_reply(arp.sender_ip, arp.sender_mac);
+                        return None;
+                    }
+                }
+            }
+
+            Some(packet)
+        })
+    }
+
     /// Receive a UDP packet destined to a specific port
     fn recv_udp<T, F>(&self, port: u16, func: F) -> Option<T>
             where F: FnOnce(&Packet, Udp) -> Option<T> {
@@ -196,7 +237,7 @@ impl NetDevice {
         }
 
         // Recv a packet, it could be any raw packet
-        let packet = self.driver.recv()?;
+        let packet = self.recv()?;
 
         // Attempt to parse the packet as UDP
         if let Some(udp) = packet.udp() {

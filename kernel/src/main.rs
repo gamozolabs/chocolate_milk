@@ -81,8 +81,15 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                time::uptime(), core!().id + 1);
     }
 
-    let netdev = net::NetDevice::get();
-    print!("{:?}\n", netdev.as_ref().map(|x| x.dhcp_lease));
+    {
+        if let Some(netdev) = net::NetDevice::get() {
+            netdev.bind_udp((core!().id + 13370) as u16);
+
+            netdev.arp("192.168.101.1");
+
+            loop { netdev.recv(); }
+        }
+    }
 
     cpu::halt();
 }
