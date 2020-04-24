@@ -307,8 +307,7 @@ pub unsafe extern fn interrupt_handler(
     let draining_eois = DRAINING_EOIS.load(Ordering::SeqCst);
     if !draining_eois {
         // Attempt to get the dispatch handler for this exception.
-        let handler = core!().interrupts.try_lock()
-            .expect("Failed to get interrupts lock")
+        let handler = core!().interrupts.lock()
             .as_ref().unwrap().dispatch[number as usize];
         
         // Invoke the dynamically installed interrupt handler if it exists

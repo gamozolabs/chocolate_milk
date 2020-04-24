@@ -82,6 +82,9 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     }
 
     {
+        let _serial1 = core!().boot_args.serial.lock();
+        let _serial2 = core!().boot_args.serial.lock();
+
         if let Some(netdev) = net::NetDevice::get() {
             let our_port = (core!().id + 13370) as u16;
 

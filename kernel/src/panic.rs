@@ -25,8 +25,7 @@ static SOFT_REBOOT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// serial port to soft reboot.
 pub unsafe fn attempt_soft_reboot() {
     // Attempt to get a byte from the serial port
-    let byte = core!().boot_args.serial.try_lock()
-        .map(|mut x| x.as_mut().unwrap().read_byte()).flatten();
+    let byte = core!().boot_args.serial.lock().as_mut().unwrap().read_byte();
 
     // Check if we got a 'Z' from the serial port.
     if let Some(b'Z') = byte {
@@ -124,11 +123,6 @@ pub fn panic(info: &PanicInfo) -> ! {
 
             apic
         };
-        
-        // Lock the old serial port so nobody can use it anymore. This is just
-        // to prevent accidential use of the old serial driver since we create
-        // a new one.
-        let _old_serial = core!().boot_args.serial.try_lock();
 
         // Create our emergency serial port. We disabled all other cores so
         // we re-initialize the serial port to make sure it's in a sane state.

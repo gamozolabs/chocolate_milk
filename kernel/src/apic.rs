@@ -345,10 +345,8 @@ impl Apic {
         self.write_apic(Register::InitialCount, 0);
         
         // Deregister an interrupt handler for `APIC_TIMER_VECTOR`
-        core!().interrupts.try_lock()
-            .expect("Failed to get interrupt lock to disable APIC timer")
-            .as_mut().unwrap().remove_handler(
-                APIC_TIMER_VECTOR, Self::timer_interrupt);
+        core!().interrupts.lock().as_mut().unwrap().remove_handler(
+            APIC_TIMER_VECTOR, Self::timer_interrupt);
     }
 }
 
