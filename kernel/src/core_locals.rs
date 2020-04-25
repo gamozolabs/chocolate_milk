@@ -4,7 +4,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 
 use crate::apic::Apic;
-use crate::mm::PageFreeList;
+use crate::mm::{PageFreeList, PhysContig};
 use crate::interrupts::Interrupts;
 
 use lockcell::LockCell;
@@ -103,15 +103,15 @@ pub struct CoreLocals {
 
     /// An initialized APIC implementation. Will be `None` until the APIC has
     /// been initialized for this core.
-    pub apic: LockCell<Option<Apic>, LockInterrupts>,
+    apic: LockCell<Option<Apic>, LockInterrupts>,
 
     /// The interrupt implementation. This is used to add interrupt handlers
     /// to the interrupt table. If this is `None`, then interrupts have not
     /// yet been initialized.
-    pub interrupts: LockCell<Option<Interrupts>, LockInterrupts>,
+    interrupts: LockCell<Option<Interrupts>, LockInterrupts>,
 
     /// A core local free list of pages
-    pub free_list: LockCell<PageFreeList, LockInterrupts>,
+    free_list: LockCell<PageFreeList, LockInterrupts>,
 
     /// Current level of interrupt nesting. Incremented on every interrupt
     /// entry, and decremented on every interrupt return.
@@ -132,6 +132,10 @@ pub struct CoreLocals {
 
     /// Get the core's APIC ID
     apic_id: AtomicU32,
+
+    /// VMXON region for this core. If VMXON has not yet executed, or VMXOFF
+    /// was executed, then this will be `None`
+    vmxon_region: LockCell<Option<PhysContig<[u8; 4096]>>, LockInterrupts>,
 }
 
 /// Empty marker trait that requires `Sync`, such that we can compile-time
@@ -143,6 +147,28 @@ impl CoreGuard for CoreLocals {}
 type Persist = PersistStore<LockInterrupts>;
 
 impl CoreLocals {
+    /// Get access to the VMXON region
+    pub unsafe fn vmxon_region(&self) ->
+            &LockCell<Option<PhysContig<[u8; 4096]>>, LockInterrupts> {
+        &self.vmxon_region
+    }
+    
+    /// Get access to the interrupts
+    pub unsafe fn interrupts(&self) ->
+            &LockCell<Option<Interrupts>, LockInterrupts> {
+        &self.interrupts
+    }
+    
+    /// Get access to the APIC
+    pub unsafe fn apic(&self) -> &LockCell<Option<Apic>, LockInterrupts> {
+        &self.apic
+    }
+    
+    /// Get access to the free list 
+    pub unsafe fn free_list(&self) -> &LockCell<PageFreeList, LockInterrupts> {
+        &self.free_list
+    }
+
     /// Get access to the persistent storage
     pub unsafe fn persist_store(&self) -> &'static Persist {
         // Get the physical address of the persist store
@@ -309,6 +335,8 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
         interrupt_depth:               AutoAtomicRef::new(0),
         exception_depth:               AutoAtomicRef::new(0),
         interrupt_disable_outstanding: AtomicUsize::new(1),
+
+        vmxon_region: LockCell::new_no_preempt(None),
     };
 
     unsafe {

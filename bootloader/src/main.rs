@@ -252,7 +252,7 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
                 // all bytes that were not initialized in the file.
                 table.map_init(&mut pmem, VirtAddr(vaddr),
                     PageType::Page4K,
-                    vsize as u64, read, write, execute,
+                    vsize as u64, read, write, execute, false,
                     Some(|off| {
                         raw.get(off as usize).copied().unwrap_or(0)
                     }));
@@ -289,7 +289,7 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
         // Map in the stack
         page_table.map(&mut pmem,
                        VirtAddr(stack_addr), PageType::Page4K,
-                       KERNEL_STACK_SIZE, true, true, false).unwrap();
+                       KERNEL_STACK_SIZE, true, true, false, false).unwrap();
         
         // Get the address of the trampoline table
         let tramp_table = unsafe {

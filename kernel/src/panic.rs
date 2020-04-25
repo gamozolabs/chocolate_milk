@@ -75,6 +75,15 @@ pub unsafe fn soft_reboot(apic: &mut Apic) -> ! {
 
     // Disable all other cores
     disable_all_cores(apic);
+    
+    {
+        // VMXOFF if we're in VMX root operation
+        let vmxon_lock = core!().vmxon_region().lock();
+        if let Some(_) = &*vmxon_lock {
+            // Disable VMX root operation
+            llvm_asm!("vmxoff" :::: "intel", "volatile");
+        }
+    }
 
     // Destroy all devices which are handled by drivers
     crate::pci::destroy_devices();
@@ -114,7 +123,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         let apic = unsafe {
             // Forcibly get access to the current APIC. This is likely safe in
             // almost every situation as the APIC is not very stateful.
-            let apic = &mut *core!().apic.shatter();
+            let apic = &mut *core!().apic().shatter();
             let apic = apic.as_mut().unwrap();
             
             // Disable all other cores, waiting for them to check-in notifying
@@ -188,7 +197,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         unsafe {
             // Forcibly get access to the current APIC. This is likely safe in
             // almost every situation as the APIC is not very stateful.
-            let apic = &mut *core!().apic.shatter();
+            let apic = &mut *core!().apic().shatter();
             let apic = apic.as_mut().unwrap();
 
             // Notify the BSP that we paniced by sending it an NMI

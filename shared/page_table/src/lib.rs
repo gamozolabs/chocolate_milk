@@ -6,13 +6,13 @@ use core::alloc::Layout;
 use core::mem::size_of;
 
 /// Page table flag indicating the entry is valid
-pub const PAGE_PRESENT: u64 = 1 <<  0;
+pub const PAGE_PRESENT: u64 = 1 << 0;
 
 /// Page table flag indiciating this page or table is writable
-pub const PAGE_WRITE: u64 = 1 <<  1;
+pub const PAGE_WRITE: u64 = 1 << 1;
 
 /// Page table flag indiciating this page or table is accessible in user mode
-pub const PAGE_USER: u64 = 1 <<  2;
+pub const PAGE_USER: u64 = 1 << 2;
 
 /// Page table flag indiciating that accesses to the memory described by this
 /// page or table should be strongly uncached
@@ -170,9 +170,11 @@ impl PageTable {
     /// as the permission bits.
     pub fn map<P: PhysMem>(&mut self, 
             phys_mem: &mut P, vaddr: VirtAddr, page_type: PageType,
-            size: u64, read: bool, write: bool, exec: bool) -> Option<()> {
+            size: u64, read: bool, write: bool, exec: bool, user: bool)
+                -> Option<()> {
         self.map_init(phys_mem,
-            vaddr, page_type, size, read, write, exec, None::<fn(u64) -> u8>)
+            vaddr, page_type, size, read, write, exec, user,
+            None::<fn(u64) -> u8>)
     }
 
     /// Create a page table entry at `vaddr` for `size` bytes in length,
@@ -189,7 +191,7 @@ impl PageTable {
     pub fn map_init<F, P: PhysMem>(
                 &mut self, phys_mem: &mut P,
                 vaddr: VirtAddr, page_type: PageType,
-                size: u64, _read: bool, write: bool, exec: bool,
+                size: u64, _read: bool, write: bool, exec: bool, user: bool,
                 init: Option<F>) -> Option<()>
             where F: Fn(u64) -> u8 {
         // Get the raw page size in bytes and the mask
@@ -218,6 +220,7 @@ impl PageTable {
             // Create the page table entry for this page
             let ent = page.0 | PAGE_PRESENT |
                 if write { PAGE_WRITE } else { 0 } |
+                if user  { PAGE_USER  } else { 0 } |
                 if exec  { 0 } else { PAGE_NX } |
                 if page_type != PageType::Page4K { PAGE_SIZE } else { 0 };
 

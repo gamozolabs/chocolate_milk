@@ -3,6 +3,9 @@
 #![feature(llvm_asm)]
 #![no_std]
 
+/// MSR for active FS base
+const IA32_FS_BASE: u32 = 0xc0000100;
+
 /// MSR for active GS base
 const IA32_GS_BASE: u32 = 0xc0000101;
 
@@ -104,6 +107,18 @@ pub unsafe fn set_gs_base(base: u64) {
     wrmsr(IA32_GS_BASE, base);
 }
 
+/// Get the FS base
+#[inline]
+pub unsafe fn fs_base() -> u64 {
+    rdmsr(IA32_FS_BASE)
+}
+
+/// Set the FS base
+#[inline]
+pub unsafe fn set_fs_base(base: u64) {
+    wrmsr(IA32_FS_BASE, base);
+}
+
 /// Halt forever
 #[inline]
 pub fn halt() -> ! {
@@ -133,6 +148,22 @@ pub unsafe fn cpuid(eax: u32, ecx: u32) -> (u32, u32, u32, u32) {
          "{eax}"(eax), "{ecx}"(ecx) :: "volatile", "intel");
 
     (oeax, oebx, oecx, oedx)
+}
+
+/// Read `cr0`
+#[inline]
+pub fn read_cr0() -> u64 {
+    let val: u64;
+    unsafe {
+        llvm_asm!("mov $0, cr0" : "=r"(val) :: "memory" : "volatile", "intel");
+    }
+    val
+}
+
+/// Write to `cr0`
+#[inline]
+pub unsafe fn write_cr0(val: u64) {
+    llvm_asm!("mov cr0, $0" :: "r"(val) : "memory" : "volatile", "intel");
 }
 
 /// Read `cr2`
@@ -165,6 +196,79 @@ pub fn read_cr3() -> u64 {
 #[inline]
 pub unsafe fn write_cr3(val: u64) {
     llvm_asm!("mov cr3, $0" :: "r"(val) : "memory" : "volatile", "intel");
+}
+
+/// Read `cr4`
+#[inline]
+pub fn read_cr4() -> u64 {
+    let val: u64;
+    unsafe {
+        llvm_asm!("mov $0, cr4" : "=r"(val) :: "memory" : "volatile", "intel");
+    }
+    val
+}
+
+/// Write to `cr4`
+#[inline]
+pub unsafe fn write_cr4(val: u64) {
+    llvm_asm!("mov cr4, $0" :: "r"(val) : "memory" : "volatile", "intel");
+}
+
+/// Gets the ES selector value
+#[inline]
+pub unsafe fn read_es() -> u16 {
+    let ret;
+    llvm_asm!("mov $0, es" : "=r"(ret) ::: "intel", "volatile");
+    ret
+}
+
+/// Gets the CS selector value
+#[inline]
+pub unsafe fn read_cs() -> u16 {
+    let ret;
+    llvm_asm!("mov $0, cs" : "=r"(ret) ::: "intel", "volatile");
+    ret
+}
+
+/// Gets the SS selector value
+#[inline]
+pub unsafe fn read_ss() -> u16 {
+    let ret;
+    llvm_asm!("mov $0, ss" : "=r"(ret) ::: "intel", "volatile");
+    ret
+}
+
+/// Gets the DS selector value
+#[inline]
+pub unsafe fn read_ds() -> u16 {
+    let ret;
+    llvm_asm!("mov $0, ds" : "=r"(ret) ::: "intel", "volatile");
+    ret
+}
+
+/// Gets the FS selector value
+#[inline]
+pub unsafe fn read_fs() -> u16 {
+    let ret;
+    llvm_asm!("mov $0, fs" : "=r"(ret) ::: "intel", "volatile");
+    ret
+}
+
+/// Gets the GS selector value
+#[inline]
+pub unsafe fn read_gs() -> u16 {
+    let ret;
+    llvm_asm!("mov $0, gs" : "=r"(ret) ::: "intel", "volatile");
+    ret
+}
+
+/// Gets the TR selector value
+#[inline]
+pub unsafe fn read_tr() -> u16 {
+    let mut ret: u16 = 0;
+    llvm_asm!("str [$0]" :: "r"(&mut ret as *mut u16) : "memory" :
+              "intel", "volatile");
+    ret
 }
 
 /// Get the current flags

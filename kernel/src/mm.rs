@@ -285,7 +285,7 @@ impl PhysMem for PhysicalMemory {
 
     fn alloc_phys(&mut self, layout: Layout) -> PhysAddr {
         if layout.size() == 4096 && layout.align() >= 4096 {
-            unsafe { core!().free_list.lock().pop() }
+            unsafe { core!().free_list().lock().pop() }
         } else {
             // Get access to physical memory
             let mut phys_mem = unsafe {
@@ -306,7 +306,7 @@ impl PhysMem for PhysicalMemory {
     fn free_phys(&mut self, phys: PhysAddr, size: u64) {
         if (phys.0 & 0xfff) == 0 && size == 4096 {
             // Get access to the free list
-            unsafe { core!().free_list.lock().push(phys); }
+            unsafe { core!().free_list().lock().push(phys); }
         } else {
             // Compute the end address
             let end = size.checked_sub(1).and_then(|x| {
@@ -357,7 +357,7 @@ impl GlobalAllocator {
 
         // Map in the memory as RW
         page_table.map(&mut pmem, vaddr, PageType::Page4K,
-            alignsize, true, true, false)?;
+            alignsize, true, true, false, false)?;
 
         // Allocation success, `vaddr` now is valid as read-write for
         // `alignsize` bytes!

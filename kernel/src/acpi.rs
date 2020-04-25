@@ -308,7 +308,7 @@ pub unsafe fn init() {
     // Launch all other cores
     if let Some(valid_apics) = apics {
         // Get exclusive access to the APIC for this core
-        let mut apic = core!().apic.lock();
+        let mut apic = core!().apic().lock();
         let apic = apic.as_mut().unwrap();
 
         // Go through all APICs on the system

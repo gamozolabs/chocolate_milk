@@ -14,17 +14,18 @@ extern crate core_reqs;
 #[allow(unused_imports)]
 #[macro_use] extern crate noodle;
 
-#[macro_use] mod core_locals;
-#[macro_use] mod print;
-mod panic;
-mod mm;
-mod interrupts;
-mod apic;
-mod acpi;
-mod intrinsics;
-mod pci;
-mod net;
-mod time;
+#[macro_use] pub mod core_locals;
+#[macro_use] pub mod print;
+pub mod panic;
+pub mod mm;
+pub mod interrupts;
+pub mod apic;
+pub mod acpi;
+pub mod intrinsics;
+pub mod pci;
+pub mod net;
+pub mod time;
+pub mod vtx;
 
 use page_table::PhysAddr;
 
@@ -56,7 +57,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         // One-time initialization for the whole kernel
 
         // Initialize PCI devices
-        unsafe { pci::init() }
+        //unsafe { pci::init() }
 
         // Bring up all APICs on the system and also initialize NUMA
         // information with the memory manager through the use of the ACPI
@@ -65,7 +66,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     }
 
     // Enable the APIC timer
-    unsafe { core!().apic.lock().as_mut().unwrap().enable_timer(); }
+    unsafe { core!().apic().lock().as_mut().unwrap().enable_timer(); }
 
     // Now we're ready for interrupts!
     unsafe { core!().enable_interrupts(); }
@@ -79,12 +80,42 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // NMIs and soft reboots work.
     acpi::core_checkin();
 
+    /*
     if core!().id == acpi::num_cores() - 1 {
         print!("[{:16.8}] We made it! All cores online! {}\n",
                time::uptime(), core!().id + 1);
-    }
+    }*/
 
     if core!().id == 0 {
+        use page_table::{VirtAddr, PageType};
+        
+        // Create a new virtual machine
+        let mut vm = vtx::Vm::new_user();
+
+        // Map in 1 page as RWXU 0x13370000
+        let mut pmem = mm::PhysicalMemory;
+        vm.page_table.map(&mut pmem, VirtAddr(0x13370000), PageType::Page4K,
+            4096, true, true, true, true);
+
+        // Get the physical address of the page and write in some assembly
+        let page = vm.page_table.translate(&mut pmem, VirtAddr(0x13370000))
+            .unwrap().page.unwrap().0;
+        unsafe {
+            crate::mm::write_phys(page,
+            *b"\xb8\x13\x37\x13\x37\x66\x48\x0f\x6e\xc0\x50\xcc");
+        }
+
+        vm.guest_regs.rip = 0x13370000;
+        vm.guest_regs.rsp = 0x13370fe8;
+
+        let vmexit = vm.run();
+        print!("[{:16.8}] {:x?}\n", time::uptime(), vmexit);
+
+        unsafe {
+        print!("{:x?}\n", crate::mm::read_phys::<u64>(PhysAddr(page.0 + 0xfe0)));
+        }
+
+        /*
         use net::netmapping::NetMapping;
         let mapping = NetMapping::new("192.168.101.1:1911", "foobar.bin")
             .expect("Failed to netmap file");
@@ -93,7 +124,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
             unsafe { core::ptr::read_volatile(&mapping[off]); }
         }
 
-        print!("Got whole buffer\n");
+        print!("Got whole buffer\n");*/
     }
 
     cpu::halt();

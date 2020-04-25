@@ -77,6 +77,15 @@ type InterruptDispatch =
 pub struct Interrupts {
     /// Dispatch routines for interrupts
     dispatch: [Option<InterruptDispatch>; 256],
+
+    /// TSS
+    pub tss: Box<Tss>,
+    
+    /// IDT
+    pub idt: Vec<IdtEntry>,
+    
+    /// GDT
+    pub gdt: Vec<u64>,
 }
 
 impl Interrupts {
@@ -111,7 +120,7 @@ struct TablePtr(u16, u64);
 /// A 64-bit TSS data structure
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
-struct Tss {
+pub struct Tss {
 	reserved1:   u32,
 	rsp:         [u64; 3],
 	reserved2:   u64,
@@ -125,19 +134,19 @@ struct Tss {
 /// representation
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
-struct IDTEntry(u32, u32, u32, u32);
+pub struct IdtEntry(u32, u32, u32, u32);
 
-impl IDTEntry {
+impl IdtEntry {
     /// Construct a new in-memory representation of an IDT entry. This will
     /// take the `cs:offset` to the handler address, the `ist` for the
     /// interrupt stack table index, the `typ` of the IDT gate entry and the
     /// `dpl` of the IDT entry.
     fn new(cs: u16, offset: u64, ist: u32, typ: u32, dpl: u32) -> Self {
-        assert!(ist <  8, "Invalid IDTEntry IST");
-        assert!(typ < 32, "Invalid IDTEntry type");
-        assert!(dpl <  4, "Invalid IDTEntry dpl");
+        assert!(ist <  8, "Invalid IdtEntry IST");
+        assert!(typ < 32, "Invalid IdtEntry type");
+        assert!(dpl <  4, "Invalid IdtEntry dpl");
 
-        IDTEntry(
+        IdtEntry(
             ((cs as u32) << 16) | (offset & 0xffff) as u32,
             ((offset & 0xffff0000) as u32) | (1 << 15) |
                 (dpl << 13) | (typ << 8) | ist,
@@ -174,12 +183,11 @@ pub fn eoi_required() -> [u128; 2] {
 /// #DF, #MC, and NMI interrupts. Then set up a IDT with all interrupts passing
 /// through to the `interrupt_handler` Rust function.
 pub fn init() {
-    let mut interrupts = core!().interrupts.lock();
+    let mut interrupts = unsafe { core!().interrupts().lock() };
     assert!(interrupts.is_none(), "Interrupts have already been initialized");
 
     // Create a new, empty TSS
-	let mut tss: ManuallyDrop<Box<Tss>> =
-        ManuallyDrop::new(Box::new(Tss::default()));
+	let mut tss: Box<Tss> = Box::new(Tss::default());
 
     // Create a 32 KiB critical stack for use during #DF, #MC, and NMI
     let crit_stack: ManuallyDrop<Vec<u8>> = ManuallyDrop::new(
@@ -187,7 +195,7 @@ pub fn init() {
     tss.ist[0] = crit_stack.as_ptr() as u64 + crit_stack.capacity() as u64;
     
     // Create GDT in the kernel context
-    let mut gdt: ManuallyDrop<Vec<u64>> = ManuallyDrop::new(vec![
+    let mut gdt: Vec<u64> = vec![
 	    0x0000000000000000, // 0x0000 | Null descriptor
 	    0x00009a007c00ffff, // 0x0008 | 16-bit, present, code, base 0x7c00
 	    0x000092000000ffff, // 0x0010 | 16-bit, present, data, base 0
@@ -195,10 +203,10 @@ pub fn init() {
 	    0x00cf92000000ffff, // 0x0020 | 32-bit, present, data, base 0
 	    0x00209a0000000000, // 0x0028 | 64-bit, present, code, base 0
 	    0x0000920000000000, // 0x0030 | 64-bit, present, data, base 0
-    ]);
+    ];
 
     // Create the task pointer in the GDT
-    let tss_base = &**tss as *const Tss as u64;
+    let tss_base = &*tss as *const Tss as u64;
     let tss_low = 0x890000000000 | (((tss_base >> 24) & 0xff) << 56) |
         ((tss_base & 0xffffff) << 16) |
         (core::mem::size_of::<Tss>() as u64 - 1);
@@ -228,7 +236,7 @@ pub fn init() {
     }
     
     // Create a new IDT
-    let mut idt = ManuallyDrop::new(Vec::with_capacity(256));
+    let mut idt = Vec::with_capacity(256);
 
     for int_id in 0..256 {
         // Determine the IST entry to use for this vector
@@ -242,7 +250,7 @@ pub fn init() {
             _ => 0,
         };
 
-        idt.push(IDTEntry::new(0x28, INT_HANDLERS[int_id] as u64,
+        idt.push(IdtEntry::new(0x28, INT_HANDLERS[int_id] as u64,
                                ist, X64_INTERRUPT_GATE, 0));
     }
 
@@ -262,6 +270,9 @@ pub fn init() {
     // Create the interrupts structure
     *interrupts = Some(Interrupts {
         dispatch: [None; 256],
+        gdt,
+        idt,
+        tss,
     });
 }
 
@@ -365,7 +376,7 @@ pub unsafe extern fn interrupt_handler(
     let draining_eois = DRAINING_EOIS.load(Ordering::SeqCst);
     if !draining_eois {
         // Attempt to get the dispatch handler for this exception.
-        let handler = core!().interrupts.lock()
+        let handler = core!().interrupts().lock()
             .as_ref().unwrap().dispatch[number as usize];
         
         // Invoke the dynamically installed interrupt handler if it exists
