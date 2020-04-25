@@ -89,9 +89,12 @@ impl PageFaultHandler for NetMapHandler {
 
             // Get a mutable slice to the physical memory backing the page
             let new_page = mm::slice_phys_mut(page, 4096);
-                
+
             // Compute the number of bytes we expect to receive
             let to_recv = core::cmp::min(4096, self.size - offset);
+
+            // Zero out any remainder of the page that will not be copied into
+            new_page[to_recv..].iter_mut().for_each(|x| *x = 0);
 
             let mut retries = 0;
             'retry: loop {

@@ -94,6 +94,7 @@ pub fn alloc_virt_addr_4k(size: u64) -> VirtAddr {
 
 /// Gets mutable access to a slice of physical memory
 #[allow(dead_code)]
+#[inline]
 pub unsafe fn slice_phys_mut<'a>(paddr: PhysAddr, size: u64) -> &'a mut [u8] {
     let end = size.checked_sub(1).and_then(|x| {
         x.checked_add(paddr.0)

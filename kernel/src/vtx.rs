@@ -573,8 +573,8 @@ impl Vm {
                     &vmcs_revision_number.to_le_bytes());
 
                 // Enable VMX by switching VMX to on
-                llvm_asm!("vmxon [$0]" :: "r"(&vmxon_region.phys_addr()) :
-                          "memory" : "intel", "volatile");
+                llvm_asm!("vmxon ($0)" :: "r"(&vmxon_region.phys_addr()) :
+                          "memory" : "volatile");
 
                 // Save the VMXON region as the current VMXON region
                 *vmxon_lock = Some(vmxon_region);
@@ -593,7 +593,7 @@ impl Vm {
         
         // Create a new empty page table for the 64-bit guest
         let mut pmem = PhysicalMemory;
-        let page_table = PageTable::new(&mut pmem);
+        let page_table = PageTable::new_tracking(&mut pmem);
 
         Vm {
             vmcs: vmcs,

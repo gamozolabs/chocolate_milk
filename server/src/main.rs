@@ -53,6 +53,7 @@ fn main() -> io::Result<()> {
                         ServerMessage::FileIdErr.serialize(
                             &mut sendbuf).unwrap();
                         socket.send_to(&sendbuf, src)?;
+                        continue;
                     }
 
                     // Compute the file ID by hashing the file path
