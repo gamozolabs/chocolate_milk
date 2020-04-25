@@ -24,7 +24,7 @@ impl NetDevice {
         let request_ip: Ipv4Addr = ip.into();
         
         // Get our own IP
-        let our_ip = self.dhcp_lease.as_ref().unwrap().client_ip;
+        let our_ip = self.dhcp_lease.lock().as_ref().unwrap().client_ip;
 
         'send_arp: for _ in 0..10000 {
             // Allocate a packet
@@ -99,10 +99,8 @@ impl NetDevice {
     }
 
     /// Construct a reply ARP from ourselves
-    pub fn arp_reply(&self, target_ip: Ipv4Addr, target_mac: [u8; 6]) {
-        // Get our own IP
-        let our_ip = self.dhcp_lease.as_ref().unwrap().client_ip;
-
+    pub fn arp_reply(&self, our_ip: Ipv4Addr,
+                     target_ip: Ipv4Addr, target_mac: [u8; 6]) {
         // Allocate a packet
         let mut packet = self.allocate_packet();
 

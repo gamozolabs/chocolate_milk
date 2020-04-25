@@ -92,6 +92,21 @@ pub fn alloc_virt_addr_4k(size: u64) -> VirtAddr {
     ret
 }
 
+/// Gets mutable access to a slice of physical memory
+#[allow(dead_code)]
+pub unsafe fn slice_phys_mut<'a>(paddr: PhysAddr, size: u64) -> &'a mut [u8] {
+    let end = size.checked_sub(1).and_then(|x| {
+        x.checked_add(paddr.0)
+    }).expect("Integer overflow on read_phys");
+    assert!(end < KERNEL_PHYS_WINDOW_SIZE,
+            "Physical address outside of window");
+
+    // Return out a slice to this physical memory as mutable
+    core::slice::from_raw_parts_mut(
+        (KERNEL_PHYS_WINDOW_BASE + paddr.0) as *mut u8,
+        size as usize)
+}
+
 /// Read a physical address containing a type `T`. This just handles the
 /// windowing and performs a `core::ptr::read_volatile`.
 #[allow(dead_code)]

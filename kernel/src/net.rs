@@ -3,7 +3,9 @@
 pub mod arp;
 pub mod dhcp;
 pub mod intel_nic;
+pub mod netmapping;
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::fmt::{self, Formatter, Debug};
 use core::convert::TryInto;
 use core::ops::{Deref, DerefMut};
@@ -13,11 +15,13 @@ use alloc::sync::Arc;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 
+use crate::time;
 use crate::pci::Device;
 use crate::mm::PhysContig;
 use crate::net::dhcp::Lease;
 use crate::core_locals::LockInterrupts;
 
+use noodle::Writer;
 use lockcell::LockCell;
 use page_table::PhysAddr;
 
@@ -56,7 +60,7 @@ impl UdpAddress {
         Some(UdpAddress {
             src_eth:  device.mac(),
             dst_eth:  device.arp(dst_ip)?,
-            src_ip:   device.dhcp_lease.as_ref().unwrap().client_ip,
+            src_ip:   device.dhcp_lease.lock().as_ref().unwrap().client_ip,
             dst_ip:   dst_ip,
             src_port: src_port,
             dst_port: dst_port,
@@ -100,23 +104,51 @@ impl Debug for Ipv4Addr {
 }
 
 /// UDP bound port
-pub struct UDPBind<'a> {
+pub struct UdpBind {
     /// Reference to the network device we are a bound on
-    device: &'a NetDevice,
+    device: Arc<NetDevice>,
 
     /// Port we are bound to
     port: u16,
 }
 
-impl<'a> UDPBind<'a> {
-    /// Atetmpt to receive a UDP packet on the bound port
-    pub fn recv<T, F>(&self, func: F) -> Option<T>
-            where F: FnOnce(&Packet, Udp) -> Option<T> {
-        self.device.recv_udp(self.port, func)
+impl UdpBind {
+    /// Attempt to receive a UDP packet on the bound port
+    #[allow(unused)]
+    pub fn recv<T, F>(&self, mut func: F) -> Option<T>
+            where F: FnMut(&Packet, Udp) -> Option<T> {
+        self.device.recv_udp(self.port, &mut func)
+    }
+
+    /// Attempts to receive a UDP packet on the bound port in a loop for a
+    /// given `timeout` in microseconds
+    pub fn recv_timeout<T, F>(&self, timeout: u64, mut func: F) -> Option<T> 
+            where F: FnMut(&Packet, Udp) -> Option<T> {
+        // Compute the TSC value at the timeout
+        let timeout = time::future(timeout);
+
+        loop {
+            // Check if we have timed out
+            if cpu::rdtsc() >= timeout { return None; }
+
+            if let Some(val) = self.device.recv_udp(self.port, &mut func) {
+                return Some(val);
+            }
+        }
+    }
+
+    /// Gets the port number this UDP bind is bound to
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Get access to the `NetDevice` that this `UdpBind` is bound to
+    pub fn device(&self) -> &NetDevice {
+        &*self.device
     }
 }
 
-impl<'a> Drop for UDPBind<'a> {
+impl Drop for UdpBind {
     fn drop(&mut self) {
         // Unbind from the UDP port
         self.device.unbind_udp(self.port);
@@ -134,7 +166,13 @@ pub struct NetDevice {
 
     /// The DHCP lease that was obtained during `init`. May be `None` if no
     /// DHCP lease was obtained
-    pub dhcp_lease: Option<Lease>,
+    pub dhcp_lease: LockCell<Option<Lease>, LockInterrupts>,
+
+    /// Next dynamic port to give out for use as an ephemeral port. This value
+    /// will just increment from 0 thus the user should add `49152` to the base
+    /// and mod to cap the range to `65535`. This is the recommended range
+    /// by IANA to use for dynamically allocated ports.
+    dynamic_port: AtomicU32,
 
     /// Packet queues for bound UDP ports
     ///
@@ -172,42 +210,68 @@ impl NetDevice {
     /// Wrap up a driver in a `NetDevice`
     fn new(driver: Box<dyn NetDriver>) -> Arc<Self> {
         // Create a new `NetDevice`
-        let mut nd = NetDevice {
-            mac: driver.mac(),
-            udp_binds:  LockCell::new(BTreeMap::new()),
-            driver:     driver,
-            dhcp_lease: None,
+        let nd = NetDevice {
+            mac:          driver.mac(),
+            udp_binds:    LockCell::new_no_preempt(BTreeMap::new()),
+            driver:       driver,
+            dhcp_lease:   LockCell::new_no_preempt(None),
+            dynamic_port: AtomicU32::new(0),
         };
-
-        // Attempt to get a DHCP lease for this device
-        nd.dhcp_lease = dhcp::get_lease(&nd);
-
+        
         // Wrap up the network device in an `Arc`
         let nd = Arc::new(nd);
 
-        // Check to see if we got a DHCP lease
-        if nd.dhcp_lease.is_some() {
-            // Save this network device to the list of network devices
-            NET_DEVICES.lock().push(nd.clone());
+        // Attempt to get a DHCP lease for this device
+        let lease = dhcp::get_lease(nd.clone());
+
+        {
+            // Assign the lease
+            let mut dhcp_lease = nd.dhcp_lease.lock();
+            *dhcp_lease = lease;
+
+            // Check to see if we got a DHCP lease
+            if dhcp_lease.is_some() {
+                // Save this network device to the list of network devices
+                NET_DEVICES.lock().push(nd.clone());
+            }
         }
 
         nd
     }
 
+    /// Allocate a new unused private port
+    pub fn bind_udp(cur: Arc<Self>) -> Option<UdpBind> {
+        for _ in 0..(65536 - 49152) {
+            // Get a unique port number in the range of `49152` and `65535`
+            // inclusive
+            let port = (cur.dynamic_port.fetch_add(1, Ordering::SeqCst) %
+                (65536 - 49152) + 49152) as u16;
+
+            // Attempt to bind to the UDP port
+            if let Some(bind) = Self::bind_udp_port(cur.clone(), port) {
+                return Some(bind);
+            }
+        }
+
+        None
+    }
+
     /// Bind to listen for all UDP packets destined to `port`
-    pub fn bind_udp<'a, 'b: 'a>(&'b self, port: u16)
-            -> Option<UDPBind<'a>> {
+    pub fn bind_udp_port(cur: Arc<Self>, port: u16) -> Option<UdpBind> {
         // Get access to the UDP binds
-        let mut udp_binds = self.udp_binds.lock();
+        let mut udp_binds = cur.udp_binds.lock();
 
         // Check to see if someone already is listening on this port
         if !udp_binds.contains_key(&port) {
             // Nobody is listening, allocate a new bind queue
             udp_binds.insert(port, VecDeque::new());
 
+            // Release the lock on the UDP binds
+            core::mem::drop(udp_binds);
+
             // Return out the UDP bind
-            Some(UDPBind {
-                device: self,
+            Some(UdpBind {
+                device: cur,
                 port,
             })
         } else {
@@ -231,7 +295,7 @@ impl NetDevice {
     pub fn recv(&self) -> Option<PacketLease> {
         self.driver.recv().and_then(|packet| {
             // We want to automatically respond to ARPs
-            if let Some(lease) = &self.dhcp_lease {
+            if let Some(lease) = self.dhcp_lease.lock().as_ref() {
                 let our_ip = lease.client_ip;
                 if let Some(arp) = packet.arp() {
                     if arp.hw_type == arp::HWTYPE_ETHERNET &&
@@ -241,19 +305,20 @@ impl NetDevice {
                             arp.opcode     == arp::Opcode::Request as u16 &&
                             arp.target_ip  == our_ip {
                         // Reply to the ARP
-                        self.arp_reply(arp.sender_ip, arp.sender_mac);
+                        self.arp_reply(lease.client_ip,
+                                       arp.sender_ip, arp.sender_mac);
                         return None;
                     }
                 }
             }
-
+        
             Some(packet)
         })
     }
 
     /// Receive a UDP packet destined to a specific port
-    fn recv_udp<T, F>(&self, port: u16, func: F) -> Option<T>
-            where F: FnOnce(&Packet, Udp) -> Option<T> {
+    fn recv_udp<T, F>(&self, port: u16, func: &mut F) -> Option<T>
+            where F: FnMut(&Packet, Udp) -> Option<T> {
         // Get access to the UDP binds
         let mut udp_binds = self.udp_binds.lock();
 
@@ -270,7 +335,7 @@ impl NetDevice {
 
         // Recv a packet, it could be any raw packet
         let packet = self.recv()?;
-
+            
         // Attempt to parse the packet as UDP
         if let Some(udp) = packet.udp() {
             // Packet was UDP
@@ -403,6 +468,126 @@ pub struct Udp<'a> {
     pub payload: &'a [u8],
 }
 
+/// Builder for creating UDP packets in place. When this is dropped, the packet
+/// lengths and checksums will be computed and populated.
+pub struct UdpBuilder<'a> {
+    /// Reference to the packet we are building in
+    packet: &'a mut Packet,
+
+    /// Number of bytes currently in the UDP payload
+    udp_payload: usize,
+
+    /// Address to construct the packet with
+    addr: &'a UdpAddress,
+}
+
+impl<'a> UdpBuilder<'a> {
+    /// Reserve `size` bytes in the UDP payload, return a mutable slice to the
+    /// bytes of the payload
+    pub fn reserve(&mut self, size: usize) -> Option<&mut [u8]> {
+        // Make sure this fits within the packet
+        if self.udp_payload.checked_add(size)? > 1472 {
+            return None;
+        }
+
+        // Update the payload size
+        self.udp_payload += size;
+
+        // Return a slice to the reserved area
+        Some(&mut self.packet.raw[
+             14 + 20 + 8 + self.udp_payload - size..
+             14 + 20 + 8 + self.udp_payload
+        ])
+    }
+}
+
+impl<'a> Writer for UdpBuilder<'a> {
+    fn write(&mut self, buf: &[u8]) -> Option<()> {
+        // Make sure this fits within the packet
+        if self.udp_payload.checked_add(buf.len())? > 1472 {
+            return None;
+        }
+
+        // Copy the buffer into the packet
+        self.packet.raw[
+            14 + 20 + 8 + self.udp_payload..
+            14 + 20 + 8 + self.udp_payload + buf.len()
+        ].copy_from_slice(buf);
+
+        // Update the length of the UDP payload
+        self.udp_payload += buf.len();
+
+        // Success!
+        Some(())
+    }
+}
+
+impl<'a> Drop for UdpBuilder<'a> {
+    fn drop(&mut self) {
+        {
+            // Set up the ethernet header
+            let eth = &mut self.packet.raw[..14];
+            eth[0x0..0x6].copy_from_slice(&self.addr.dst_eth);
+            eth[0x6..0xc].copy_from_slice(&self.addr.src_eth);
+            eth[0xc..0xe].copy_from_slice(&ETHTYPE_IPV4.to_be_bytes());
+        }
+        
+        {
+            // Set up the IP header
+            let ip = &mut self.packet.raw[14..14 + 20];
+
+            // Set IPv4 as version and 20 byte header
+            ip[0] = 0x45;
+
+            // No DSCP and ECN
+            ip[1] = 0;
+
+            // Copy in the total length of the IP packet
+            let ip_size = (20 + 8 + self.udp_payload) as u16;
+            ip[2..4].copy_from_slice(&ip_size.to_be_bytes());
+
+            // Identification, flags, and fragment offset are all zero
+            ip[4..8].copy_from_slice(&[0; 4]);
+
+            // TTL is set to 64 (seems to be standard)
+            ip[8] = 64;
+
+            // Protocol is UDP
+            ip[9] = IPPROTO_UDP;
+
+            // Initialize the checksum to zero
+            ip[10..12].copy_from_slice(&[0; 2]);
+
+            // Copy in the source and dest IPs
+            ip[12..16].copy_from_slice(&self.addr.src_ip.0.to_be_bytes());
+            ip[16..20].copy_from_slice(&self.addr.dst_ip.0.to_be_bytes());
+
+            // Compute the checksum and fill in the checksum field
+            let checksum = Packet::checksum(0, ip);
+            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        }
+
+        {
+            // Set up the UDP header
+            let udp = &mut self.packet.raw[14 + 20..14 + 20 + 8];
+
+            // Copy in the source and dest ports
+            udp[0..2].copy_from_slice(&self.addr.src_port.to_be_bytes());
+            udp[2..4].copy_from_slice(&self.addr.dst_port.to_be_bytes());
+
+            // Compute and copy in the UDP size + header
+            let udp_size = (8 + self.udp_payload) as u16;
+            udp[4..6].copy_from_slice(&udp_size.to_be_bytes());
+
+            // No checksum (not required for IPv4)
+            udp[6..8].copy_from_slice(&[0; 2]);
+        }
+
+        // Set the length of the packet
+        self.packet.set_len(14 + 20 + 8 + self.udp_payload);
+    }
+}
+
 /// A physically and virtually allocated packet that can easily be put into
 /// and taken from DMA buffers directly from NICs.
 /// 
@@ -440,7 +625,7 @@ impl Packet {
         // size
         if (bytes.len() % 2) != 0 {
             checksum = checksum.wrapping_add(
-                ((bytes[bytes.len() - 1] as u16) << 8) as u32);
+                ((bytes[bytes.len() - 1] as u16) << 0) as u32);
         }
 
         // Carry over the carries and invert the whole thing
@@ -515,7 +700,7 @@ impl Packet {
         // Validate the total length
         if total_length < 20 || total_length as usize > eth.payload.len() {
             return None;
-        }
+        }        
 
         // Check the checksum
         if Self::checksum(0, &header) != 0 {
@@ -537,6 +722,10 @@ impl Packet {
         // Parse the IP information from the header
         let ip = self.ip()?;
 
+        if ip.protocol != IPPROTO_UDP {
+            return None;
+        }
+
         // Get the UDP header
         let header = ip.payload.get(0..8)?;
 
@@ -545,6 +734,7 @@ impl Packet {
         let dst_port = u16::from_be_bytes(header[2..4].try_into().ok()?);
         let length   = u16::from_be_bytes(header[4..6].try_into().ok()?);
 
+        /*
         // Checksum is optional in IPv4, so we ignore it
         let orig_checksum = u16::from_be_bytes(header[6..8].try_into().ok()?);
 
@@ -582,8 +772,8 @@ impl Packet {
             if Self::checksum(checksum, ip.payload) != 0 {
                 return None;
             }
-        }
-        
+        }*/
+
         // Validate the length
         if length < 8 || length as usize > ip.payload.len() {
             return None;
@@ -600,72 +790,15 @@ impl Packet {
 
     /// Create a new raw UDP packet
     /// Returns the index into the packet where the message should be placed.
-    pub fn create_udp(&mut self, addr: &UdpAddress,
-                      message_len: usize) -> usize {
-        {
-            // Set up the ethernet header
-            let eth = &mut self.raw[..14];
-            eth[0x0..0x6].copy_from_slice(&addr.dst_eth);
-            eth[0x6..0xc].copy_from_slice(&addr.src_eth);
-            eth[0xc..0xe].copy_from_slice(&ETHTYPE_IPV4.to_be_bytes());
-        }
-        
-        {
-            // Set up the IP header
-            let ip = &mut self.raw[14..14 + 20];
-
-            // Set IPv4 as version and 20 byte header
-            ip[0] = 0x45;
-
-            // No DSCP and ECN
-            ip[1] = 0;
-
-            // Copy in the total length of the IP packet
-            let ip_size = (20 + 8 + message_len) as u16;
-            ip[2..4].copy_from_slice(&ip_size.to_be_bytes());
-
-            // Identification, flags, and fragment offset are all zero
-            ip[4..8].copy_from_slice(&[0; 4]);
-
-            // TTL is set to 64 (seems to be standard)
-            ip[8] = 64;
-
-            // Protocol is UDP
-            ip[9] = IPPROTO_UDP;
-
-            // Initialize the checksum to zero
-            ip[10..12].copy_from_slice(&[0; 2]);
-
-            // Copy in the source and dest IPs
-            ip[12..16].copy_from_slice(&addr.src_ip.0.to_be_bytes());
-            ip[16..20].copy_from_slice(&addr.dst_ip.0.to_be_bytes());
-
-            // Compute the checksum and fill in the checksum field
-            let checksum = Self::checksum(0, ip);
-            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-        }
-
-        {
-            // Set up the UDP header
-            let udp = &mut self.raw[14 + 20..14 + 20 + 8];
-
-            // Copy in the source and dest ports
-            udp[0..2].copy_from_slice(&addr.src_port.to_be_bytes());
-            udp[2..4].copy_from_slice(&addr.dst_port.to_be_bytes());
-
-            // Compute and copy in the UDP size + header
-            let udp_size = (8 + message_len) as u16;
-            udp[4..6].copy_from_slice(&udp_size.to_be_bytes());
-
-            // No checksum (not required for IPv4)
-            udp[6..8].copy_from_slice(&[0; 2]);
-        }
-
-        // Set the length of the packet
-        self.set_len(14 + 20 + 8 + message_len);
-
+    #[inline]
+    pub fn create_udp<'a, 'b: 'a>(&'b mut self, addr: &'a UdpAddress)
+            -> UdpBuilder<'a> {
         // Return the index of where to populate the message payload
-        14 + 20 + 8
+        UdpBuilder {
+            packet:      self,
+            addr:        addr,
+            udp_payload: 0,
+        }
     }
 
     /// Gets the physical address for the packet

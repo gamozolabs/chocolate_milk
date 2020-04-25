@@ -11,6 +11,9 @@ extern crate core_reqs;
 #[allow(unused_imports)]
 #[macro_use] extern crate alloc;
 
+#[allow(unused_imports)]
+#[macro_use] extern crate noodle;
+
 #[macro_use] mod core_locals;
 #[macro_use] mod print;
 mod panic;
@@ -81,34 +84,16 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
                time::uptime(), core!().id + 1);
     }
 
-    {
-        let _serial1 = core!().boot_args.serial.lock();
-        let _serial2 = core!().boot_args.serial.lock();
+    if core!().id == 0 {
+        use net::netmapping::NetMapping;
+        let mapping = NetMapping::new("192.168.101.1:1911", "foobar.bin")
+            .expect("Failed to netmap file");
 
-        if let Some(netdev) = net::NetDevice::get() {
-            let our_port = (core!().id + 13370) as u16;
-
-            // Bind to our port
-            netdev.bind_udp(our_port);
-
-            print!("Got lease {:#?}\n", netdev.dhcp_lease);
-
-            // Resolve the target
-            let server = net::UdpAddress::resolve(
-                &netdev, our_port, "192.168.1.76:5000")
-                .expect("Couldn't resolve target address");
-
-            let mut packet = netdev.allocate_packet();
-            let message = format!("Hello from {:02x?} {:?}\n",
-                                  netdev.mac(),
-                                  netdev.dhcp_lease.as_ref().unwrap().client_ip);
-            let ins_point = packet.create_udp(&server, message.as_bytes().len());
-            packet.raw_mut()[ins_point..ins_point + message.as_bytes().len()]
-                .copy_from_slice(message.as_bytes());
-            netdev.send(packet, true);
-    
-            cpu::halt();
+        for off in (0..mapping.len()).step_by(4096) {
+            unsafe { core::ptr::read_volatile(&mapping[off]); }
         }
+
+        print!("Got whole buffer\n");
     }
 
     cpu::halt();

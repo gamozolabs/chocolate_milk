@@ -121,9 +121,9 @@ impl<I: InterruptState> BootArgs<I> {
         BootArgs {
             struct_size:           core::mem::size_of::<Self>() as u64,
             persist:               AtomicU64::new(0),
-            free_memory:           LockCell::new(None),
+            free_memory:           LockCell::new_no_preempt(None),
             serial:                LockCell::new_no_preempt(None),
-            page_table:            LockCell::new(None),
+            page_table:            LockCell::new_no_preempt(None),
             trampoline_page_table: AtomicU64::new(0),
             kernel_entry:          LockCell::new(None),
             stack_vaddr:           AtomicU64::new(KERNEL_STACKS_BASE),

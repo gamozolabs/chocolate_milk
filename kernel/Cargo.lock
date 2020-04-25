@@ -19,13 +19,22 @@ name = "cpu"
 version = "0.1.0"
 
 [[package]]
+name = "falktp"
+version = "0.1.0"
+dependencies = [
+ "noodle",
+]
+
+[[package]]
 name = "kernel"
 version = "0.1.0"
 dependencies = [
  "boot_args",
  "core_reqs",
  "cpu",
+ "falktp",
  "lockcell",
+ "noodle",
  "page_table",
  "rangeset",
  "serial",
@@ -33,6 +42,10 @@ dependencies = [
 
 [[package]]
 name = "lockcell"
+version = "0.1.0"
+
+[[package]]
+name = "noodle"
 version = "0.1.0"
 
 [[package]]

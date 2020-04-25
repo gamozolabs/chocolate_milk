@@ -5,7 +5,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 
+use lockcell::LockCell;
+use page_table::VirtAddr;
+
 use crate::apic::Apic;
+use crate::core_locals::LockInterrupts;
 use crate::acpi::{set_core_state, ApicState};
 
 /// If a given interrupt requires an EOI when it is handled, the corresponding
@@ -18,6 +22,49 @@ pub static DRAINING_EOIS: AtomicBool = AtomicBool::new(false);
 
 /// Type for an interrupt gate for 64-bit mode
 const X64_INTERRUPT_GATE: u32 = 0xe;
+
+/// List of all registered page fault handlers on the system
+static PAGE_FAULT_HANDLERS:
+    LockCell<Vec<Box<dyn PageFaultHandler>>, LockInterrupts> =
+        LockCell::new_no_preempt(Vec::new());
+
+/// Fault handler registration
+///
+/// Allows the fault handler to be removed when the `FaultReg` goes is
+/// `Drop`ped
+pub struct FaultReg(*const dyn PageFaultHandler);
+
+impl Drop for FaultReg {
+    fn drop(&mut self) {
+        // Lock access to the fault handlers
+        let mut fault_handlers = PAGE_FAULT_HANDLERS.lock();
+
+        // Drop any fault handler which uses the same pointer (should only
+        // ever be one)
+        fault_handlers.retain(|x: &Box<dyn PageFaultHandler>| {
+            let handler: *const dyn PageFaultHandler = &**x;
+            self.0 != handler
+        });
+    }
+}
+
+/// Register a page fault handler
+pub fn register_fault_handler(handler: Box<dyn PageFaultHandler>) -> FaultReg {
+    let ptr = &*handler as *const dyn PageFaultHandler;
+    PAGE_FAULT_HANDLERS.lock().push(handler);
+    FaultReg(ptr)
+}
+
+/// Implemented for structures which may be registered as page fault handlers.
+/// These handlers can be used to hook page faults and potentially lazily map
+/// in pages when needed.
+pub trait PageFaultHandler {
+    /// Invoked when a page fault occurs with the contents for `cr2`, the
+    /// faulting address. If the fault was handled this should return `true`
+    /// and thus execution will return back to where the exception originally
+    /// occurred.
+    unsafe fn page_fault(&mut self, vaddr: VirtAddr) -> bool;
+}
 
 /// Dispatch routine definition
 /// Arguments are (interrupt number, frame, error code, register state at int)
@@ -297,6 +344,17 @@ pub unsafe extern fn interrupt_handler(
 
             // Halt forever
             cpu::halt();
+        }
+    }
+
+    // Handle page faults
+    if number == 0xe {
+        // Invoke all page fault handlers
+        for handler in PAGE_FAULT_HANDLERS.lock().iter_mut() {
+            if handler.page_fault(VirtAddr(cpu::read_cr2())) {
+                // If the page fault was handled, return back to execution
+                return;
+            }
         }
     }
     

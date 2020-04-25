@@ -302,7 +302,7 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
         boot_args:  unsafe {
             &*(boot_args as *const _ as *const BootArgs<LockInterrupts>)
         },
-        free_list:  LockCell::new(PageFreeList::new()),
+        free_list:  LockCell::new_no_preempt(PageFreeList::new()),
         apic:       LockCell::new_no_preempt(None),
         interrupts: LockCell::new_no_preempt(None),
 

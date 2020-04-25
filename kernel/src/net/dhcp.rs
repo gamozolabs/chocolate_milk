@@ -3,7 +3,7 @@
 use core::mem::size_of;
 use core::convert::TryInto;
 use alloc::vec::Vec;
-use crate::time;
+use alloc::sync::Arc;
 use crate::net::{NetDevice, Packet, Udp, Ipv4Addr, UdpAddress};
 
 /// Amount of time to wait for a DHCP response from the server in microseconds.
@@ -267,20 +267,21 @@ fn parse_dhcp_packet<'a>(xid: u32, udp: Udp<'a>) ->
 fn create_dhcp_packet(packet: &mut Packet, xid: u32,
                       mac: [u8; 6], options: &[u8]) {
     // Initialize the packet for a UDP DHCP packet
-    let offset = packet.create_udp(&UdpAddress {
+    let addr = UdpAddress {
         src_eth:  mac,
         dst_eth:  [0xff; 6],
         src_ip:   0.into(),
         dst_ip:   (!0).into(),
         src_port: 68,
         dst_port: 67,
-    }, core::mem::size_of::<Header>() + options.len());
+    };
+    let mut pkt = packet.create_udp(&addr);
+
+    // Reserve room in the packet for the header and the DHCP options
+    let dhcp_header = pkt.reserve(size_of::<Header>() + options.len())
+        .unwrap();
 
     {
-        // Get access to the header portion of the payload
-        let dhcp_header = &mut packet.raw_mut()
-            [offset..offset + core::mem::size_of::<Header>()];
-
         // Cast the header to a DHCP header
         let header: &mut Header = unsafe {
             &mut *(dhcp_header.as_mut_ptr() as *mut Header)
@@ -304,14 +305,13 @@ fn create_dhcp_packet(packet: &mut Packet, xid: u32,
     
     {
         // Get access to the DHCP options
-        let dhcp_options = &mut packet.raw_mut()
-            [offset + core::mem::size_of::<Header>()..
-             offset + core::mem::size_of::<Header>() + options.len()];
+        let dhcp_options = &mut dhcp_header
+            [size_of::<Header>()..size_of::<Header>() + options.len()];
         dhcp_options.copy_from_slice(&options);
     }
 }
 
-pub fn get_lease(device: &NetDevice) -> Option<Lease> {
+pub fn get_lease(device: Arc<NetDevice>) -> Option<Lease> {
     // Get a "unique" transaction ID
     let xid = cpu::rdtsc() as u32;
 
@@ -319,7 +319,7 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
     let mac = device.mac();
 
     // Bind to UDP port 68
-    let bind = device.bind_udp(68)
+    let bind = NetDevice::bind_udp_port(device.clone(), 68)
         .expect("Could not bind to port 68 for dhcp");
 
     // Construct the DHCP options for the discover
@@ -340,41 +340,29 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
     let mut offer_ip:  Option<Ipv4Addr> = None;
     let mut server_ip: Option<Ipv4Addr> = None;
 
-    // Get a future time to time out at
-    let timeout = time::future(DHCP_TIMEOUT);
+    bind.recv_timeout(DHCP_TIMEOUT, |_pkt, udp| {
+        // Check that the destination is us
+        if udp.ip.eth.dst_mac != mac { return None; }
 
-    // Wait for the DHCP offer
-    loop {
-        if cpu::rdtsc() >= timeout {
-            return None;
-        }
+        // Parse the DHCP packet
+        let (header, options) = parse_dhcp_packet(xid, udp)?;
 
-        let resp = bind.recv(|_pkt, udp| {
-            // Check that the destination is us
-            if udp.ip.eth.dst_mac != mac { return None; }
+        // Check if this is an offer
+        options.iter()
+            .find(|x| x == &&DhcpOption::MessageType(MessageType::Offer))?;
 
-            // Parse the DHCP packet
-            let (header, options) = parse_dhcp_packet(xid, udp)?;
+        // Save the offer IP
+        offer_ip = Some(u32::from_be(header.yiaddr).into());
 
-            // Check if this is an offer
-            options.iter()
-                .find(|x| x == &&DhcpOption::MessageType(MessageType::Offer))?;
-
-            // Save the offer IP
-            offer_ip = Some(u32::from_be(header.yiaddr).into());
-
-            // Save the server IP if it was present
-            server_ip = options.iter().find_map(|x| {
-                if let DhcpOption::ServerIp(ip) = x {
-                    Some((*ip).into())
-                } else { None }
-            });
-
-            Some(())
+        // Save the server IP if it was present
+        server_ip = options.iter().find_map(|x| {
+            if let DhcpOption::ServerIp(ip) = x {
+                Some((*ip).into())
+            } else { None }
         });
 
-        if resp.is_some() { break; }
-    }
+        Some(())
+    })?;
 
     // Attempt to get the offer IP and server IP
     let offer_ip  = offer_ip?;
@@ -401,47 +389,34 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
     let mut broadcast_ip = None;
     let mut subnet_mask  = None;
     
-    // Get a future time to time out at
-    let timeout = time::future(DHCP_TIMEOUT);
-    
     // Wait for the DHCP ACK
-    
-    loop {
-        // Timeout
-        if cpu::rdtsc() >= timeout {
-            return None;
-        }
+    bind.recv_timeout(DHCP_TIMEOUT, |_pkt, udp| {
+        // Check that the destination is us
+        if udp.ip.eth.dst_mac != mac { return None; }
 
-        let resp = bind.recv(|_pkt, udp| {
-            // Check that the destination is us
-            if udp.ip.eth.dst_mac != mac { return None; }
+        // Parse the DHCP packet
+        let (_header, options) = parse_dhcp_packet(xid, udp)?;
 
-            // Parse the DHCP packet
-            let (_header, options) = parse_dhcp_packet(xid, udp)?;
+        // Check if this is an ack
+        options.iter()
+            .find(|x| x == &&DhcpOption::MessageType(MessageType::Ack))?;
 
-            // Check if this is an ack
-            options.iter()
-                .find(|x| x == &&DhcpOption::MessageType(MessageType::Ack))?;
-
-            // Save the broadcast IP if it was present
-            broadcast_ip = options.iter().find_map(|x| {
-                if let DhcpOption::BroadcastIp(ip) = x {
-                    Some((*ip).into())
-                } else { None }
-            });
-            
-            // Save the subnet mask if it was present
-            subnet_mask = options.iter().find_map(|x| {
-                if let DhcpOption::SubnetMask(ip) = x {
-                    Some((*ip).into())
-                } else { None }
-            });
-
-            Some(())
+        // Save the broadcast IP if it was present
+        broadcast_ip = options.iter().find_map(|x| {
+            if let DhcpOption::BroadcastIp(ip) = x {
+                Some((*ip).into())
+            } else { None }
         });
         
-        if resp.is_some() { break; }
-    }
+        // Save the subnet mask if it was present
+        subnet_mask = options.iter().find_map(|x| {
+            if let DhcpOption::SubnetMask(ip) = x {
+                Some((*ip).into())
+            } else { None }
+        });
+
+        Some(())
+    })?;
 
     Some(Lease {
         client_ip: offer_ip,

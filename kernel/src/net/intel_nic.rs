@@ -378,18 +378,18 @@ impl<'a> IntelGbit {
         let mut nic = IntelGbit {
             regs,
             mmio,
-            rx_state: LockCell::new(RxState {
+            rx_state: LockCell::new_no_preempt(RxState {
                 descriptors: rx_descriptors,
                 buffers:     rx_buffers,
                 head:        0,
             }),
-            tx_state: LockCell::new(TxState {
+            tx_state: LockCell::new_no_preempt(TxState {
                 descriptors: tx_descriptors,
                 head:        0,
                 tail:        0, 
                 buffers:     (0..NUM_TX_DESCS).map(|_| None).collect(),
             }),
-            packets: LockCell::new(
+            packets: LockCell::new_no_preempt(
                          Vec::with_capacity(NUM_TX_DESCS + NUM_RX_DESCS)),
             mac: [0u8; 6],
         };
@@ -539,12 +539,17 @@ impl NetDriver for IntelGbit {
 
         unsafe {
             // Check if there is a packet that is ready to read
-            let present = (read_volatile(
-                &rx_state.descriptors[rx_state.head].status) & 1) != 0;
-            if !present {
+            let status = read_volatile(
+                &rx_state.descriptors[rx_state.head].status);
+            if (status & 1) == 0 {
                 // No packet present
                 return None;
             }
+            
+            // Make sure there were no RX errors
+            let errors = read_volatile(
+                &rx_state.descriptors[rx_state.head].errors);
+            assert!(errors == 0);
 
             // Get the length of the rxed buffer and copy into the caller
             // supplied buffer
