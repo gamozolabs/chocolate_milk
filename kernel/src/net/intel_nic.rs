@@ -134,6 +134,7 @@ pub fn probe(device: &PciDevice) -> Option<Arc<NetDevice>> {
         // 82574L Gigabit Network Connection "e1000e"
         (0x8086, 0x10d3, E1000_REGS),
 
+        /*
         // I210 Gigabit Network Connection
         (0x8086, 0x1533, NicRegisters {
             ctrl:     0x0000,
@@ -159,7 +160,7 @@ pub fn probe(device: &PciDevice) -> Option<Arc<NetDevice>> {
             fctrl:    None,
             rxctrl:   None,
             ctrl_ext: Some(0x0018),
-        }),
+        }),*/
 
         // Ethernet Converged Network Adapter X540-T1
         (0x8086, 0x1528, NicRegisters {

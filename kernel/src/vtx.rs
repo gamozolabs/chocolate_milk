@@ -6,6 +6,7 @@
 //! modprobe kvm_intel nested=1
 
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
 use page_table::{VirtAddr, PageTable};
 use crate::mm::{PhysicalMemory, PhysContig};
 use crate::interrupts::Tss;
@@ -328,7 +329,7 @@ enum Vmcs {
 }
 
 /// Floating point state from an `fxsave` instruction
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, align(16))]
 pub struct FxSave {
     // Floating point state information like the FXCS, MXCSR, etc
@@ -381,7 +382,7 @@ impl Default for FxSave {
 }
 
 /// General purpose register state
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 #[repr(C, align(16))]
 pub struct RegisterState {
     pub rax: u64, 
@@ -486,6 +487,7 @@ impl From<u8> for Exception {
 #[derive(Debug)]
 pub enum VmExit {
     Exception(Exception),
+    ExternalInterrupt,
 }
 
 /// A virtual machine using Intel VT-x extensions
@@ -505,6 +507,10 @@ pub struct Vm {
 
     /// Guest registers
     pub guest_regs: RegisterState,
+
+    /// Tracks if this VM is currently launched (thus, `vmresume` should be
+    /// used)
+    launched: bool,
 }
 
 impl Vm {
@@ -594,16 +600,23 @@ impl Vm {
             init: false,
             host_regs:  RegisterState::default(),
             guest_regs: RegisterState::default(),
+            launched:   false,
             page_table,
         }
     }
 
     /// Run the VM
     pub fn run(&mut self) -> VmExit {
-        // Set the current VM as the active VM
         unsafe {
-            llvm_asm!("vmptrld ($0)" :: "r"(&self.vmcs.phys_addr()) :
-                      "memory" : "volatile");
+            // Check if we need to switch to a different active VM 
+            if core!().current_vm_ptr().load(Ordering::SeqCst) !=
+                    self.vmcs.phys_addr().0 {
+                // Set the current VM as the active VM
+                llvm_asm!("vmptrld ($0)" :: "r"(&self.vmcs.phys_addr()) :
+                          "memory" : "volatile");
+                core!().current_vm_ptr().store(self.vmcs.phys_addr().0,
+                                               Ordering::SeqCst);
+            }
         }
 
         // Do one-time initialization
@@ -838,6 +851,8 @@ impl Vm {
             // Sanity check our `FxSave` structure shape
             assert!(core::mem::size_of::<FxSave>() == 512,
                 "Whoa, fxsave broken");
+        
+            core!().disable_interrupts();
 
             llvm_asm!(r#"
 
@@ -874,8 +889,14 @@ impl Vm {
                 lea rbx, [rip + 1f]
                 vmwrite rax, rbx
 
-                // Load the guest state
+                // Load the guest floating point regs
                 fxrstor64 [rdx + 0x90]
+
+                // Check if we should be using vmlaunch or vmresume
+                // These flags can persist during the guest GPR loads
+                test edi, edi
+
+                // Load the guest GPRs
                 mov rax, [rdx +  0 * 8]
                 mov rbx, [rdx +  1 * 8]
                 mov rcx, [rdx +  2 * 8]
@@ -892,7 +913,19 @@ impl Vm {
                 mov r15, [rdx + 15 * 8]
                 mov rdx, [rdx +  3 * 8]
 
+                // If `resume` is `true` then use resume, otherwise use launch
+                jnz 2f
+
                 vmlaunch
+                
+                // Should never be hit unless vmlaunch failed
+                int3
+
+            2:
+                vmresume
+
+                // Should never be hit unless vmresume failed
+                int3
 
             1:
                 // Save the VM exit rdx
@@ -943,9 +976,17 @@ impl Vm {
                 mov rcx, [rcx +  2 * 8]
                 fxrstor64 [rcx + 0x90]
 
-            "# :: "{rcx}"(&mut self.host_regs), "{rdx}"(&mut self.guest_regs) :
+            "# ::
+            "{rcx}"(&mut self.host_regs),
+            "{rdx}"(&mut self.guest_regs),
+            "{edi}"(self.launched as u32) :
             "memory", "rax", "rbx" : "intel", "volatile");
+        
+            core!().enable_interrupts();
         }
+
+        // Mark that this VM has launched
+        self.launched = true;
         
         // Restore VM guest state into our Rust-usable guest state structure
         unsafe {
@@ -993,6 +1034,7 @@ impl Vm {
 
                 VmExit::Exception(exception)
             }
+            1 => VmExit::ExternalInterrupt,
             x @ _ => unimplemented!("Unhandled VM exit code {}\n", x),
         };
 

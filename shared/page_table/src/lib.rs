@@ -16,10 +16,16 @@ pub const PAGE_USER: u64 = 1 << 2;
 
 /// Page table flag indiciating that accesses to the memory described by this
 /// page or table should be strongly uncached
-pub const PAGE_CACHE_DISABLE: u64 = 1 <<  4;
+pub const PAGE_CACHE_DISABLE: u64 = 1 << 4;
+
+/// Page has been accessed
+pub const PAGE_ACCESSED: u64 = 1 << 5;
+
+/// Page has been dirtied
+pub const PAGE_DIRTY: u64 = 1 << 6;
 
 /// Page table flag indicating that this page entry is a large page
-pub const PAGE_SIZE: u64 = 1 <<  7;
+pub const PAGE_SIZE: u64 = 1 << 7;
 
 /// Page table flag indicating the page or table is not to be executable
 pub const PAGE_NX: u64 = 1 << 63;
@@ -161,6 +167,7 @@ impl PageTable {
     }
 
     /// Get the address of the page table
+    #[inline]
     pub fn table(&self) -> PhysAddr {
         self.table
     }
@@ -648,6 +655,93 @@ impl PageTable {
         core::ptr::write(ptr as *mut u64, raw);
 
         Some(())
+    }
+
+    /// Invoke a closure on every dirtied page in the range from [start, end]
+    pub unsafe fn for_each_dirty_page<P, F>(&mut self, phys_mem: &mut P,
+                                            start: VirtAddr, end: VirtAddr,
+                                            mut callback: F)
+            where P: PhysMem,
+                  F: FnMut(VirtAddr, PhysAddr) {
+        /// Accessed and present
+        const AP: u64 = PAGE_PRESENT | PAGE_ACCESSED;
+        
+        /// Accessed and dirty
+        const AD: u64 = PAGE_ACCESSED | PAGE_DIRTY;
+        
+        /// Dirty and present
+        const DP: u64 = PAGE_PRESENT | PAGE_DIRTY;
+
+        let pml4 = phys_mem.translate(self.table(), 4096) as *mut u64;
+        for pml4i in 0..512 {
+            let vaddr  = VirtAddr(pml4i << 39);
+            let vaddre = VirtAddr(vaddr.0 + ((1 << 39) - 1));
+            if !(vaddr.0 <= end.0 && start.0 <= vaddre.0) { continue; }
+
+            let pml4e = *pml4.offset(pml4i as isize);
+            if (pml4e & AP) != AP { continue; }
+            *pml4.offset(pml4i as isize) = pml4e & !AD;
+
+            let tab = PhysAddr(pml4e & 0xffffffffff000);
+            let pdp = phys_mem.translate(tab, 4096) as *mut u64;
+            for pdpi in 0..512 {
+                let vaddr = VirtAddr((pml4i << 39) | (pdpi << 30));
+                let vaddre = VirtAddr(vaddr.0 + ((1 << 30) - 1));
+                if !(vaddr.0 <= end.0 && start.0 <= vaddre.0) { continue; }
+
+                let pdpe = *pdp.offset(pdpi as isize);
+                if (pdpe & AP) != AP { continue; }
+                *pdp.offset(pdpi as isize) = pdpe & !AD;
+                let tab = PhysAddr(pdpe & 0xffffffffff000);
+
+                if (pdpe & PAGE_SIZE) != 0 {
+                    if (pdpe & PAGE_DIRTY) != 0 {
+                        callback(vaddr, tab);
+                    }
+                    continue;
+                }
+
+                let pd = phys_mem.translate(tab, 4096) as *mut u64;
+                for pdi in 0..512 {
+                    let vaddr = VirtAddr((pml4i << 39) |
+                                         (pdpi  << 30) |
+                                         (pdi   << 21));
+                    let vaddre = VirtAddr(vaddr.0 + ((1 << 21) - 1));
+                    if !(vaddr.0 <= end.0 && start.0 <= vaddre.0) {
+                        continue;
+                    }
+
+                    let pde = *pd.offset(pdi as isize);
+                    if (pde & AP) != AP { continue; }
+                    *pd.offset(pdi as isize) = pde & !AD;
+                    let tab = PhysAddr(pde & 0xffffffffff000);
+                    if (pde & PAGE_SIZE) != 0 {
+                        if (pde & PAGE_DIRTY) != 0 {
+                            callback(vaddr, tab);
+                        }
+                        continue;
+                    }
+                
+                    let pt = phys_mem.translate(tab, 4096) as *mut u64;
+                    for pti in 0..512 {
+                        let vaddr = VirtAddr((pml4i << 39) |
+                                             (pdpi  << 30) |
+                                             (pdi   << 21) |
+                                             (pti   << 12));
+                        let vaddre = VirtAddr(vaddr.0 + ((1 << 12) - 1));
+                        if !(vaddr.0 <= end.0 && start.0 <= vaddre.0) {
+                            continue;
+                        }
+
+                        let pte = *pt.offset(pti as isize);
+                        if (pte & DP) != DP { continue; }
+                        *pt.offset(pti as isize) = pte & !AD;
+                        let tab = PhysAddr(pte & 0xffffffffff000);
+                        callback(vaddr, tab);
+                    }
+                }
+            }
+        }
     }
 }
 

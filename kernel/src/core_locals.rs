@@ -1,7 +1,7 @@
 //! This file is used to hold and access all of the core locals
 
 use core::mem::size_of;
-use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, Ordering};
 
 use crate::apic::Apic;
 use crate::mm::{PageFreeList, PhysContig};
@@ -136,6 +136,9 @@ pub struct CoreLocals {
     /// VMXON region for this core. If VMXON has not yet executed, or VMXOFF
     /// was executed, then this will be `None`
     vmxon_region: LockCell<Option<PhysContig<[u8; 4096]>>, LockInterrupts>,
+
+    /// Current active VM pointer from a `vmptrld`
+    current_vm_ptr: AtomicU64,
 }
 
 /// Empty marker trait that requires `Sync`, such that we can compile-time
@@ -151,6 +154,11 @@ impl CoreLocals {
     pub unsafe fn vmxon_region(&self) ->
             &LockCell<Option<PhysContig<[u8; 4096]>>, LockInterrupts> {
         &self.vmxon_region
+    }
+
+    /// Get access to the core's active VT-x VM pointer (`vmptrld`)
+    pub unsafe fn current_vm_ptr(&self) -> &AtomicU64 {
+        &self.current_vm_ptr
     }
     
     /// Get access to the interrupts
@@ -336,7 +344,8 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
         exception_depth:               AutoAtomicRef::new(0),
         interrupt_disable_outstanding: AtomicUsize::new(1),
 
-        vmxon_region: LockCell::new_no_preempt(None),
+        vmxon_region:   LockCell::new_no_preempt(None),
+        current_vm_ptr: AtomicU64::new(!0),
     };
 
     unsafe {

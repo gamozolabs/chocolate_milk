@@ -278,7 +278,7 @@ impl Apic {
 
     /// Handler for APIC timer interrupts
     unsafe fn timer_interrupt(_number: u8, _frame: &mut InterruptFrame,
-                              _error: usize, _regs: &mut AllRegs) -> bool {
+                              _error: u64, _regs: &mut AllRegs) -> bool {
         crate::panic::attempt_soft_reboot();
 
         true

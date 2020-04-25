@@ -24,6 +24,9 @@ static SOFT_REBOOT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Attempt a soft reboot by checking to see if there is a command on the
 /// serial port to soft reboot.
 pub unsafe fn attempt_soft_reboot() {
+    // Only allow soft reboot attempts from the BSP
+    if core!().id != 0 { return; }
+
     // Attempt to get a byte from the serial port
     let byte = core!().boot_args.serial.lock().as_mut().unwrap().read_byte();
 
@@ -51,9 +54,19 @@ pub unsafe fn disable_all_cores(apic: &mut Apic) {
 
             let state = acpi::core_state(apic_id);
             if state == ApicState::Online {
-                // Send this core an NMI to cause it to halt
-                apic.ipi(apic_id, (1 << 14) | (4 << 8));
-                while acpi::core_state(apic_id) != ApicState::Halted {}
+                loop {
+                    // Send this core an NMI to cause it to halt
+                    if acpi::core_state(apic_id) == ApicState::Halted {
+                        break;
+                    }
+
+                    apic.ipi(apic_id, (1 << 14) | (4 << 8));
+                    crate::time::sleep(1_000);
+                }
+            
+                // INIT the core
+                apic.ipi(apic_id, 0x4500);
+                crate::time::sleep(1_000);
             }
         }
     }
@@ -78,11 +91,14 @@ pub unsafe fn soft_reboot(apic: &mut Apic) -> ! {
     
     {
         // VMXOFF if we're in VMX root operation
-        let vmxon_lock = core!().vmxon_region().lock();
+        let vmxon_lock = core!().vmxon_region().shatter();
+
         if let Some(_) = &*vmxon_lock {
             // Disable VMX root operation
             llvm_asm!("vmxoff" :::: "intel", "volatile");
         }
+
+        *vmxon_lock = None;
     }
 
     // Destroy all devices which are handled by drivers
@@ -193,7 +209,10 @@ pub fn panic(info: &PanicInfo) -> ! {
     } else {
         // Save the panic info for this core
         PANIC_PENDING.store(info as *const _ as *mut _, Ordering::SeqCst);
+        
+        cpu::halt();
 
+        /*
         unsafe {
             // Forcibly get access to the current APIC. This is likely safe in
             // almost every situation as the APIC is not very stateful.
@@ -202,10 +221,7 @@ pub fn panic(info: &PanicInfo) -> ! {
 
             // Notify the BSP that we paniced by sending it an NMI
             apic.ipi(0, (1 << 14) | (4 << 8));
-        }
-
-        // Halt forever
-        cpu::halt();
+        }*/
     }
 }
 

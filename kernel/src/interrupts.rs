@@ -63,7 +63,9 @@ pub trait PageFaultHandler {
     /// faulting address. If the fault was handled this should return `true`
     /// and thus execution will return back to where the exception originally
     /// occurred.
-    unsafe fn page_fault(&mut self, vaddr: VirtAddr) -> bool;
+    ///
+    /// The `code` is the error code pushed onto a stack during a page fault
+    unsafe fn page_fault(&mut self, vaddr: VirtAddr, code: u64) -> bool;
 }
 
 /// Dispatch routine definition
@@ -71,7 +73,7 @@ pub trait PageFaultHandler {
 ///
 /// Returns `true` if the interrupt was handled, and execution should continue
 type InterruptDispatch =
-    unsafe fn(u8, &mut InterruptFrame, usize, &mut AllRegs) -> bool;
+    unsafe fn(u8, &mut InterruptFrame, u64, &mut AllRegs) -> bool;
 
 /// Structure to hold different dispatch routines for interrupts
 pub struct Interrupts {
@@ -328,7 +330,7 @@ pub struct AllRegs {
 /// Entry point for all interrupts and exceptions
 #[no_mangle]
 pub unsafe extern fn interrupt_handler(
-        number: u8, frame: &mut InterruptFrame, error: usize,
+        number: u8, frame: &mut InterruptFrame, error: u64,
         regs: &mut AllRegs) {
     // Increment the level of interrupt depth. This will automatically get
     // decremented when the scope ends.
@@ -350,6 +352,18 @@ pub unsafe extern fn interrupt_handler(
             // NMI, signalled that another core has paniced
             panic!("Panic occured on another core");
         } else {
+            {
+                // VMXOFF if we're in VMX root operation
+                let vmxon_lock = core!().vmxon_region().shatter();
+
+                if let Some(_) = &*vmxon_lock {
+                    // Disable VMX root operation
+                    llvm_asm!("vmxoff" :::: "intel", "volatile");
+                }
+
+                *vmxon_lock = None;
+            }
+
             // Mark that we're in the halted state
             set_core_state(core!().apic_id().unwrap(), ApicState::Halted);
 
@@ -362,7 +376,7 @@ pub unsafe extern fn interrupt_handler(
     if number == 0xe {
         // Invoke all page fault handlers
         for handler in PAGE_FAULT_HANDLERS.lock().iter_mut() {
-            if handler.page_fault(VirtAddr(cpu::read_cr2())) {
+            if handler.page_fault(VirtAddr(cpu::read_cr2()), error) {
                 // If the page fault was handled, return back to execution
                 return;
             }
