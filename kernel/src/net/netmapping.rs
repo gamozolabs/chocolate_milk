@@ -67,7 +67,7 @@ impl PageFaultHandler for NetMapHandler {
 
                 // Map in the memory as RW
                 if page_table.translate(&mut pmem,
-                                     VirtAddr(fault_addr.0 & !0xfff))
+                                        VirtAddr(fault_addr.0 & !0xfff), false)
                         .map(|x| x.page).flatten().is_some() {
                     // This has already been handled by another core
                     return true;

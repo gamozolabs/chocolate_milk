@@ -26,8 +26,12 @@ pub mod pci;
 pub mod net;
 pub mod time;
 pub mod vtx;
+pub mod snapshotted_app;
 
+use lockcell::LockCell;
 use page_table::PhysAddr;
+use core_locals::LockInterrupts;
+use snapshotted_app::SnapshottedApp;
 
 /// Release the early boot stack such that other cores can use it by marking
 /// it as available
@@ -80,249 +84,64 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // NMIs and soft reboots work.
     acpi::core_checkin();
 
-    /*
-    if core!().id == acpi::num_cores() - 1 {
-        print!("[{:16.8}] We made it! All cores online! {}\n",
-               time::uptime(), core!().id + 1);
-    }*/
+    {
+        use core::sync::atomic::Ordering;
+        use alloc::sync::Arc;
+        use page_table::VirtAddr;
 
-    //if core!().id == 0 {
-        test_vm();
-    //}
+        static SNAPSHOT:
+            LockCell<Option<Arc<SnapshottedApp>>, LockInterrupts> =
+            LockCell::new(None);
 
-    cpu::halt();
-}
-
-fn test_vm() {
-    use core::alloc::Layout;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use alloc::sync::Arc;
-    use vtx::{Vm, VmExit, Exception};
-    use page_table::{VirtAddr, PhysMem, PageType, Mapping};
-    use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_USER};
-    use lockcell::LockCell;
-    use net::netmapping::NetMapping;
-    use core_locals::LockInterrupts;
-
-    /// Network mapped file to execute from
-    static MAPPING: LockCell<Option<Arc<NetMapping>>, LockInterrupts> =
-        LockCell::new(None);
-
-    /// Base for this test VM
-    const VM_BASE: VirtAddr = VirtAddr(0x13370000);
-
-    /// Number of fuzz cases
-    static FUZZ_CASES: AtomicU64 = AtomicU64::new(0);
-    
-    static DIRTY_COST: [AtomicU64; 1024] = [AtomicU64::new(0); 1024];
-    static NUM_TESTS:  [AtomicU64; 1024] = [AtomicU64::new(0); 1024];
-    
-    let mapping = {
-        let mut ms = MAPPING.lock();
-        if let Some(mapping) = &*ms {
-            mapping.clone()
-        } else {
-            // Network map the memory contents as read-only
-            let mapping = Arc::new(NetMapping::new(
-                "192.168.101.1:1911", "test.bin", true)
-                .expect("Failed to netmap file"));
-            let ret = mapping.clone();
-            *ms = Some(mapping);
-            ret
-        }
-    };
-    
-    // Compute the end of the mapped space
-    let mapping_end = VirtAddr(VM_BASE.0 + (mapping.len() as u64 - 1));
-
-    let it = cpu::rdtsc();
-    
-    // Create a new virtual machine
-    let mut vm = Vm::new_user();
-    vm.guest_regs.rip = VM_BASE.0;
-
-    // Save off the original register state
-    let orig_regs = vm.guest_regs.clone();
-
-    // Time to print the next status message
-    let mut next_print = time::future(1_000_000);
-
-    let mut start = None;
-
-    let mut to_dirty = 0;
-    let mut next_dirty = time::future(1_000_000);
-
-    loop {
-        // Reset the register state
-        vm.guest_regs = orig_regs;
-
-        let mut dirtied = 0;
-        unsafe {
-            // Reset memory
-            vm.page_table.for_each_dirty_page(&mut mm::PhysicalMemory, |addr, page| {
-                // Compute the offset into the mapped file
-                let offset = ((addr.0 & !0xfff) - VM_BASE.0) as usize;
-
-                // Get mutable access to the underlying page
-                let psl = mm::slice_phys_mut(page, 4096);
-
-                llvm_asm!(r#"
-                  
-                    mov rcx, 4096 / 8
-                    rep movsq
-
-                "# ::
-                "{rdi}"(psl.as_ptr()),
-                "{rsi}"(mapping.get_unchecked(offset..).as_ptr()) :
-                "memory", "rcx", "rdi", "rsi", "cc" : 
-                "intel", "volatile");
-
-                dirtied += 1;
-            });
-        }
-
-        if let Some(start) = start {
-            DIRTY_COST[dirtied].fetch_add(cpu::rdtsc() - start, Ordering::Relaxed);
-            NUM_TESTS[dirtied].fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Print status messages on an interval
-        if core!().id == 0 && cpu::rdtsc() >= next_print {
-            let fuzz_case = FUZZ_CASES.load(Ordering::Relaxed);
-
-            print!("Fuzz case {:12} | {:12.1} fcps\n", fuzz_case,
-                   fuzz_case as f64 / time::elapsed(it));
-
-            for bucket in 0..=200 {
-                let cycles_per = DIRTY_COST[bucket].load(Ordering::Relaxed) as f64 /
-                    NUM_TESTS[bucket].load(Ordering::Relaxed) as f64;
-
-                let fcps = time::tsc_mhz() as f64 * 1_000_000. / cycles_per;
-                let fcps = fcps * acpi::num_cores() as f64;
-                print!("{:5} {:16.4}\n", bucket, fcps);
-                /*print!("Stats for dirty pages {:5} | {:12.1} fcps\n",
-                       bucket, fcps);*/
+        // Create the master snapshot, and fork from it for all cores
+        let snapshot = {
+            let mut snap = SNAPSHOT.lock();
+            if snap.is_none() {
+                *snap = Some(
+                    Arc::new(
+                        SnapshottedApp::new("192.168.101.1:1911", "falkdump")
+                    )
+                );
             }
-            print!("-------------------------------------\n");
+            snap.as_ref().unwrap().clone()
+        };
 
-            next_print = time::future(1_000_000);
-        }
+        //if core!().id != 0 { cpu::halt(); }
 
-        start = Some(cpu::rdtsc());
-        
-        if cpu::rdtsc() >= next_dirty {
-            to_dirty += 1;
-            next_dirty = time::future(1_000_000);
-        }
-        vm.guest_regs.rcx = to_dirty;
+        // Create a new worker for the snapshot
+        let mut worker = snapshot.worker();
 
-        'vm_loop: loop {
-            let vmexit = vm.run();
-            if matches!(vmexit, VmExit::ExternalInterrupt) {
-                continue 'vm_loop;
+        // Save the current time and compute a time in the future to print
+        // status messages
+        let it = cpu::rdtsc();
+        let mut next_print = time::future(1_000_000);
+
+        /// Buffer for the file contents in WinRAR
+        const BUFFER_ADDR: VirtAddr = VirtAddr(0x02bcbb1b7040);
+        const BUFFER_SIZE: usize    = 0x2123;
+
+        loop {
+            if core!().id == 0 && cpu::rdtsc() >= next_print {
+                let fuzz_cases = snapshot.fuzz_cases.load(Ordering::SeqCst);
+                let coverage   = snapshot.coverage.lock().len();
+
+                print!("{:12} cases | {:12.3} fcps | {:6} coverage\n",
+                       fuzz_cases, fuzz_cases as f64 / time::elapsed(it),
+                       coverage);
+                next_print = time::future(1_000_000);
             }
-            
-            print!("[{:16.8}] {:x?}\n", time::uptime(), vmexit);
 
-            if let VmExit::Exception(Exception::PageFault { addr, write, .. }) =
-                    vmexit {
-                // Compute the offset into the mapped file
-                let offset = ((addr.0 & !0xfff) - VM_BASE.0) as usize;
-                
-                // If the page fault was inbounds of our mapping
-                if !write && addr.0 >= VM_BASE.0 && addr.0 <= mapping_end.0 {
-                    unsafe {
-                        // Touch the mapping to make sure it is downloaded and
-                        // mapped
-                        core::ptr::read_volatile(&mapping[offset]);
-                    }
-                        
-                    // Get access to physical memory
-                    let mut pmem = mm::PhysicalMemory;
-
-                    // Look up the physical page backing for the mapping
-                    let page = {
-                        // Get access to the host page table
-                        let mut page_table =
-                            core!().boot_args.page_table.lock();
-                        let page_table = page_table.as_mut().unwrap();
-
-                        // Translate the mapping virtual address into a
-                        // physical address
-                        page_table.translate(&mut pmem,
-                            VirtAddr(mapping[offset..].as_ptr() as u64))
-                            .map(|x| x.page).flatten()
-                            .expect("Whoa, mapping page not mapped?!").0
-                    };
-                    
-                    unsafe {
-                        // Map in the page
-                        vm.page_table.map_raw(&mut pmem,
-                            VirtAddr(addr.0 & !0xfff),
-                            PageType::Page4K,
-                            page.0 | PAGE_USER | PAGE_PRESENT).unwrap();
-                    }
-                    
-                    continue 'vm_loop;
+            // Corrupt the input
+            {
+                for _ in 0..worker.rng.rand() % 64 {
+                    let offset = worker.rng.rand() % BUFFER_SIZE;
+                    worker.write(VirtAddr(BUFFER_ADDR.0 + offset as u64),
+                        &[worker.rng.rand() as u8]).unwrap();
                 }
-
-                // If the page fault was inbounds of our mapping
-                if write && addr.0 >= VM_BASE.0 && addr.0 <= mapping_end.0 {
-                    // Map in the page
-                    let mut pmem = mm::PhysicalMemory;
-
-                    // Allocate a new page and zero it out
-                    let page = pmem.alloc_phys_zeroed(
-                        Layout::from_size_align(4096, 4096).unwrap());
-
-                    unsafe {
-                        // Compute the offset into the mapped file
-                        let offset = ((addr.0 & !0xfff) - VM_BASE.0) as usize;
-
-                        // Get mutable access to the underlying page
-                        let psl = mm::slice_phys_mut(page, 4096);
-
-                        // Compute the number of bytes to copy
-                        let to_copy =
-                            core::cmp::min(4096, mapping.len() - offset);
-
-                        // Copy in the bytes to initialize the page
-                        psl[..to_copy].copy_from_slice(
-                            &mapping[offset..offset + to_copy]);
-                        
-                        // Attempt to translate the page, it may already be
-                        // mapped read-only
-                        let translation = vm.page_table.translate(&mut pmem,
-                            VirtAddr(addr.0 & !0xfff));
-
-                        if let Some(Mapping {
-                                    pte: Some(pte), page: Some(page), ..
-                                }) = translation {
-                            // If this page is already mapped, we are doing
-                            // CoW and need to promote it to it's own page
-                            mm::write_phys(pte, (page.0).0 | PAGE_USER |
-                                           PAGE_WRITE | PAGE_PRESENT);
-                        } else {
-                            // Map in the page
-                            vm.page_table.map_raw(&mut pmem,
-                                VirtAddr(addr.0 & !0xfff),
-                                PageType::Page4K,
-                                page.0 |
-                                PAGE_USER | PAGE_WRITE | PAGE_PRESENT)
-                                .unwrap();
-                        }
-                    }
-
-                    continue 'vm_loop;
-                }
-                
-                break 'vm_loop;
-            } else {
-                break 'vm_loop;
             }
-        }
 
-        FUZZ_CASES.fetch_add(1, Ordering::Relaxed);
+            worker.run_fuzz_case();
+        }
     }
 }
 

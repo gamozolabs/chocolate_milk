@@ -304,7 +304,7 @@ impl PageTable {
         let mut freed = 0u64;
 
         // Translate the initial page
-        let mut cur_page = self.translate(phys_mem, vaddr).unwrap();
+        let mut cur_page = self.translate(phys_mem, vaddr, false).unwrap();
         
         loop {
             // Get the virtual address and size of this page
@@ -423,7 +423,7 @@ impl PageTable {
 
             // Otherwise, we've got more to do!
             cur_page =
-                self.translate(phys_mem, VirtAddr(next_page.unwrap()))
+                self.translate(phys_mem, VirtAddr(next_page.unwrap()), false)
                 .expect("Failed to translate virtual address during free");
         }
 
@@ -460,8 +460,12 @@ impl PageTable {
     /// Translate a virtual address in the `self` page table into its
     /// components. This will include entries for every level in the table as
     /// well as the final page result if the page is mapped and present.
+    ///
+    /// If `dirty` is set to `true`, then the accessed and dirty bits will be
+    /// set during the page table walk.
     pub fn translate<P: PhysMem>(&self, phys_mem: &mut P,
-                                 vaddr: VirtAddr) -> Option<Mapping> {
+                                 vaddr: VirtAddr, dirty: bool)
+            -> Option<Mapping> {
         // Start off with an empty mapping
         let mut ret = Mapping {
             pml4e: None,
@@ -508,6 +512,14 @@ impl PageTable {
             if (ent & PAGE_PRESENT) == 0 {
                 // Page is not present, break out and stop the translation
                 break;
+            }
+
+            // Update dirty bits if requested
+            if dirty {
+                unsafe {
+                    core::ptr::write_volatile(vad as *mut u64,
+                        ent | PAGE_DIRTY | PAGE_ACCESSED);
+                }
             }
 
             // Update the table to point to the next level
@@ -572,7 +584,7 @@ impl PageTable {
         }
 
         // Determine the state of the existing mapping
-        let mapping = self.translate(phys_mem, vaddr)?;
+        let mapping = self.translate(phys_mem, vaddr, false)?;
 
         // Page already mapped
         if mapping.page.is_some() {

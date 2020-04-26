@@ -326,6 +326,9 @@ enum Vmcs {
     
     /// Guest IA32_SYSENTER_EIP
     GuestIa32SysenterEip = 0x6826,
+
+    /// Pre-emption timer
+    PreemptionTimer = 0x482e,
 }
 
 /// Floating point state from an `fxsave` instruction
@@ -403,6 +406,8 @@ pub struct RegisterState {
     pub r15: u64, 
     pub rip: u64, 
     pub rfl: u64,
+
+    pub gs_base: u64,
 
     pub fxsave: FxSave,
 }
@@ -488,6 +493,7 @@ impl From<u8> for Exception {
 pub enum VmExit {
     Exception(Exception),
     ExternalInterrupt,
+    PreemptionTimer,
 }
 
 /// A virtual machine using Intel VT-x extensions
@@ -511,6 +517,12 @@ pub struct Vm {
     /// Tracks if this VM is currently launched (thus, `vmresume` should be
     /// used)
     launched: bool,
+
+    /// Pre-emption timer value to use
+    pub preemption_timer: Option<u32>,
+
+    /// Current setting for the pin-based controls
+    pinbased_controls: u64,
 }
 
 impl Vm {
@@ -602,6 +614,8 @@ impl Vm {
             guest_regs: RegisterState::default(),
             launched:   false,
             page_table,
+            preemption_timer: None,
+            pinbased_controls: 0,
         }
     }
 
@@ -716,6 +730,7 @@ impl Vm {
                 // Establish the VM controls
                 vmwrite(Vmcs::PinBasedControls,
                              pinbased_minimum | pin_on);
+                self.pinbased_controls = pinbased_minimum | pin_on;
                 vmwrite(Vmcs::ProcBasedControls,
                              procbased_minimum);
                 vmwrite(Vmcs::ProcBasedControls2,
@@ -834,8 +849,24 @@ impl Vm {
         }
 
         unsafe {
+            if let Some(timer) = self.preemption_timer {
+                if (self.pinbased_controls & (1 << 6)) == 0 {
+                    // Enable the pre-emption timer
+                    self.pinbased_controls |= 1 << 6;
+                    vmwrite(Vmcs::PinBasedControls, self.pinbased_controls);
+                }
+                vmwrite(Vmcs::PreemptionTimer, timer as u64);
+            } else {
+                if (self.pinbased_controls & (1 << 6)) != 0 {
+                    // Disable the pre-emption timer
+                    self.pinbased_controls &= !(1 << 6);
+                    vmwrite(Vmcs::PinBasedControls, self.pinbased_controls);
+                }
+            }
+
             vmwrite(Vmcs::GuestRsp, self.guest_regs.rsp);
             vmwrite(Vmcs::GuestRip, self.guest_regs.rip);
+            vmwrite(Vmcs::GuestGSBase, self.guest_regs.gs_base);
 
             // Set guest rflags. Make sure the reserved bit is set and
             // interrupts are always enabled
@@ -844,9 +875,9 @@ impl Vm {
         }
 
         unsafe {
-            // Make sure the fxsave starts at `0x90` from the `guest_regs`
+            // Make sure the fxsave starts at `0xa0` from the `guest_regs`
             assert!((&self.guest_regs.fxsave as *const _ as usize -
-                     &self.guest_regs as *const _ as usize) == 0x90);
+                     &self.guest_regs as *const _ as usize) == 0xa0);
 
             // Sanity check our `FxSave` structure shape
             assert!(core::mem::size_of::<FxSave>() == 512,
@@ -872,7 +903,7 @@ impl Vm {
                 mov [rcx + 13 * 8], r13
                 mov [rcx + 14 * 8], r14
                 mov [rcx + 15 * 8], r15
-                fxsave64 [rcx + 0x90]
+                fxsave64 [rcx + 0xa0]
 
                 // Save host state register
                 push rcx
@@ -890,7 +921,7 @@ impl Vm {
                 vmwrite rax, rbx
 
                 // Load the guest floating point regs
-                fxrstor64 [rdx + 0x90]
+                fxrstor64 [rdx + 0xa0]
 
                 // Check if we should be using vmlaunch or vmresume
                 // These flags can persist during the guest GPR loads
@@ -947,7 +978,7 @@ impl Vm {
                 mov [rdx + 13 * 8], r13
                 mov [rdx + 14 * 8], r14
                 mov [rdx + 15 * 8], r15
-                fxsave64 [rdx + 0x90]
+                fxsave64 [rdx + 0xa0]
 
                 // Get the saved rdx from above and save it in to the guest
                 // state
@@ -974,7 +1005,7 @@ impl Vm {
                 mov r14, [rcx + 14 * 8]
                 mov r15, [rcx + 15 * 8]
                 mov rcx, [rcx +  2 * 8]
-                fxrstor64 [rcx + 0x90]
+                fxrstor64 [rcx + 0xa0]
 
             "# ::
             "{rcx}"(&mut self.host_regs),
@@ -993,6 +1024,7 @@ impl Vm {
             self.guest_regs.rsp = vmread(Vmcs::GuestRsp);
             self.guest_regs.rip = vmread(Vmcs::GuestRip);
             self.guest_regs.rfl = vmread(Vmcs::GuestRflags);
+            self.guest_regs.gs_base = vmread(Vmcs::GuestGSBase);
         }
 
         // Parse the VM exit information
@@ -1035,6 +1067,7 @@ impl Vm {
                 VmExit::Exception(exception)
             }
             1 => VmExit::ExternalInterrupt,
+            52 => VmExit::PreemptionTimer,
             x @ _ => unimplemented!("Unhandled VM exit code {}\n", x),
         };
 
