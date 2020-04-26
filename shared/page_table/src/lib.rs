@@ -725,75 +725,83 @@ impl PageTable {
     }
 
     /// Invoke a closure on every dirtied page
+    #[inline]
     pub unsafe fn for_each_dirty_page<P, F>(&mut self, phys_mem: &mut P,
                                             mut callback: F)
             where P: PhysMem,
                   F: FnMut(VirtAddr, PhysAddr) {
-        /// Accessed and present
-        const AP: u64 = PAGE_PRESENT | PAGE_ACCESSED;
-        
-        /// Accessed and dirty
-        const AD: u64 = PAGE_ACCESSED | PAGE_DIRTY;
-        
-        /// Dirty and present
-        const DP: u64 = PAGE_PRESENT | PAGE_DIRTY;
-
         // Track the level into the tracking table
         let tracking =
             &*(self.tracking.unwrap().0 as *mut [u64; 512 / 64 + 512]);
-
         let mut bit = [0u64; 4];
+        Self::for_each_dirty_page_int(phys_mem, &mut callback, tracking,
+                                      &mut bit, 0, self.table());
+    }
 
-        macro_rules! tracking {
-            ($rec:expr, $pt:expr, $tracking:expr, $e:expr, $($es:expr),+) => {
-                let table = phys_mem.translate($pt, 4096) as *mut u64;
+    /// An function that simplifies recursion to walk dirty pages
+    unsafe fn for_each_dirty_page_int<P, F>(
+        phys_mem: &mut P, callback: &mut F,
+        tracking: &[u64; 512 / 64 + 512],
+        bit: &mut [u64; 4], rec: usize, pt: PhysAddr)
+            where P: PhysMem,
+                  F: FnMut(VirtAddr, PhysAddr) {
 
-                for (ii, &bits) in $tracking[..512 / 64].iter().enumerate() {
-                    let mut bits: u64 = bits;
-                    while bits != 0 {
-                        let tz = bits.trailing_zeros() as u64;
-                        bits &= !(1 << tz);
+        /// Accessed and present
+        const AP: u64 = PAGE_PRESENT | PAGE_ACCESSED;
 
-                        // Compute the page index
-                        let pfn = ii as u64 * 64 + tz;
+        /// Accessed and dirty
+        const AD: u64 = PAGE_ACCESSED | PAGE_DIRTY;
 
-                        // Get the page table entry
-                        let pte = table.offset(pfn as isize);
+        /// Dirty and present
+        const DP: u64 = PAGE_PRESENT | PAGE_DIRTY;
 
-                        if $rec == 3 {
-                            // Skip the entry if it's not both dirty and
-                            // present
-                            if (*pte & DP) != DP { continue; }
-                        } else {
-                            // Skip the entry if it's not both accessed and
-                            // present
-                            if (*pte & AP) != AP { continue; }
-                        }
+        let table = phys_mem.translate(pt, 4096) as *mut u64;
 
-                        // Clear the accessed and dirty bits
-                        *pte &= !AD;
-            
-                        // Compute the physical address of the table/page
-                        let _next_table = PhysAddr(*pte & 0xffffffffff000);
+        for (ii, &bits) in tracking[..512 / 64].iter().enumerate() {
+            let mut bits: u64 = bits;
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as u64;
+                bits &= !(1 << tz);
 
-                        bit[$rec] = pfn;
-                        let _tracking =
-                            &*($tracking[512 / 64 + bit[$rec] as usize] as
-                               *mut [u64; 512 / 64 + 512]);
-                        tracking!($rec + 1, _next_table, _tracking, $($es),*);
-                    }
+                // Compute the page index
+                let pfn = ii as u64 * 64 + tz;
+
+                // Get the page table entry
+                let pte = table.offset(pfn as isize);
+
+                if rec == 3 {
+                    // Skip the entry if it's not both dirty and
+                    // present
+                    if (*pte & DP) != DP { continue; }
+                } else {
+                    // Skip the entry if it's not both accessed and
+                    // present
+                    if (*pte & AP) != AP { continue; }
                 }
-            };
-            ($rec:expr, $pt:expr, $tracking:expr, $e:expr) => {
-                let vaddr = VirtAddr(bit[0] << 39 |
-                                     bit[1] << 30 |
-                                     bit[2] << 21 |
-                                     bit[3] << 12);
-                callback(vaddr, $pt);
-            };
+
+                // Clear the accessed and dirty bits
+                *pte &= !AD;
+
+                bit[rec] = pfn;
+                if rec == 3 {
+                    let vaddr = VirtAddr(bit[0] << 39 |
+                                         bit[1] << 30 |
+                                         bit[2] << 21 |
+                                         bit[3] << 12);
+                    callback(vaddr, pt);
+                } else {
+                    let tracking =
+                        &*(tracking[512 / 64 + bit[rec] as usize] as
+                           *mut [u64; 512 / 64 + 512]);
+                    // Compute the physical address of the table/page
+                    let next_table = PhysAddr(*pte & 0xffffffffff000);
+
+                    Self::for_each_dirty_page_int(
+                        phys_mem, callback, tracking,
+                        bit, rec + 1, next_table);
+                }
+            }
         }
-        
-        tracking!(0, self.table(), tracking, 0, 0, 0, 0, 0);
     }
 }
 
