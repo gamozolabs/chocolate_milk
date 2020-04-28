@@ -18,6 +18,6 @@ jobs:
                   rustup default nightly
                   rustup target add i586-pc-windows-msvc x86_64-pc-windows-msvc
             - name: Compile
-              run: |
-                  cargo run
-                  cargo run -- check
+              run: cargo run
+            - name: Check
+              run: cargo run -- check
