@@ -121,6 +121,8 @@ fn check_install(command: &str, args: &[&str],
     }
 }
 
+// Perform `cargo check` on the bootloader and the kernel.
+// Fails if there were any warnings.
 fn check_warnings() -> Result<(), Box<dyn Error>> {
     // Check the bootloader
     let bootloader_build_dir =
