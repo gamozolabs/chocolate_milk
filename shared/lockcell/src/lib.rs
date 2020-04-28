@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU32, Ordering, spin_loop_hint};
 /// Read the time stamp counter
 #[inline]
 pub fn rdtsc() -> u64 {
+    let unused = 0_u64;
     let val_lo: u32;
     let val_hi: u32;
 
