@@ -17,17 +17,20 @@ mod panic;
 mod pxe;
 mod intrins;
 
-use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use core::mem::{size_of, align_of};
+use core::sync::atomic::{AtomicU32, Ordering};
 use serial::SerialPort;
-use boot_args::{BootArgs, KERNEL_PHYS_WINDOW_SIZE, KERNEL_STACKS_BASE};
+use boot_args::{BootArgs, PersistStore, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_STACK_SIZE, KERNEL_STACK_PAD};
 use pe_parser::PeParser;
-use lockcell::LockCell;
 use page_table::{VirtAddr, PageType, PageTable, PAGE_PRESENT, PAGE_WRITE};
-use page_table::PAGE_SIZE;
+use page_table::{PhysAddr, PAGE_SIZE};
 
 /// Empty structure to implement locking semantics for pre-emptable locks
 pub struct LockInterrupts;
+
+/// The type of the `PersistStore`
+type Persist = PersistStore<LockInterrupts>;
 
 /// Current running core ID. The entire bootloader is protected with a lock
 /// preventing 2 cores from every running in the bootloader at the same time.
@@ -48,25 +51,16 @@ impl lockcell::InterruptState for LockInterrupts {
 /// Global arguments shared between the kernel and bootloader. It is critical
 /// that every structure in here is identical in shape between both 64-bit
 /// and 32-bit representations.
-pub static BOOT_ARGS: BootArgs<LockInterrupts> = BootArgs {
-    free_memory:           LockCell::new(None),
-    serial:                LockCell::new_no_preempt(None),
-    page_table:            LockCell::new(None),
-    trampoline_page_table: AtomicU64::new(0),
-    kernel_entry:          LockCell::new(None),
-    stack_vaddr:           AtomicU64::new(KERNEL_STACKS_BASE),
-    print_lock:            LockCell::new_no_preempt(()),
-    soft_reboot_addr:      AtomicU64::new(0),
-};
+pub static BOOT_ARGS: BootArgs<LockInterrupts> = BootArgs::new();
 
 /// Rust entry point for the bootloader
 ///
 /// * `bootloader_end`    - One byte past the end of the bootloader
 /// * `soft_reboot_entry` - Long mode soft reboot entry point
-/// * `_num_boots`        - Number of boots that has occurred, starts at 1
+/// * `num_boots`         - Number of boots that has occurred, starts at 1
 #[no_mangle]
 extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
-                _num_boots: u64) -> ! {
+                num_boots: u64) -> ! {
     // Initialize the serial driver
     {
         // Get access to the serial driver
@@ -89,10 +83,34 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
         }
     }
 
-    {
+    unsafe {
         // Store information about the soft reboot address
-        BOOT_ARGS.soft_reboot_addr.store(
+        BOOT_ARGS.soft_reboot_addr_ref().store(
             soft_reboot_entry as u64, Ordering::SeqCst);
+    
+        // Establish the address of the persist store and make sure it's
+        // aligned
+        let addr = bootloader_end
+            .checked_add(align_of::<Persist>() - 1).unwrap() &
+            !(align_of::<Persist>() - 1);
+        let persist_store_end = addr.checked_add(size_of::<Persist>())
+            .unwrap();
+
+        // Make sure persist store doesn't overflow into the EBDA
+        assert!(persist_store_end <= 0x00080000,
+                "Persist store doesn't fit before EBDA");
+
+        // Initialize the persist store on only the first boot
+        if CORE_ID.load(Ordering::SeqCst) == 0 && num_boots == 1 {
+            core::ptr::write_volatile(
+                addr as *mut Persist, Persist::new());
+
+            BOOT_ARGS.serial.lock().as_mut().unwrap()
+                .write(b"Initialized persist store\n");
+        }
+
+        // Establish the address of the persist store
+        BOOT_ARGS.set_persist_store(PhysAddr(addr as u64));
     }
 
     // Initialize the MMU
@@ -100,14 +118,15 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
 
     // Download the kernel and create the kernel page table
     let (entry_point, stack, cr3, tramp_cr3) = {
-        let mut kernel_entry = BOOT_ARGS.kernel_entry.lock();
+        let mut kernel_entry = unsafe { BOOT_ARGS.kernel_entry_ref().lock() };
         let mut page_table   = BOOT_ARGS.page_table.lock();
 
         // If no kernel entry is set yet, download the kernel and load it
         if kernel_entry.is_none() {
             // Make sure the trampoline table hasn't been set yet
-            let tramp_table = BOOT_ARGS.trampoline_page_table
-                .load(Ordering::SeqCst);
+            let tramp_table = unsafe {
+                BOOT_ARGS.trampoline_page_table_ref().load(Ordering::SeqCst)
+            };
             assert!(page_table.is_none() && tramp_table == 0,
                 "Page tables set up before kernel!?");
 
@@ -136,7 +155,7 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
             let pe = PeParser::parse(&kernel).expect("Failed to parse PE");
 
             // Get exclusive access to physical memory
-            let mut pmem = BOOT_ARGS.free_memory.lock();
+            let mut pmem = unsafe { BOOT_ARGS.free_memory_ref().lock() };
             let pmem = pmem.as_mut()
                 .expect("Whoa, physical memory not initialized yet");
             let mut pmem = mm::PhysicalMemory(pmem);
@@ -233,7 +252,7 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
                 // all bytes that were not initialized in the file.
                 table.map_init(&mut pmem, VirtAddr(vaddr),
                     PageType::Page4K,
-                    vsize as u64, read, write, execute,
+                    vsize as u64, read, write, execute, false,
                     Some(|off| {
                         raw.get(off as usize).copied().unwrap_or(0)
                     }));
@@ -245,13 +264,15 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
             *kernel_entry = Some(pe.entry_point);
             *page_table   = Some(table);
            
-            // Save the trampoline table address
-            BOOT_ARGS.trampoline_page_table.store(trampoline_table.table().0,
-                                                  Ordering::SeqCst);
+            unsafe {
+                // Save the trampoline table address
+                BOOT_ARGS.trampoline_page_table_ref()
+                    .store(trampoline_table.table().0, Ordering::SeqCst);
+            }
         }
 
         // Get exclusive access to physical memory
-        let mut pmem = BOOT_ARGS.free_memory.lock();
+        let mut pmem = unsafe { BOOT_ARGS.free_memory_ref().lock() };
         let pmem = pmem.as_mut()
             .expect("Whoa, physical memory not initialized yet");
         let mut pmem = mm::PhysicalMemory(pmem);
@@ -260,17 +281,20 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
         let page_table = page_table.as_mut().unwrap();
 
         // Get a unique stack address for this core
-        let stack_addr = BOOT_ARGS.stack_vaddr.fetch_add(
-            KERNEL_STACK_SIZE + KERNEL_STACK_PAD, Ordering::SeqCst);
+        let stack_addr = unsafe {
+            BOOT_ARGS.stack_vaddr_ref().fetch_add(
+                KERNEL_STACK_SIZE + KERNEL_STACK_PAD, Ordering::SeqCst)
+        };
         
         // Map in the stack
         page_table.map(&mut pmem,
                        VirtAddr(stack_addr), PageType::Page4K,
-                       KERNEL_STACK_SIZE, true, true, false).unwrap();
+                       KERNEL_STACK_SIZE, true, true, false, false).unwrap();
         
         // Get the address of the trampoline table
-        let tramp_table = BOOT_ARGS.trampoline_page_table
-            .load(Ordering::SeqCst);
+        let tramp_table = unsafe {
+            BOOT_ARGS.trampoline_page_table_ref().load(Ordering::SeqCst)
+        };
 
         (
             *kernel_entry.as_ref().unwrap(),

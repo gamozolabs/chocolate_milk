@@ -1,12 +1,26 @@
 //! Inner-mutability on shared variables through spinlocks
 
 #![no_std]
-#![feature(const_fn, track_caller)]
+#![feature(const_fn, track_caller, llvm_asm)]
 
 use core::ops::{Deref, DerefMut};
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering, spin_loop_hint};
+
+/// Read the time stamp counter
+#[inline]
+pub fn rdtsc() -> u64 {
+    let val_lo: u32;
+    let val_hi: u32;
+
+    unsafe {
+        llvm_asm!("rdtsc" : "={edx}"(val_hi), "={eax}"(val_lo) ::
+             "memory" : "volatile", "intel");
+    }
+
+    ((val_hi as u64) << 32) | val_lo as u64
+}
 
 /// Trait that allows access to OS-level constructs defining interrupt state,
 /// exception state, unique core IDs, and enter/exit lock (for interrupt
@@ -90,23 +104,15 @@ impl<T, I: InterruptState> LockCell<T, I> {
 }
 
 impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
-    /// Attempt to get exclusive access to the contained value. If `try_lock`
-    /// is set to `true`, the lock is only attempted once and if it fails
-    /// a `None` is returned. If `try_lock` is set to `false`, this will block
-    /// until the lock is obtained.
+    /// Get exclusive access to the value guarded by the lock
     #[track_caller]
-    fn lock_int(&self, try_lock: bool) -> Option<LockCellGuard<T, I>> {
+    pub fn lock(&self) -> LockCellGuard<T, I> {
         // If this lock does not disable interrupts, and we're currently in
         // an interrupt. Then, we just used a non-preemptable lock during an
         // interrupt. This means the lock creation for this lock should be
         // changed to a `new_no_preempt`
         assert!(self.disables_interrupts || !I::in_interrupt(),
             "Attempted to take a non-preemptable lock in an interrupt");
-
-        // Make sure that there are no uses of blocking locks in exception
-        // handlers.
-        assert!(try_lock || !I::in_exception(),
-            "Attempted to take a blocking lock while in an exception");
         
         // Get the core ID of the running core
         let core_id = I::core_id();
@@ -116,60 +122,66 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
             I::enter_lock();
         }
 
-        if try_lock {
-            // Try locks are special, we need to guarantee we will succeed in
-            // taking the lock.
+        // Take a ticket
+        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst);
 
-            // Get the number of the ticket that is ready right now
-            let current_release = self.release.load(Ordering::SeqCst);
-            
-            // Attempt to take the winning ticket. If we cannot get the
-            // winning ticket, then give up.
-            if self.ticket.compare_and_swap(
-                    current_release, current_release.wrapping_add(1),
-                    Ordering::SeqCst) != current_release {
-                // We didn't win the lock, thus return early
-                if self.disables_interrupts {
-                    I::exit_lock();
-                }
-
-                return None;
-            }
+        // Number of attempts of taking the lock until we use a TSC based
+        // countdown until a timeout panic. We only use this timeout during
+        // exceptions, as all other conditions should either never deadlock
+        // due to interrupts getting disabled ala. locks that get taken during
+        // and interrupt. Deadlocks on a single core are easily detected and
+        // thus we can panic on those.
+        //
+        // This leave one condition. Exceptions. During an exception it is
+        // possible that we need access to a lock. If we cannot get access to
+        // a lock in a given amount of time, the exception handler cannot
+        // do the correct thing anyways, and thus we need to bring the system
+        // down with a panic.
+        let mut time_threshold: u32 = if I::in_exception() {
+            10_000
         } else {
-            // Take a ticket
-            let ticket = self.ticket.fetch_add(1, Ordering::SeqCst);
-            while self.release.load(Ordering::SeqCst) != ticket {
-                // If the current core is the owner of the load
-                if self.owner.load(Ordering::SeqCst) == core_id {
-                    panic!("Deadlock detected");
-                }
+            !0
+        };
 
-                spin_loop_hint();
+        // Timeout based off of the TSC to determine when to give up on the
+        // lock and just panic.
+        let mut timeout = 0;
+
+        while self.release.load(Ordering::SeqCst) != ticket {
+            // If the current core is the owner of the load
+            if self.owner.load(Ordering::SeqCst) == core_id {
+                panic!("Deadlock detected");
             }
+
+            if time_threshold > 0 {
+                // Decrement number of attempts
+                time_threshold -= 1;
+            } else {
+                // We've tried getting access to the lock for a decent enough
+                // amount of time that we can affordibly use RDTSC now to
+                // enforce a seconds-based timeout
+                if timeout == 0 {
+                    // 1 second on a 3 GHz processor
+                    timeout = rdtsc() + 3_000_000_000;
+                } else {
+                    if rdtsc() >= timeout {
+                        panic!("Timed out when attempting to take lock");
+                    }
+                }
+            }
+
+            spin_loop_hint();
         }
 
         // Note that this core owns the lock
         self.owner.store(core_id, Ordering::SeqCst);
 
         // At this point we have exclusive access
-        Some(LockCellGuard {
+        LockCellGuard {
             cell: self,
-        })
-    }
-
-    /// Get exclusive access to the value guarded by the lock
-    #[track_caller]
-    pub fn lock(&self) -> LockCellGuard<T, I> {
-        self.lock_int(false).unwrap()
+        }
     }
     
-    /// Get exclusive access to the value guarded by the lock, if the lock
-    /// is already held, returns `None`
-    #[track_caller]
-    pub fn try_lock(&self) -> Option<LockCellGuard<T, I>> {
-        self.lock_int(true)
-    }
-
     /// Return a raw pointer to the internal locked value, regardless of the
     /// lock state. This bypasses the lock.
     pub unsafe fn shatter(&self) -> *mut T {

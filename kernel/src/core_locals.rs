@@ -1,14 +1,16 @@
 //! This file is used to hold and access all of the core locals
 
-use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use core::mem::size_of;
+use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, Ordering};
 
 use crate::apic::Apic;
-use crate::mm::PageFreeList;
+use crate::mm::{PageFreeList, PhysContig};
 use crate::interrupts::Interrupts;
 
 use lockcell::LockCell;
 use page_table::PhysAddr;
-use boot_args::{BootArgs, KERNEL_PHYS_WINDOW_BASE};
+use boot_args::{BootArgs, PersistStore, KERNEL_PHYS_WINDOW_BASE};
+use boot_args::KERNEL_PHYS_WINDOW_SIZE;
 
 /// A shortcut to get access to the core locals
 #[macro_export]
@@ -101,15 +103,15 @@ pub struct CoreLocals {
 
     /// An initialized APIC implementation. Will be `None` until the APIC has
     /// been initialized for this core.
-    pub apic: LockCell<Option<Apic>, LockInterrupts>,
+    apic: LockCell<Option<Apic>, LockInterrupts>,
 
     /// The interrupt implementation. This is used to add interrupt handlers
     /// to the interrupt table. If this is `None`, then interrupts have not
     /// yet been initialized.
-    pub interrupts: LockCell<Option<Interrupts>, LockInterrupts>,
+    interrupts: LockCell<Option<Interrupts>, LockInterrupts>,
 
     /// A core local free list of pages
-    pub free_list: LockCell<PageFreeList, LockInterrupts>,
+    free_list: LockCell<PageFreeList, LockInterrupts>,
 
     /// Current level of interrupt nesting. Incremented on every interrupt
     /// entry, and decremented on every interrupt return.
@@ -130,6 +132,13 @@ pub struct CoreLocals {
 
     /// Get the core's APIC ID
     apic_id: AtomicU32,
+
+    /// VMXON region for this core. If VMXON has not yet executed, or VMXOFF
+    /// was executed, then this will be `None`
+    vmxon_region: LockCell<Option<PhysContig<[u8; 4096]>>, LockInterrupts>,
+
+    /// Current active VM pointer from a `vmptrld`
+    current_vm_ptr: AtomicU64,
 }
 
 /// Empty marker trait that requires `Sync`, such that we can compile-time
@@ -137,7 +146,53 @@ pub struct CoreLocals {
 trait CoreGuard: Sync + Sized {}
 impl CoreGuard for CoreLocals {}
 
+/// Type of the `PersistStore`
+type Persist = PersistStore<LockInterrupts>;
+
 impl CoreLocals {
+    /// Get access to the VMXON region
+    pub unsafe fn vmxon_region(&self) ->
+            &LockCell<Option<PhysContig<[u8; 4096]>>, LockInterrupts> {
+        &self.vmxon_region
+    }
+
+    /// Get access to the core's active VT-x VM pointer (`vmptrld`)
+    pub unsafe fn current_vm_ptr(&self) -> &AtomicU64 {
+        &self.current_vm_ptr
+    }
+    
+    /// Get access to the interrupts
+    pub unsafe fn interrupts(&self) ->
+            &LockCell<Option<Interrupts>, LockInterrupts> {
+        &self.interrupts
+    }
+    
+    /// Get access to the APIC
+    pub unsafe fn apic(&self) -> &LockCell<Option<Apic>, LockInterrupts> {
+        &self.apic
+    }
+    
+    /// Get access to the free list 
+    pub unsafe fn free_list(&self) -> &LockCell<PageFreeList, LockInterrupts> {
+        &self.free_list
+    }
+
+    /// Get access to the persistent storage
+    pub unsafe fn persist_store(&self) -> &'static Persist {
+        // Get the physical address of the persist store
+        let addr = self.boot_args.persist_store();
+        assert!(addr.0 != 0, "Invalid persist store address");
+
+        // Make sure the persist store is within the physical window
+        let persist_store_end = addr.0.checked_add(size_of::<Persist>() as u64)
+            .unwrap();
+        assert!(persist_store_end <= KERNEL_PHYS_WINDOW_SIZE,
+            "Persist store out of bounds of physical window");
+
+        // Return a reference to the persist store
+        &*((KERNEL_PHYS_WINDOW_BASE + addr.0) as *const Persist)
+    }
+
     /// Set the current core's APIC ID
     pub unsafe fn set_apic_id(&self, apic_id: u32) {
         self.apic_id.store(apic_id, Ordering::SeqCst);
@@ -222,7 +277,7 @@ pub fn get_core_locals() -> &'static CoreLocals {
 
         // Get the first `u64` from `CoreLocals`, which given we don't change
         // the structure shape, should be the address of the core locals.
-        asm!("mov $0, gs:[0]" :
+        llvm_asm!("mov $0, gs:[0]" :
              "=r"(ptr) :: "memory" : "volatile", "intel");
 
         &*(ptr as *const CoreLocals)
@@ -255,10 +310,15 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
         &*((boot_args.0 + KERNEL_PHYS_WINDOW_BASE) as
            *const BootArgs<DummyLockInterrupts>)
     };
+    
+    // Make sure the structure size is the same betewen the bootloader and
+    // kernel
+    assert!(boot_args.struct_size == core::mem::size_of_val(boot_args) as u64,
+        "Bootloader struct size mismatch");
 
     let core_local_ptr = {
         // Get access to the physical memory allocator
-        let mut pmem = boot_args.free_memory.lock();
+        let mut pmem = unsafe { boot_args.free_memory_ref().lock() };
         let pmem = pmem.as_mut().unwrap();
         
         // Allocate the core locals
@@ -276,13 +336,16 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
         boot_args:  unsafe {
             &*(boot_args as *const _ as *const BootArgs<LockInterrupts>)
         },
-        free_list:  LockCell::new(PageFreeList::new()),
+        free_list:  LockCell::new_no_preempt(PageFreeList::new()),
         apic:       LockCell::new_no_preempt(None),
         interrupts: LockCell::new_no_preempt(None),
 
         interrupt_depth:               AutoAtomicRef::new(0),
         exception_depth:               AutoAtomicRef::new(0),
         interrupt_disable_outstanding: AtomicUsize::new(1),
+
+        vmxon_region:   LockCell::new_no_preempt(None),
+        current_vm_ptr: AtomicU64::new(!0),
     };
 
     unsafe {

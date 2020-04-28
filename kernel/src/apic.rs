@@ -278,7 +278,7 @@ impl Apic {
 
     /// Handler for APIC timer interrupts
     unsafe fn timer_interrupt(_number: u8, _frame: &mut InterruptFrame,
-                              _error: usize, _regs: &mut AllRegs) -> bool {
+                              _error: u64, _regs: &mut AllRegs) -> bool {
         crate::panic::attempt_soft_reboot();
 
         true
@@ -300,7 +300,7 @@ impl Apic {
         // Get access to the APIC without needing the lock. This is safe in
         // all situations as we issue one EOI wrmsr which is "atomic" WRT other
         // interrupts.
-        let apic = &mut *core!().apic.shatter();
+        let apic = &mut *core!().apic().shatter();
 
         if let Some(apic) = apic {
             apic.write_apic(Register::EndOfInterrupt, 0);
@@ -316,7 +316,7 @@ impl Apic {
         
         {
             // Register an interrupt handler for `APIC_TIMER_VECTOR`
-            core!().interrupts.lock().as_mut().unwrap().add_handler(
+            core!().interrupts().lock().as_mut().unwrap().add_handler(
                 APIC_TIMER_VECTOR, Self::timer_interrupt, true);
         }
 
@@ -345,10 +345,8 @@ impl Apic {
         self.write_apic(Register::InitialCount, 0);
         
         // Deregister an interrupt handler for `APIC_TIMER_VECTOR`
-        core!().interrupts.try_lock()
-            .expect("Failed to get interrupt lock to disable APIC timer")
-            .as_mut().unwrap().remove_handler(
-                APIC_TIMER_VECTOR, Self::timer_interrupt);
+        core!().interrupts().lock().as_mut().unwrap().remove_handler(
+            APIC_TIMER_VECTOR, Self::timer_interrupt);
     }
 }
 
@@ -457,7 +455,7 @@ pub unsafe fn init() {
             "Invalid APIC base address");
 
     // Get access to and make sure the APIC has not yet been initialized
-    let mut apic = core!().apic.lock();
+    let mut apic = core!().apic().lock();
     assert!(apic.is_none(), "APIC was already initialized");
 
     // Get the CPU features for this system

@@ -15,23 +15,23 @@ static RDTSC_START: AtomicU64 = AtomicU64::new(0);
 
 /// Get the TSC rate in MHz
 pub fn tsc_mhz() -> u64 {
-    RDTSC_MHZ.load(Ordering::Relaxed)
+    RDTSC_MHZ.load(Ordering::SeqCst)
 }
 
 /// Returns the TSC value upon a future time in microseconds
 pub fn future(microseconds: u64) -> u64 {
-	cpu::rdtsc() + (microseconds * RDTSC_MHZ.load(Ordering::Relaxed))
+	cpu::rdtsc() + (microseconds * RDTSC_MHZ.load(Ordering::SeqCst))
 }
 
 /// Returns system uptime in seconds as a float
 pub fn uptime() -> f64 {
-    rdtsc_elapsed(RDTSC_START.load(Ordering::Relaxed))
+    elapsed(RDTSC_START.load(Ordering::SeqCst))
 }
 
 /// Return number of seconds elapsed since a prior TSC value
-pub fn rdtsc_elapsed(start_time: u64) -> f64 {
+pub fn elapsed(start_time: u64) -> f64 {
     (cpu::rdtsc() - start_time) as f64 /
-        RDTSC_MHZ.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        RDTSC_MHZ.load(Ordering::SeqCst) as f64 / 1_000_000.0
 }
 
 /// Busy sleep for a given number of microseconds
@@ -47,7 +47,13 @@ pub fn sleep(microseconds: u64) {
 pub unsafe fn calibrate() {
     // Store off the current rdtsc value
     let start = cpu::rdtsc();
-    RDTSC_START.store(start, Ordering::Relaxed);
+    RDTSC_START.store(start, Ordering::SeqCst);
+
+    // Check if we already calibrated
+    if let Some(tsc_freq) = *core!().persist_store().rdtsc_freq.lock() {
+        RDTSC_MHZ.store(tsc_freq, Ordering::SeqCst);
+        return;
+    }
 
     // Program the PIT to use mode 0 (interrupt after countdown) to
     // count down from 65535. This causes an interrupt to occur after
@@ -82,6 +88,9 @@ pub unsafe fn calibrate() {
     let rounded_rate = (((computed_rate / 100.0) + 0.5) as u64) * 100;
 
     // Stock the TSC rate
-    RDTSC_MHZ.store(rounded_rate, Ordering::Relaxed);
+    RDTSC_MHZ.store(rounded_rate, Ordering::SeqCst);
+
+    // Save the TSC frequency in the persist store
+    *core!().persist_store().rdtsc_freq.lock() = Some(rounded_rate);
 }
 

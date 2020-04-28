@@ -3,12 +3,18 @@
 use core::mem::size_of;
 use core::convert::TryInto;
 use alloc::vec::Vec;
-use crate::net::{NetDevice, Packet, Udp, Ipv4Addr};
+use alloc::sync::Arc;
+use crate::net::{NetDevice, Packet, Udp, Ipv4Addr, UdpAddress};
+
+/// Amount of time to wait for a DHCP response from the server in microseconds.
+/// If the DHCP process takes longer than this we will give up and return
+/// `None` from lease
+const DHCP_TIMEOUT: u64 = 5_000_000;
 
 /// The magic DHCP cookie
 const DHCP_COOKIE: u32 = 0x63825363;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Lease {
     pub client_ip:    Ipv4Addr,
     pub server_ip:    Ipv4Addr,
@@ -261,15 +267,21 @@ fn parse_dhcp_packet<'a>(xid: u32, udp: Udp<'a>) ->
 fn create_dhcp_packet(packet: &mut Packet, xid: u32,
                       mac: [u8; 6], options: &[u8]) {
     // Initialize the packet for a UDP DHCP packet
-    let offset = packet.create_udp_raw(
-        mac, [0xff; 6], 0.into(), (!0).into(), 68, 67,
-        core::mem::size_of::<Header>() + options.len());
+    let addr = UdpAddress {
+        src_eth:  mac,
+        dst_eth:  [0xff; 6],
+        src_ip:   0.into(),
+        dst_ip:   (!0).into(),
+        src_port: 68,
+        dst_port: 67,
+    };
+    let mut pkt = packet.create_udp(&addr);
+
+    // Reserve room in the packet for the header and the DHCP options
+    let dhcp_header = pkt.reserve(size_of::<Header>() + options.len())
+        .unwrap();
 
     {
-        // Get access to the header portion of the payload
-        let dhcp_header = &mut packet.raw_mut()
-            [offset..offset + core::mem::size_of::<Header>()];
-
         // Cast the header to a DHCP header
         let header: &mut Header = unsafe {
             &mut *(dhcp_header.as_mut_ptr() as *mut Header)
@@ -293,14 +305,13 @@ fn create_dhcp_packet(packet: &mut Packet, xid: u32,
     
     {
         // Get access to the DHCP options
-        let dhcp_options = &mut packet.raw_mut()
-            [offset + core::mem::size_of::<Header>()..
-             offset + core::mem::size_of::<Header>() + options.len()];
+        let dhcp_options = &mut dhcp_header
+            [size_of::<Header>()..size_of::<Header>() + options.len()];
         dhcp_options.copy_from_slice(&options);
     }
 }
 
-pub fn get_lease(device: &NetDevice) -> Option<Lease> {
+pub fn get_lease(device: Arc<NetDevice>) -> Option<Lease> {
     // Get a "unique" transaction ID
     let xid = cpu::rdtsc() as u32;
 
@@ -308,7 +319,7 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
     let mac = device.mac();
 
     // Bind to UDP port 68
-    let bind = device.bind_udp(68)
+    let bind = NetDevice::bind_udp_port(device.clone(), 68)
         .expect("Could not bind to port 68 for dhcp");
 
     // Construct the DHCP options for the discover
@@ -323,14 +334,13 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
     // Send the DHCP discover
     let mut packet = device.allocate_packet();
     create_dhcp_packet(&mut packet, xid, mac, &options);
-    device.send(packet);
+    device.send(packet, true);
 
     // Things we hope to maybe find in a DHCP offer
     let mut offer_ip:  Option<Ipv4Addr> = None;
     let mut server_ip: Option<Ipv4Addr> = None;
 
-    // Wait for the DHCP offer
-    while bind.recv(|_pkt, udp| {
+    bind.recv_timeout(DHCP_TIMEOUT, |_pkt, udp| {
         // Check that the destination is us
         if udp.ip.eth.dst_mac != mac { return None; }
 
@@ -352,7 +362,7 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
         });
 
         Some(())
-    }).is_none() {}
+    })?;
 
     // Attempt to get the offer IP and server IP
     let offer_ip  = offer_ip?;
@@ -373,14 +383,14 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
     // Send the DHCP request
     let mut packet = device.allocate_packet();
     create_dhcp_packet(&mut packet, xid, mac, &options);
-    device.send(packet);
+    device.send(packet, true);
 
     // Things we hope to get from the DHCP ACK
     let mut broadcast_ip = None;
     let mut subnet_mask  = None;
     
     // Wait for the DHCP ACK
-    while bind.recv(|_pkt, udp| {
+    bind.recv_timeout(DHCP_TIMEOUT, |_pkt, udp| {
         // Check that the destination is us
         if udp.ip.eth.dst_mac != mac { return None; }
 
@@ -406,7 +416,7 @@ pub fn get_lease(device: &NetDevice) -> Option<Lease> {
         });
 
         Some(())
-    }).is_none() {}
+    })?;
 
     Some(Lease {
         client_ip: offer_ip,

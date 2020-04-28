@@ -115,6 +115,13 @@ struct Rsdp {
     oem_id:            [u8; 6],
     revision:          u8,
     rsdt_addr:         u32,
+}
+
+/// In-memory representation of an Extended RSDP ACPI structure
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct RsdpExtended {
+    descriptor:        Rsdp,
     length:            u32,
     xsdt_addr:         u64,
     extended_checksum: u8,
@@ -212,6 +219,20 @@ pub unsafe fn init() {
                 continue;
             }
 
+            // Checksum the extended RSDP if needed
+            if table.revision > 0 {
+                // Read the tables bytes so we can checksum it
+                const N: usize = size_of::<RsdpExtended>();
+                let extended_bytes = mm::read_phys::<[u8; N]>(PhysAddr(paddr));
+
+                // Checksum the table
+                let sum = extended_bytes.iter()
+                    .fold(0u8, |acc, &x| acc.wrapping_add(x));
+                if sum != 0 {
+                    continue;
+                }
+            }
+
             rsdp = Some(table);
             break 'rsdp_search;
         }
@@ -287,7 +308,7 @@ pub unsafe fn init() {
     // Launch all other cores
     if let Some(valid_apics) = apics {
         // Get exclusive access to the APIC for this core
-        let mut apic = core!().apic.lock();
+        let mut apic = core!().apic().lock();
         let apic = apic.as_mut().unwrap();
 
         // Go through all APICs on the system

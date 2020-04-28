@@ -14,6 +14,9 @@ boot_args = { path = "../shared/boot_args" }
 page_table = { path = "../shared/page_table" }
 rangeset = { path = "../shared/rangeset" }
 lockcell = { path = "../shared/lockcell" }
+noodle = { path = "../shared/noodle" }
+falktp = { path = "../shared/falktp" }
+aht = { path = "../shared/aht" }
 
 [profile.release]
 panic = "abort"

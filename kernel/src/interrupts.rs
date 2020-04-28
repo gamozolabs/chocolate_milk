@@ -5,7 +5,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 
+use lockcell::LockCell;
+use page_table::VirtAddr;
+
 use crate::apic::Apic;
+use crate::core_locals::LockInterrupts;
 use crate::acpi::{set_core_state, ApicState};
 
 /// If a given interrupt requires an EOI when it is handled, the corresponding
@@ -19,17 +23,71 @@ pub static DRAINING_EOIS: AtomicBool = AtomicBool::new(false);
 /// Type for an interrupt gate for 64-bit mode
 const X64_INTERRUPT_GATE: u32 = 0xe;
 
+/// List of all registered page fault handlers on the system
+static PAGE_FAULT_HANDLERS:
+    LockCell<Vec<Box<dyn PageFaultHandler>>, LockInterrupts> =
+        LockCell::new_no_preempt(Vec::new());
+
+/// Fault handler registration
+///
+/// Allows the fault handler to be removed when the `FaultReg` goes is
+/// `Drop`ped
+pub struct FaultReg(*const dyn PageFaultHandler);
+
+impl Drop for FaultReg {
+    fn drop(&mut self) {
+        // Lock access to the fault handlers
+        let mut fault_handlers = PAGE_FAULT_HANDLERS.lock();
+
+        // Drop any fault handler which uses the same pointer (should only
+        // ever be one)
+        fault_handlers.retain(|x: &Box<dyn PageFaultHandler>| {
+            let handler: *const dyn PageFaultHandler = &**x;
+            self.0 != handler
+        });
+    }
+}
+
+/// Register a page fault handler
+pub fn register_fault_handler(handler: Box<dyn PageFaultHandler>) -> FaultReg {
+    let ptr = &*handler as *const dyn PageFaultHandler;
+    PAGE_FAULT_HANDLERS.lock().push(handler);
+    FaultReg(ptr)
+}
+
+/// Implemented for structures which may be registered as page fault handlers.
+/// These handlers can be used to hook page faults and potentially lazily map
+/// in pages when needed.
+pub trait PageFaultHandler {
+    /// Invoked when a page fault occurs with the contents for `cr2`, the
+    /// faulting address. If the fault was handled this should return `true`
+    /// and thus execution will return back to where the exception originally
+    /// occurred.
+    ///
+    /// The `code` is the error code pushed onto a stack during a page fault
+    unsafe fn page_fault(&mut self, vaddr: VirtAddr, code: u64) -> bool;
+}
+
 /// Dispatch routine definition
 /// Arguments are (interrupt number, frame, error code, register state at int)
 ///
 /// Returns `true` if the interrupt was handled, and execution should continue
 type InterruptDispatch =
-    unsafe fn(u8, &mut InterruptFrame, usize, &mut AllRegs) -> bool;
+    unsafe fn(u8, &mut InterruptFrame, u64, &mut AllRegs) -> bool;
 
 /// Structure to hold different dispatch routines for interrupts
 pub struct Interrupts {
     /// Dispatch routines for interrupts
     dispatch: [Option<InterruptDispatch>; 256],
+
+    /// TSS
+    pub tss: Box<Tss>,
+    
+    /// IDT
+    pub idt: Vec<IdtEntry>,
+    
+    /// GDT
+    pub gdt: Vec<u64>,
 }
 
 impl Interrupts {
@@ -64,7 +122,7 @@ struct TablePtr(u16, u64);
 /// A 64-bit TSS data structure
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
-struct Tss {
+pub struct Tss {
 	reserved1:   u32,
 	rsp:         [u64; 3],
 	reserved2:   u64,
@@ -78,19 +136,19 @@ struct Tss {
 /// representation
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
-struct IDTEntry(u32, u32, u32, u32);
+pub struct IdtEntry(u32, u32, u32, u32);
 
-impl IDTEntry {
+impl IdtEntry {
     /// Construct a new in-memory representation of an IDT entry. This will
     /// take the `cs:offset` to the handler address, the `ist` for the
     /// interrupt stack table index, the `typ` of the IDT gate entry and the
     /// `dpl` of the IDT entry.
     fn new(cs: u16, offset: u64, ist: u32, typ: u32, dpl: u32) -> Self {
-        assert!(ist <  8, "Invalid IDTEntry IST");
-        assert!(typ < 32, "Invalid IDTEntry type");
-        assert!(dpl <  4, "Invalid IDTEntry dpl");
+        assert!(ist <  8, "Invalid IdtEntry IST");
+        assert!(typ < 32, "Invalid IdtEntry type");
+        assert!(dpl <  4, "Invalid IdtEntry dpl");
 
-        IDTEntry(
+        IdtEntry(
             ((cs as u32) << 16) | (offset & 0xffff) as u32,
             ((offset & 0xffff0000) as u32) | (1 << 15) |
                 (dpl << 13) | (typ << 8) | ist,
@@ -127,12 +185,11 @@ pub fn eoi_required() -> [u128; 2] {
 /// #DF, #MC, and NMI interrupts. Then set up a IDT with all interrupts passing
 /// through to the `interrupt_handler` Rust function.
 pub fn init() {
-    let mut interrupts = core!().interrupts.lock();
+    let mut interrupts = unsafe { core!().interrupts().lock() };
     assert!(interrupts.is_none(), "Interrupts have already been initialized");
 
     // Create a new, empty TSS
-	let mut tss: ManuallyDrop<Box<Tss>> =
-        ManuallyDrop::new(Box::new(Tss::default()));
+	let mut tss: Box<Tss> = Box::new(Tss::default());
 
     // Create a 32 KiB critical stack for use during #DF, #MC, and NMI
     let crit_stack: ManuallyDrop<Vec<u8>> = ManuallyDrop::new(
@@ -140,7 +197,7 @@ pub fn init() {
     tss.ist[0] = crit_stack.as_ptr() as u64 + crit_stack.capacity() as u64;
     
     // Create GDT in the kernel context
-    let mut gdt: ManuallyDrop<Vec<u64>> = ManuallyDrop::new(vec![
+    let mut gdt: Vec<u64> = vec![
 	    0x0000000000000000, // 0x0000 | Null descriptor
 	    0x00009a007c00ffff, // 0x0008 | 16-bit, present, code, base 0x7c00
 	    0x000092000000ffff, // 0x0010 | 16-bit, present, data, base 0
@@ -148,10 +205,10 @@ pub fn init() {
 	    0x00cf92000000ffff, // 0x0020 | 32-bit, present, data, base 0
 	    0x00209a0000000000, // 0x0028 | 64-bit, present, code, base 0
 	    0x0000920000000000, // 0x0030 | 64-bit, present, data, base 0
-    ]);
+    ];
 
     // Create the task pointer in the GDT
-    let tss_base = &**tss as *const Tss as u64;
+    let tss_base = &*tss as *const Tss as u64;
     let tss_low = 0x890000000000 | (((tss_base >> 24) & 0xff) << 56) |
         ((tss_base & 0xffffff) << 16) |
         (core::mem::size_of::<Tss>() as u64 - 1);
@@ -169,7 +226,7 @@ pub fn init() {
 
     unsafe {
         // Update to use a GDT in the current virtual space
-        asm!(r#"
+        llvm_asm!(r#"
                 // Load the GDT
                 lgdt [$0]
 
@@ -181,7 +238,7 @@ pub fn init() {
     }
     
     // Create a new IDT
-    let mut idt = ManuallyDrop::new(Vec::with_capacity(256));
+    let mut idt = Vec::with_capacity(256);
 
     for int_id in 0..256 {
         // Determine the IST entry to use for this vector
@@ -195,7 +252,7 @@ pub fn init() {
             _ => 0,
         };
 
-        idt.push(IDTEntry::new(0x28, INT_HANDLERS[int_id] as u64,
+        idt.push(IdtEntry::new(0x28, INT_HANDLERS[int_id] as u64,
                                ist, X64_INTERRUPT_GATE, 0));
     }
 
@@ -208,13 +265,16 @@ pub fn init() {
   
     unsafe {
         // Load the IDT!
-        asm!("lidt [$0]" :: "r"(&idt_ptr as *const TablePtr) :
+        llvm_asm!("lidt [$0]" :: "r"(&idt_ptr as *const TablePtr) :
              "memory" : "volatile", "intel");
     }
 
     // Create the interrupts structure
     *interrupts = Some(Interrupts {
         dispatch: [None; 256],
+        gdt,
+        idt,
+        tss,
     });
 }
 
@@ -270,7 +330,7 @@ pub struct AllRegs {
 /// Entry point for all interrupts and exceptions
 #[no_mangle]
 pub unsafe extern fn interrupt_handler(
-        number: u8, frame: &mut InterruptFrame, error: usize,
+        number: u8, frame: &mut InterruptFrame, error: u64,
         regs: &mut AllRegs) {
     // Increment the level of interrupt depth. This will automatically get
     // decremented when the scope ends.
@@ -292,11 +352,34 @@ pub unsafe extern fn interrupt_handler(
             // NMI, signalled that another core has paniced
             panic!("Panic occured on another core");
         } else {
+            {
+                // VMXOFF if we're in VMX root operation
+                let vmxon_lock = core!().vmxon_region().shatter();
+
+                if let Some(_) = &*vmxon_lock {
+                    // Disable VMX root operation
+                    llvm_asm!("vmxoff" :::: "intel", "volatile");
+                }
+
+                *vmxon_lock = None;
+            }
+
             // Mark that we're in the halted state
             set_core_state(core!().apic_id().unwrap(), ApicState::Halted);
 
             // Halt forever
             cpu::halt();
+        }
+    }
+
+    // Handle page faults
+    if number == 0xe {
+        // Invoke all page fault handlers
+        for handler in PAGE_FAULT_HANDLERS.lock().iter_mut() {
+            if handler.page_fault(VirtAddr(cpu::read_cr2()), error) {
+                // If the page fault was handled, return back to execution
+                return;
+            }
         }
     }
     
@@ -307,8 +390,7 @@ pub unsafe extern fn interrupt_handler(
     let draining_eois = DRAINING_EOIS.load(Ordering::SeqCst);
     if !draining_eois {
         // Attempt to get the dispatch handler for this exception.
-        let handler = core!().interrupts.try_lock()
-            .expect("Failed to get interrupts lock")
+        let handler = core!().interrupts().lock()
             .as_ref().unwrap().dispatch[number as usize];
         
         // Invoke the dynamically installed interrupt handler if it exists

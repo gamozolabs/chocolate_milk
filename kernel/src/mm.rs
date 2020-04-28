@@ -92,6 +92,22 @@ pub fn alloc_virt_addr_4k(size: u64) -> VirtAddr {
     ret
 }
 
+/// Gets mutable access to a slice of physical memory
+#[allow(dead_code)]
+#[inline]
+pub unsafe fn slice_phys_mut<'a>(paddr: PhysAddr, size: u64) -> &'a mut [u8] {
+    let end = size.checked_sub(1).and_then(|x| {
+        x.checked_add(paddr.0)
+    }).expect("Integer overflow on read_phys");
+    assert!(end < KERNEL_PHYS_WINDOW_SIZE,
+            "Physical address outside of window");
+
+    // Return out a slice to this physical memory as mutable
+    core::slice::from_raw_parts_mut(
+        (KERNEL_PHYS_WINDOW_BASE + paddr.0) as *mut u8,
+        size as usize)
+}
+
 /// Read a physical address containing a type `T`. This just handles the
 /// windowing and performs a `core::ptr::read_volatile`.
 #[allow(dead_code)]
@@ -178,7 +194,7 @@ impl PageFreeList {
             // Get some bulk memory
             let alc = {
                 // Get access to physical memory
-                let mut phys_mem = core!().boot_args.free_memory.lock();
+                let mut phys_mem = core!().boot_args.free_memory_ref().lock();
                 let phys_mem     = phys_mem.as_mut().unwrap();
 
                 // Bulk allocate some memory to populate the empty free list
@@ -270,11 +286,13 @@ impl PhysMem for PhysicalMemory {
 
     fn alloc_phys(&mut self, layout: Layout) -> PhysAddr {
         if layout.size() == 4096 && layout.align() >= 4096 {
-            unsafe { core!().free_list.lock().pop() }
+            unsafe { core!().free_list().lock().pop() }
         } else {
             // Get access to physical memory
-            let mut phys_mem = core!().boot_args.free_memory.lock();
-            let phys_mem     = phys_mem.as_mut().unwrap();
+            let mut phys_mem = unsafe {
+                core!().boot_args.free_memory_ref().lock()
+            };
+            let phys_mem = phys_mem.as_mut().unwrap();
 
             // Could not satisfy allocation from free list, allocate
             // directly from the physical memory pool
@@ -289,7 +307,7 @@ impl PhysMem for PhysicalMemory {
     fn free_phys(&mut self, phys: PhysAddr, size: u64) {
         if (phys.0 & 0xfff) == 0 && size == 4096 {
             // Get access to the free list
-            unsafe { core!().free_list.lock().push(phys); }
+            unsafe { core!().free_list().lock().push(phys); }
         } else {
             // Compute the end address
             let end = size.checked_sub(1).and_then(|x| {
@@ -297,8 +315,10 @@ impl PhysMem for PhysicalMemory {
             }).expect("Integer overflow on free_phys");
 
             // Get access to physical memory
-            let mut phys_mem = core!().boot_args.free_memory.lock();
-            let phys_mem     = phys_mem.as_mut().unwrap();
+            let mut phys_mem = unsafe {
+                core!().boot_args.free_memory_ref().lock()
+            };
+            let phys_mem = phys_mem.as_mut().unwrap();
             phys_mem.insert(Range { start: phys.0, end: end });
         }
     }
@@ -338,7 +358,7 @@ impl GlobalAllocator {
 
         // Map in the memory as RW
         page_table.map(&mut pmem, vaddr, PageType::Page4K,
-            alignsize, true, true, false)?;
+            alignsize, true, true, false, false)?;
 
         // Allocation success, `vaddr` now is valid as read-write for
         // `alignsize` bytes!
