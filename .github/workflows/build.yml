@@ -19,5 +19,5 @@ jobs:
                   rustup target add i586-pc-windows-msvc x86_64-pc-windows-msvc
             - name: Compile
               run: |
-                  cargo run -- check
                   cargo run
+                  cargo run -- check
