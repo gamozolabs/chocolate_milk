@@ -1,8 +1,7 @@
 all:
 	nasm -f bin shellcode.asm -o shellcode.bin
-	cl /Od /Zi /Zo test.c kernel32.lib ntdll.lib
-	-del C:\users\pleb\falkdump*
-	whoami
-	test.exe
-#	cdb -g -G test.exe
+	cl /Wall /WX /wd4820 /wd4668 /wd4710 /Od /Zi /Zo \
+		test.c kernel32.lib ntdll.lib
+#	test.exe
+	cdb -g -G test.exe
 

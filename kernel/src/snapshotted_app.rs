@@ -2,21 +2,32 @@
 
 use core::cell::Cell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
 use core::alloc::Layout;
 use core::convert::TryInto;
 use alloc::sync::Arc;
-use alloc::collections::{BTreeSet, BTreeMap};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::collections::{BTreeMap};
 
 use crate::mm;
+use crate::time;
+use crate::net::{NetDevice, UdpBind, UdpAddress};
 use crate::vtx::{Vm, FxSave, RegisterState, VmExit};
-use crate::vtx::Exception::*;
+use crate::vtx::Exception;
 use crate::net::netmapping::NetMapping;
 use crate::core_locals::LockInterrupts;
 
+use aht::Aht;
 use lockcell::LockCell;
 use page_table::{PhysAddr, VirtAddr, PhysMem, PageType, Mapping};
 use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_USER};
+
+/// Number of microseconds to wait before syncing worker statistics into the
+/// `FuzzTarget`
+///
+/// This is used to reduce the frequency which workers sync with the master,
+/// to cut down on the lock contention
+const STATISTIC_SYNC_INTERVAL: u64 = 100_000;
 
 /// Parsed snapshot information file
 struct SnapshotInfo {
@@ -27,27 +38,65 @@ struct SnapshotInfo {
     virt_to_offset: BTreeMap<VirtAddr, usize>,
 }
 
+/// Statistics collected about number of fuzz cases and VM exits
+///
+/// This structure is synced on `STATISTIC_SYNC_INTERVAL` from the workers to
+/// the master `FuzzTarget`. This interval based syncing ensures that the
+/// lock contention is kept low, regardless of number of fuzz cases or cores.
+#[derive(Default)]
+pub struct Statistics {
+    /// Number of fuzz cases performed on the target
+    fuzz_cases: u64,
+
+    /// Frequencies of various VM exit reasons
+    vmexits: BTreeMap<VmExit, u64>,
+}
+
+impl Statistics {
+    /// Sync the statistics in `self` into `master`, resetting `self`'s
+    /// statistics back to 0 such that the syncing cycle can repeat.
+    fn sync_into(&mut self, master: &mut Statistics) {
+        // Merge number of fuzz cases
+        master.fuzz_cases += self.fuzz_cases;
+
+        // Merge vmexit reasons
+        for (reason, freq) in self.vmexits.iter() {
+            *master.vmexits.entry(*reason).or_insert(0) += freq;
+        }
+
+        // Reset our statistics
+        self.fuzz_cases = 0;
+        self.vmexits.clear();
+    }
+}
+
 /// A shared state for a snapshot of an application which is being fuzzed
-pub struct SnapshottedApp<'a> {
+pub struct FuzzTarget<'a> {
     /// Parse information about the snapshot. This is the `.info` file produced
     /// by the Sausage Factory. This contains information such as the register
     /// states of the target application as well as what virtual addresses
     /// map to offsets in the backing memory
     snapshot_info: Arc<SnapshotInfo>,
 
+    /// The `rdtsc` value at the time this snapshotted application was created
+    start: u64,
+
     /// Raw memory contents which back the original snapshot. This is a packed
     /// format and thus the `snapshot_info` can be used to take the sparse
     /// virtual addresses and convert them into the `memory` offsets.
     memory: Arc<NetMapping<'a>>,
 
-    /// Coverage database containing all observed RIP values
-    pub coverage: LockCell<BTreeSet<u64>, LockInterrupts>,
+    /// `ip:port` string of the server where we downloaded the image
+    server: String,
 
-    /// Number of fuzz cases performed on the target
-    pub fuzz_cases: AtomicU64,
+    /// All observed coverage information
+    coverage: Aht<u64, (), 65536>,
+
+    /// Global statistics for the fuzz cases
+    stats: LockCell<Statistics, LockInterrupts>,
 }
 
-impl<'a> SnapshottedApp<'a> {
+impl<'a> FuzzTarget<'a> {
     /// Creates a new snapshotted application based on the snapshot `name`.
     ///
     /// This snapshot currently must be in the Sausage Factory file format.
@@ -79,6 +128,7 @@ impl<'a> SnapshottedApp<'a> {
         }
 
         // Parse out the register fields from the snapshot info
+        regs.gs_base = consume!(u64);
         regs.rfl = consume!(u64);
         regs.r15 = consume!(u64);
         regs.r14 = consume!(u64);
@@ -96,10 +146,6 @@ impl<'a> SnapshottedApp<'a> {
         regs.rbx = consume!(u64);
         regs.rax = consume!(u64);
         regs.rsp = consume!(u64);
-
-        // XXX XXX HARDCODED RIP ALERT XXX XXX
-        regs.rip = 0x7ffe_3e825187;
-        regs.gs_base = 0x00fb_c974f000;
 
         // Parse the `FxSave` out of the info
         unsafe {
@@ -141,14 +187,16 @@ impl<'a> SnapshottedApp<'a> {
         assert!(offset == memory.len());
 
         // Return out the snapshotted application
-        SnapshottedApp {
+        FuzzTarget {
             snapshot_info: Arc::new(SnapshotInfo {
                 regs,
                 virt_to_offset,
             }),
+            server:     server.into(),
+            start:      cpu::rdtsc(),
             memory:     Arc::new(memory),
-            coverage:   LockCell::new(BTreeSet::new()),
-            fuzz_cases: AtomicU64::new(0),
+            coverage:   Aht::new(),
+            stats:      LockCell::new(Default::default()),
         }
     }
 
@@ -156,11 +204,41 @@ impl<'a> SnapshottedApp<'a> {
     pub fn worker(&self) -> Worker {
         // Create a new virtual machine
         let vm = Vm::new_user();
+        
+        // Get access to a network device
+        let netdev = NetDevice::get()
+            .expect("Failed to get network device for worker");
+
+        // Bind to a random UDP port on this network device
+        let udp = NetDevice::bind_udp(netdev.clone())
+            .expect("Failed to bind to UDP for worker");
+        
+        // Resolve the target
+        let server = UdpAddress::resolve(
+            &netdev, udp.port(), &self.server)
+            .expect("Couldn't resolve target address");
 
         Worker {
             snapshot: self,
             vm:       vm,
             rng:      Rng::new(),
+            stats:    Default::default(),
+            server:   server,
+            udp:      udp,
+            sync:     0,
+        }
+    }
+
+    /// Print statistics information to serial
+    pub fn print_stats(&self) {
+        let stats = self.stats.lock();
+
+        print!("{:12} cases | {:12.3} fcps | {:6} coverage\n",
+               stats.fuzz_cases,
+               stats.fuzz_cases as f64 / time::elapsed(self.start),
+               self.coverage.len());
+        for (reason, freq) in stats.vmexits.iter() {
+            print!("    {:12} {:x?}\n", freq, reason);
         }
     }
 }
@@ -190,21 +268,38 @@ impl Rng {
     }
 }
 
-/// A worker for fuzzing a `SnapshottedApp`
+/// A worker for fuzzing a `FuzzTarget`
 pub struct Worker<'a> {
     /// Snapshotted application that we're a worker for fuzzing
-    snapshot: &'a SnapshottedApp<'a>,
+    snapshot: &'a FuzzTarget<'a>,
 
     /// Virtual machine for running the application
-    vm: Vm,
+    pub vm: Vm,
 
     /// Random number generator seed
     pub rng: Rng,
+
+    /// This workers UDP connection to the server
+    udp: UdpBind,
+    
+    /// The network address for this worker's communication with the server
+    server: UdpAddress,
+
+    /// Local worker statistics, to be merged into the master on an interval
+    stats: Statistics,
+
+    /// `rdtsc` time of the next statistic sync
+    sync: u64,
 }
 
 impl<'a> Worker<'a> {
     /// Execute a single fuzz case until completion
-    pub fn run_fuzz_case(&mut self) {
+    /// Will exit with a timeout if `timeout` microseconds is exceeded
+    pub fn run_fuzz_case<I, F>(&mut self, timeout: Option<u64>,
+                               inject: I,
+                               mut vmexit_filter: F) -> VmExit
+            where I: FnOnce(&mut Worker),
+                  F: FnMut(&mut Worker, &VmExit) -> bool {
         // Load the original snapshot registers
         self.vm.guest_regs = self.snapshot.snapshot_info.regs;
        
@@ -232,11 +327,21 @@ impl<'a> Worker<'a> {
                 "intel", "volatile");
             });
         }
-        
+
+        // Invoke the injection callback
+        inject(self);
+
         // Counter of number of single steps we should perform
         let mut single_step = 0;
 
-        'vm_loop: loop {
+        // Compute the timeout
+        let timeout = timeout.map(|x| time::future(x));
+
+        let vmexit = 'vm_loop: loop {
+            if cpu::rdtsc() >= timeout.unwrap_or(!0) {
+                break 'vm_loop VmExit::Timeout;
+            }
+
             // Check if single stepping is requested
             if single_step > 0 {
                 // Enable single stepping
@@ -251,52 +356,30 @@ impl<'a> Worker<'a> {
 
             // Set the pre-emption timer for randomly breaking into the VM
             // to record coverage information
-            self.vm.preemption_timer = Some((self.rng.rand() & 0xffff) as u32);
+            self.vm.preemption_timer = Some((self.rng.rand() & 0xfff) as u32);
 
             // Run the VM until a VM exit
-            let vmexit = self.vm.run();
+            let mut vmexit = self.vm.run();
 
             match vmexit {
-                VmExit::Exception(PageFault { addr, write, .. }) => {
+                VmExit::Exception(
+                        Exception::PageFault { addr, write, .. }) => {
                     if self.translate(addr, write).is_some() {
                         continue 'vm_loop;
                     }
                 }
-                VmExit::Exception(InvalidOpcode) => {
-                    // We assume invalid opcodes are syscalls
-                    let syscall = self.vm.guest_regs.rax;
-                    match syscall {
-                        0x7 => {
-                            // NtDeviceIoControlFile(), return
-                            // STATUS_INVALID_PARAMETER
-                            self.vm.guest_regs.rax  = 0xC000000D;
-                            self.vm.guest_regs.rip += 2;
-                            continue 'vm_loop;
-                        }
-                        0x8 => {
-                            // NtWriteFile(), end of fuzz case
-                            break 'vm_loop;
-                        }
-                        0x1a7 => {
-                            // NtSetThreadExecutionState(), return
-                            // STATUS_INVALID_PARAMETER
-                            self.vm.guest_regs.rax  = 0xC000000D;
-                            self.vm.guest_regs.rip += 2;
-                            continue 'vm_loop;
-                        }
-                        x @ _ => print!("Unhandled syscall {:#x}\n", x),
-                    }
-                }
-                VmExit::Exception(DebugException) => {
-                    if self.snapshot.coverage.lock()
-                            .insert(self.vm.guest_regs.rip) {
+                VmExit::Exception(Exception::DebugException) => {
+                    let rip = self.vm.guest_regs.rip;
+                    if self.snapshot.coverage.entry_or_insert(
+                            &rip, rip as usize, || Box::new(())).inserted() {
                         single_step = 1000;
                     }
                     continue 'vm_loop;
                 }
                 VmExit::PreemptionTimer => {
-                    if self.snapshot.coverage.lock()
-                            .insert(self.vm.guest_regs.rip) {
+                    let rip = self.vm.guest_regs.rip;
+                    if self.snapshot.coverage.entry_or_insert(
+                            &rip, rip as usize, || Box::new(())).inserted() {
                         single_step = 1000;
                     }
                     continue 'vm_loop;
@@ -305,15 +388,46 @@ impl<'a> Worker<'a> {
                     // Host interrupt happened, ignore it
                     continue 'vm_loop;
                 }
-                x @ _ => panic!("Unhandled VM exit {:?}", x),
+                _ => {},
+            }
+
+            // Convert a potential `InvalidOpcode` which could be a syscall
+            // into a syscall vmexit. This helps for tracking statistics and
+            // vmexit handling for the `vmexit_filter`
+            if vmexit == VmExit::Exception(Exception::InvalidOpcode) {
+                // Check if the reason for the invalid opcode was a syscall
+                let mut inst_bytes = [0u8; 2];
+                if self.read(VirtAddr(self.vm.guest_regs.rip),
+                        &mut inst_bytes).is_some() &&
+                        inst_bytes == [0x0f, 0x05] {
+                    vmexit = VmExit::Syscall(self.vm.guest_regs.rax as u32);
+                }
+            }
+            
+            // Attempt to handle the vmexit with the user's callback
+            if vmexit_filter(self, &vmexit) {
+                continue 'vm_loop;
             }
 
             // Unhandled VM exit, break
-            break 'vm_loop;
-        }
+            break 'vm_loop vmexit;
+        };
 
         // Update number of fuzz cases
-        self.snapshot.fuzz_cases.fetch_add(1, Ordering::SeqCst);
+        self.stats.fuzz_cases += 1;
+
+        // Update VM exit reason statistics
+        *self.stats.vmexits.entry(vmexit).or_insert(0) += 1;
+
+        // Sync the local statistics into the master on an interval
+        if cpu::rdtsc() >= self.sync {
+            self.stats.sync_into(&mut self.snapshot.stats.lock());
+
+            // Set the next sync time
+            self.sync = time::future(STATISTIC_SYNC_INTERVAL);
+        }
+
+        vmexit
     }
 
     /// Read the contents of the virtual memory at `vaddr` in the guest into
@@ -422,7 +536,7 @@ impl<'a> Worker<'a> {
 
         // Attempt to translate the page, it is possible it has not yet been
         // mapped and we need to page it in from the network mapped storage in
-        // the `SnapshottedApp`
+        // the `FuzzTarget`
         let translation = self.vm.page_table.translate(&mut pmem, align_addr,
                                                        write);
 

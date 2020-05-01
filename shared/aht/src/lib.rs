@@ -1,177 +1,167 @@
 //! Atomic hash table. Allows thread-safe atomic hash table insertions without
 //! needing locks
 
+#![feature(const_generics)]
+#![allow(incomplete_features)]
 #![no_std]
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-use core::marker::PhantomData;
-use alloc::vec::Vec;
+use core::mem::MaybeUninit;
+use core::borrow::Borrow;
+use core::alloc::Layout;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use alloc::boxed::Box;
+use alloc::alloc::alloc_zeroed;
+use alloc::borrow::ToOwned;
+
+/// Type for an internal hash table entry. Tuple is
+/// (pointer to boxed value, key)
+type HashTableEntry<K, V> = (AtomicPtr<V>, MaybeUninit<K>);
+
+/// Type used for a hash table internal table
+type HashTable<K, V, const N: usize> = [HashTableEntry<K, V>; N];
+
+/// An enum which contains information of whether an entry was inserted or
+/// already existed for returning from `entry_or_insert`
+pub enum Entry<'a, V> {
+    /// `V` is a reference to a value that was just inserted into the table
+    Inserted(&'a V),
+
+    /// `V` is a reference to an old entry in the table
+    Exists(&'a V),
+}
+
+impl<'a, V> Entry<'a, V> {
+    /// Gets a `bool` indicating if the entry was inserted
+    pub fn inserted(&self) -> bool { matches!(self, Entry::Inserted(..)) }
+
+    /// Gets a `bool` indicating if the entry already exists
+    pub fn exists(&self) -> bool { matches!(self, Entry::Exists(..)) }
+
+    /// Gets the reference to the entry
+    pub fn entry(&self) -> &'a V {
+        match self {
+            Entry::Inserted(x) => x,
+            Entry::Exists(x)   => x,
+        }
+    }
+}
 
 /// An atomic hash table that allows insertions and lookups in parallel.
 /// However resizing of the hash table or removing of entries is not supported.
-pub struct Aht<K: Copy + Eq + Default + Sync, V: Sync> {
+pub struct Aht<K, V, const N: usize> {
     /// Raw hash table
-    /// Tuple is (pointer to entry, key)
-    hash_table: Vec<(AtomicUsize, K)>,
+    hash_table: Box<HashTable<K, V, N>>,
 
-    /// List of all pointers to entries in the hash table. This allows the
-    /// hash table to be iterated cheaply.
-    contig_table: Vec<AtomicUsize>,
-
-    /// Number of entries present in the hash table
+    /// Number of entries currently present in the hash table
     entries: AtomicUsize,
-
-    /// Marker for the `T` used for the hash table
-    _phantom: PhantomData<V>,
 }
 
-/// Guard structure to give access to a hash table entry that we have exclusive
-/// access to
-pub struct HashEntry<'a, K: Copy + Eq + Default + Sync, V: Sync> {
-    /// Reference to the hash table this entry belongs to
-    aht: &'a Aht<K, V>,
+impl<K, V, const N: usize> Aht<K, V, N> {
+    /// Create a new atomic hash table
+    pub fn new() -> Self {
+        // Make sure the table is a power of two such that masks can be used
+        // to find hash table entries
+        assert!(N.count_ones() == 1, "Aht entries is not a power of two");
 
-    /// Index into the hash table which this entry corresponds to
-    index: usize,
-}
+        // Determine the layout for an allocation to satisfy an array of `N`
+        // `HashTableEntry`'s
+        let layout = Layout::array::<HashTableEntry<K, V>>(N)
+            .expect("Invalid shape for Aht");
 
-impl<'a, K: Copy + Eq + Default + Sync, V: Sync> HashEntry<'a, K, V> {
-    /// Fill in a missing hash table entry returned by `fetch_or_insert`
-    pub fn insert(self, entry: Box<V>) {
-        let entry = Box::into_raw(entry) as usize;
+        // Create a new, initialized-as-zero allocation
+        // This will create uninitialized keys, which are held in `MaybeUninit`
+        // and zeroed out `AtomicPtr`s, which are "empty" entries in the table
+        let allocation = unsafe { alloc_zeroed(layout) };
+        let allocation = allocation as *mut HashTable<K, V, N>;
+        assert!(!allocation.is_null(), "Allocation failure for Aht");
 
-        // Update the corresponding hash table entry with the provided `entry`
-        self.aht.hash_table[self.index].0
-            .store(entry, Ordering::SeqCst);
-        let cidx = self.aht.entries.fetch_add(1, Ordering::SeqCst);
-        self.aht.contig_table[cidx].store(entry, Ordering::SeqCst);
-    }
-}
-
-impl<K: Copy + Eq + Default + Sync, V: Sync> Aht<K, V> {
-    /// Create a new atomic hash table capable of holding `entries` entries
-    pub fn new(entries: usize) -> Aht<K, V> {
-        assert!(entries.count_ones() == 1, "entries is not a power of two");
-
-        // Create the backing for the hash table
-        let mut data = Vec::with_capacity(entries);
-        for _ in 0..entries {
-            data.push((AtomicUsize::new(0), K::default()));
-        }
-        
-        // Create the backing for the contiguous region
-        let mut contig = Vec::with_capacity(entries);
-        for _ in 0..entries {
-            contig.push(AtomicUsize::new(0));
-        }
+        // Convert the new allocation into a `Box`
+        let boxed = unsafe { Box::from_raw(allocation) };
 
         Aht {
-            hash_table:   data,
-            entries:      AtomicUsize::new(0),
-            contig_table: contig,
-            _phantom:     PhantomData,
+            hash_table: boxed,
+            entries:    AtomicUsize::new(0),
         }
     }
 
-    /// Creates an atomic hash table from an existing hash table.
-    /// Since we have no way to correctly de-allocate the backing, this will
-    /// never be able to be freed.
-    /// 
-    /// For correct behavior, `backing` must be entirely zeroed out.
-    pub unsafe fn from_existing(entries: usize,
-            backing: *mut (AtomicUsize, K), contig: *mut AtomicUsize)
-            -> Aht<K, V> {
-        assert!(entries.count_ones() == 1, "entries is not a power of two");
+    /// Get the number of entries in this hash table
+    pub fn len(&self) -> usize { self.entries.load(Ordering::SeqCst) }
+    
+    /// Insert a `key` into the hash table using `hash` as the first index
+    /// into the table.
+    ///
+    /// If `key` is not present in the hash table, `insert` will be invoked to
+    /// produce a value which will be inserted.
+    ///
+    /// Returns a reference to the inserted or old entry in the table
+    /// If the key was already in the table, returns `Err(ref old entry)`
+    /// otherwise it returns `Ok(ref new entry)`
+    pub fn entry_or_insert<F, Q>(&self, key: &Q, mut hash: usize,
+                                 insert: F) -> Entry<V>
+            where F: FnOnce() -> Box<V>,
+                  K: Borrow<Q>,
+                  Q: Eq + ToOwned + ?Sized,
+                  Q::Owned: Into<K> {
+        // Mask used to index the hash table
+        let mask = N - 1;
 
-        Aht {
-            hash_table:   Vec::from_raw_parts(backing, entries, entries),
-            entries:      AtomicUsize::new(0),
-            _phantom:     PhantomData,
-            contig_table: Vec::from_raw_parts(contig, entries, entries),
-        }
-    }
-
-    /// Get the number of entires present in the hash table
-    pub fn len(&self) -> usize {
-        self.entries.load(Ordering::SeqCst)
-    }
-
-    /// Get an entry from the hash table based on the index
-    pub fn get(&self, idx: usize) -> Option<&V> {
-        let dbsize = self.len();
-
-        // Make sure the index is in bounds
-        if idx >= dbsize {
-            return None;
-        }
-
-        // Make sure this entry has been filled in
-        if self.contig_table[idx].load(Ordering::SeqCst) == 0 {
-            return None;
-        }
-        
-        // Return the entry!
-        let reference = self.contig_table[idx]
-            .load(Ordering::SeqCst) as *const V;
-
-        Some(unsafe { &*reference })
-    }
-
-    /// Attempt to insert `hash` into `self`. Returns `Ok` and a reference to
-    /// the existing entry if one already exists with the same hash, otherwise
-    /// it returns a `Err(HashEntry)` which must be used to insert a valid
-    /// entry into the hash table.
-    pub fn fetch_or_insert(&self, key: K, hash: u128)
-            -> Result<&V, HashEntry<K, V>> {
-        // Get the low part of the hash
-        let mut fh_low = hash as usize;
-
-        // Compute the mask used to index the hash table
-        let mask = self.hash_table.len() - 1;
+        let empty:   *mut V =  0 as *mut V;
+        let filling: *mut V = !0 as *mut V;
 
         for attempts in 0usize.. {
             // Check if there are no free entries left in the hash table
-            assert!(attempts < self.hash_table.len(),
-                "Out of entries in the atomic hash map");
+            assert!(attempts < N, "Out of entries in the atomic hash table");
 
             // Get the index into the hash table for this entry
-            let hash_table_idx = fh_low & mask;
+            let hti = hash & mask;
 
             // Try to get exclusive access to this hash table entry
-            if self.hash_table[hash_table_idx].0.load(Ordering::SeqCst) == 0 &&
-                    self.hash_table[hash_table_idx].0
-                    .compare_and_swap(0, 1, Ordering::SeqCst) == 0 {
+            if self.hash_table[hti].0.load(Ordering::SeqCst) == empty &&
+                    self.hash_table[hti].0
+                        .compare_and_swap(empty, filling,
+                                          Ordering::SeqCst) == empty {
+                // Request the caller to create the entry
+                let ent = Box::into_raw(insert());
+
+                // Make sure the pointer doesn't end up turning into one of
+                // the reserved values we use for our hash table internals.
+                assert!(ent != empty && ent != filling,
+                    "Invalid pointer value for Aht");
+                
                 // Save the key into the table. It is safe to fill this entry
                 // in with an immutable reference as we have exclusive access
                 // to it
                 unsafe {
-                    (*(&self.hash_table as *const Vec<(AtomicUsize, K)> as 
-                        *mut Vec<(AtomicUsize, K)>))
-                        [hash_table_idx].1 = key;
+                    let ht = self.hash_table[hti].1.as_ptr() as *mut K;
+                    core::ptr::write(ht, key.to_owned().into());
                 }
 
-                // Return out the the user to fill in this entry
-                return Err(HashEntry {
-                    aht:   self,
-                    index: hash_table_idx,
-                });
+                // Fill in the entry
+                self.hash_table[hti].0.store(ent, Ordering::SeqCst);
+
+                // Update number of entries in our table
+                self.entries.fetch_add(1, Ordering::SeqCst);
+
+                // Return a reference to the newly created data
+                return Entry::Inserted(unsafe { &*ent });
             } else {
                 // Either we lost the race, or the entry was valid. Lets wait
                 // for it to become valid first.
 
                 // Loop forever until this entry in the hash table is valid
-                while self.hash_table[hash_table_idx]
-                    .0.load(Ordering::SeqCst) == 1 {}
+                while self.hash_table[hti]
+                    .0.load(Ordering::SeqCst) == filling {}
 
-                if key == self.hash_table[hash_table_idx].1 {
+                // Now that we know the entry is valid, check if the keys match
+                if key == unsafe {
+                        (*self.hash_table[hti].1.as_ptr()).borrow() } {
                     // Entry is already in the map, just return the existing
                     // entry!
-                    let reference = self.hash_table[hash_table_idx].0
+                    let reference = self.hash_table[hti].0
                         .load(Ordering::SeqCst) as *const V;
-                    return Ok(unsafe { &*reference });
+                    return Entry::Exists(unsafe { &*reference });
                 } else {
                     // There was a collision in the hash table for this entry.
                     // We were stored at the same index, however we were not
@@ -182,9 +172,54 @@ impl<K: Copy + Eq + Default + Sync, V: Sync> Aht<K, V> {
             }
 
             // Advance to the next index in the hash table
-            fh_low = fh_low.wrapping_add(1);
+            hash = hash.wrapping_add(1);
         }
 
         unreachable!("Unreachable");
     }
 }
+
+impl<K, V, const N: usize> Drop for Aht<K, V, N> {
+    fn drop(&mut self) {
+        for ii in 0..N {
+            // Get the entry
+            let ptr = self.hash_table[ii].0.load(Ordering::SeqCst);
+
+            // It should be impossible to `Drop` while an entry is being filled
+            // in
+            assert!(ptr != !0usize as *mut V);
+
+            if !ptr.is_null() {
+                // Drop the value
+                unsafe { Box::from_raw(ptr); }
+
+                // Drop the key as well, as it's not automatically dropped due
+                // to `MaybeUninit`
+                unsafe {
+                    core::ptr::drop_in_place(
+                        self.hash_table[ii].1.as_mut_ptr())
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::*;
+
+    extern crate std;
+    use alloc::string::String;
+
+    #[test]
+    fn test() {
+        let mut table: Aht<u32, u64, 64> = Aht::new();
+        let foo1 = table.entry_or_insert(&11, 50, || Box::new(57));
+        assert!(*foo1 == 57);
+        let foo2 = table.entry_or_insert(&15, 50, || Box::new(52));
+        assert!(*foo2 == 52);
+        let foo3 = table.entry_or_insert(&11, 50, || Box::new(1111));
+        assert!(*foo3 == 57);
+    }
+}
+

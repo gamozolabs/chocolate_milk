@@ -413,7 +413,7 @@ pub struct RegisterState {
 }
 
 /// An x86 exception
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Exception {
     DivideError,
     DebugException,
@@ -489,11 +489,13 @@ impl From<u8> for Exception {
 }
 
 /// Virtual machine exit reason
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum VmExit {
     Exception(Exception),
     ExternalInterrupt,
     PreemptionTimer,
+    Timeout,
+    Syscall(u32),
 }
 
 /// A virtual machine using Intel VT-x extensions

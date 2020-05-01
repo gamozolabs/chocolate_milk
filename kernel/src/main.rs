@@ -1,7 +1,8 @@
 //! A kernel written all in Rust
 
 #![feature(panic_info_message, alloc_error_handler, llvm_asm, global_asm)]
-#![feature(const_in_array_repeat_expressions)]
+#![feature(const_in_array_repeat_expressions, const_generics)]
+#![allow(incomplete_features)]
 
 #![no_std]
 #![no_main]
@@ -31,7 +32,7 @@ pub mod snapshotted_app;
 use lockcell::LockCell;
 use page_table::PhysAddr;
 use core_locals::LockInterrupts;
-use snapshotted_app::SnapshottedApp;
+use snapshotted_app::FuzzTarget;
 
 /// Release the early boot stack such that other cores can use it by marking
 /// it as available
@@ -85,12 +86,10 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     acpi::core_checkin();
 
     {
-        use core::sync::atomic::Ordering;
         use alloc::sync::Arc;
-        use page_table::VirtAddr;
 
         static SNAPSHOT:
-            LockCell<Option<Arc<SnapshottedApp>>, LockInterrupts> =
+            LockCell<Option<Arc<FuzzTarget>>, LockInterrupts> =
             LockCell::new(None);
 
         // Create the master snapshot, and fork from it for all cores
@@ -99,49 +98,14 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
             if snap.is_none() {
                 *snap = Some(
                     Arc::new(
-                        SnapshottedApp::new("192.168.101.1:1911", "falkdump")
+                        FuzzTarget::new("192.168.101.1:1911", "falkdump_pid_00000000000000000424_tid_00000000000000000440")
                     )
                 );
             }
             snap.as_ref().unwrap().clone()
         };
-
-        //if core!().id != 0 { cpu::halt(); }
-
-        // Create a new worker for the snapshot
-        let mut worker = snapshot.worker();
-
-        // Save the current time and compute a time in the future to print
-        // status messages
-        let it = cpu::rdtsc();
-        let mut next_print = time::future(1_000_000);
-
-        /// Buffer for the file contents in WinRAR
-        const BUFFER_ADDR: VirtAddr = VirtAddr(0x02bcbb1b7040);
-        const BUFFER_SIZE: usize    = 0x2123;
-
-        loop {
-            if core!().id == 0 && cpu::rdtsc() >= next_print {
-                let fuzz_cases = snapshot.fuzz_cases.load(Ordering::SeqCst);
-                let coverage   = snapshot.coverage.lock().len();
-
-                print!("{:12} cases | {:12.3} fcps | {:6} coverage\n",
-                       fuzz_cases, fuzz_cases as f64 / time::elapsed(it),
-                       coverage);
-                next_print = time::future(1_000_000);
-            }
-
-            // Corrupt the input
-            {
-                for _ in 0..worker.rng.rand() % 64 {
-                    let offset = worker.rng.rand() % BUFFER_SIZE;
-                    worker.write(VirtAddr(BUFFER_ADDR.0 + offset as u64),
-                        &[worker.rng.rand() as u8]).unwrap();
-                }
-            }
-
-            worker.run_fuzz_case();
-        }
     }
+
+    cpu::halt();
 }
 
