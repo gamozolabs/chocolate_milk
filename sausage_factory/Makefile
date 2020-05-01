@@ -1,5 +1,5 @@
-#SERVER = 192.168.122.21
-SERVER = REDMOND\\brfalk@192.168.100.129
+SERVER = 192.168.122.21
+#SERVER = REDMOND\\brfalk@192.168.100.129
 
 all:
 	scp -r ../sausage_factory $(SERVER):

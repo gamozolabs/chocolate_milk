@@ -5,6 +5,10 @@ name = "aht"
 version = "0.1.0"
 
 [[package]]
+name = "atomicvec"
+version = "0.1.0"
+
+[[package]]
 name = "boot_args"
 version = "0.1.0"
 dependencies = [
@@ -34,6 +38,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "aht",
+ "atomicvec",
  "boot_args",
  "core_reqs",
  "cpu",

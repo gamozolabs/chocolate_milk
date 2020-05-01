@@ -304,7 +304,7 @@ impl PageTable {
         let mut freed = 0u64;
 
         // Translate the initial page
-        let mut cur_page = self.translate(phys_mem, vaddr, false).unwrap();
+        let mut cur_page = self.translate(phys_mem, vaddr).unwrap();
         
         loop {
             // Get the virtual address and size of this page
@@ -423,7 +423,7 @@ impl PageTable {
 
             // Otherwise, we've got more to do!
             cur_page =
-                self.translate(phys_mem, VirtAddr(next_page.unwrap()), false)
+                self.translate(phys_mem, VirtAddr(next_page.unwrap()))
                 .expect("Failed to translate virtual address during free");
         }
 
@@ -460,11 +460,37 @@ impl PageTable {
     /// Translate a virtual address in the `self` page table into its
     /// components. This will include entries for every level in the table as
     /// well as the final page result if the page is mapped and present.
+    pub fn translate<P: PhysMem>(&self, phys_mem: &mut P, vaddr: VirtAddr)
+            -> Option<Mapping> {
+        unsafe {
+            (*(self as *const Self as *mut Self))
+                .translate_int(phys_mem, vaddr, false)
+        }
+    }
+    
+    /// Translate a virtual address in the `self` page table into its
+    /// components. This will include entries for every level in the table as
+    /// well as the final page result if the page is mapped and present.
     ///
     /// If `dirty` is set to `true`, then the accessed and dirty bits will be
     /// set during the page table walk.
-    pub fn translate<P: PhysMem>(&self, phys_mem: &mut P,
-                                 vaddr: VirtAddr, dirty: bool)
+    pub fn translate_dirty<P: PhysMem>(&mut self, 
+                                       phys_mem: &mut P, vaddr: VirtAddr,
+                                       dirty: bool)
+            -> Option<Mapping> {
+        unsafe {
+            self.translate_int(phys_mem, vaddr, dirty)
+        }
+    }
+
+    /// Translate a virtual address in the `self` page table into its
+    /// components. This will include entries for every level in the table as
+    /// well as the final page result if the page is mapped and present.
+    ///
+    /// If `dirty` is set to `true`, then the accessed and dirty bits will be
+    /// set during the page table walk.
+    pub unsafe fn translate_int<P: PhysMem>(&mut self, phys_mem: &mut P,
+                                            vaddr: VirtAddr, dirty: bool)
             -> Option<Mapping> {
         // Start off with an empty mapping
         let mut ret = Mapping {
@@ -505,8 +531,8 @@ impl PageTable {
             }
 
             // Get a virtual address for this entry
-            let vad = unsafe { phys_mem.translate(ptp, size_of::<u64>()) };
-            let ent = unsafe { core::ptr::read(vad as *const u64) };
+            let vad = phys_mem.translate(ptp, size_of::<u64>());
+            let ent = core::ptr::read(vad as *const u64);
 
             // Check if this page is present
             if (ent & PAGE_PRESENT) == 0 {
@@ -516,10 +542,8 @@ impl PageTable {
 
             // Update dirty bits if requested
             if dirty {
-                unsafe {
-                    core::ptr::write_volatile(vad as *mut u64,
-                        ent | PAGE_DIRTY | PAGE_ACCESSED);
-                }
+                core::ptr::write_volatile(vad as *mut u64,
+                    ent | PAGE_DIRTY | PAGE_ACCESSED);
             }
 
             // Update the table to point to the next level
@@ -584,7 +608,7 @@ impl PageTable {
         }
 
         // Determine the state of the existing mapping
-        let mapping = self.translate(phys_mem, vaddr, false)?;
+        let mapping = self.translate(phys_mem, vaddr)?;
 
         // Page already mapped
         if mapping.page.is_some() {

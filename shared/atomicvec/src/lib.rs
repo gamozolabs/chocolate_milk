@@ -1,6 +1,6 @@
 //! An atomic vector with a fixed size capacity and insert-only semantics
 
-//#![no_std]
+#![no_std]
 #![feature(const_generics, track_caller)]
 #![allow(incomplete_features)]
 

@@ -8,6 +8,14 @@ use alloc::borrow::Cow;
 use noodle::*;
 
 noodle!(serialize, deserialize,
+    #[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
+    pub struct CoverageRecord<'a> {
+        pub module: Option<Cow<'a, str>>,
+        pub offset: u64,
+    }
+);
+
+noodle!(serialize, deserialize,
 /// Messages sent to and from the server for network mapped files
 #[derive(Debug)]
 pub enum ServerMessage<'a> {
@@ -47,5 +55,22 @@ pub enum ServerMessage<'a> {
 
     /// Indicates that reading the file failed
     ReadErr,
+
+    /// Log in as a new fuzzer
+    Login(u64, u32),
+
+    /// Acknowledge a login
+    LoginAck(u64, u32),
+    
+    /// Report new coverage to the server
+    ReportCoverage(Cow<'a, CoverageRecord<'a>>),
+    
+    /// Acknowledge coverage was reported
+    ReportCoverageAck(Cow<'a, CoverageRecord<'a>>),
+
+    /// Report new statistics (always the totals)
+    ReportStatistics {
+        fuzz_cases: u64,
+    },
 });
 

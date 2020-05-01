@@ -61,10 +61,6 @@ pub struct Aht<K, V, const N: usize> {
 impl<K, V, const N: usize> Aht<K, V, N> {
     /// Create a new atomic hash table
     pub fn new() -> Self {
-        // Make sure the table is a power of two such that masks can be used
-        // to find hash table entries
-        assert!(N.count_ones() == 1, "Aht entries is not a power of two");
-
         // Determine the layout for an allocation to satisfy an array of `N`
         // `HashTableEntry`'s
         let layout = Layout::array::<HashTableEntry<K, V>>(N)
@@ -104,9 +100,6 @@ impl<K, V, const N: usize> Aht<K, V, N> {
                   K: Borrow<Q>,
                   Q: Eq + ToOwned + ?Sized,
                   Q::Owned: Into<K> {
-        // Mask used to index the hash table
-        let mask = N - 1;
-
         let empty:   *mut V =  0 as *mut V;
         let filling: *mut V = !0 as *mut V;
 
@@ -115,7 +108,7 @@ impl<K, V, const N: usize> Aht<K, V, N> {
             assert!(attempts < N, "Out of entries in the atomic hash table");
 
             // Get the index into the hash table for this entry
-            let hti = hash & mask;
+            let hti = hash % N;
 
             // Try to get exclusive access to this hash table entry
             if self.hash_table[hti].0.load(Ordering::SeqCst) == empty &&

@@ -12,9 +12,22 @@
 #define TEST_ON_SELF
 
 #ifdef TEST_ON_SELF
-void
-hook_me(void) {
-    printf("Hello world\n");
+static void
+hook_me(uint8_t *buf, size_t len) {
+    if(len != 5) return;
+
+    if(buf[0] == 'h') {
+        if(buf[1] == 'e') {
+            if(buf[2] == 'l') {
+                if(buf[3] == 'l') {
+                    if(buf[4] == 'o') {
+                        *(volatile char*)(0x123344528) = 0;
+                    }
+                }
+            }
+        }
+    }
+
     return;
 }
 #endif
@@ -106,10 +119,11 @@ main(int argc, char *argv[])
         return -1;
     }
 
-    printf("Injected!\n");
+    printf("Injected to %p!\n", (void*)snapshot_addr);
 
 #ifdef TEST_ON_SELF
-    hook_me();
+    uint8_t *buf = malloc(128);
+    hook_me(buf, 128);
 #endif
 
     return 0;
