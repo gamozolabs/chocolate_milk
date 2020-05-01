@@ -121,6 +121,37 @@ fn check_install(command: &str, args: &[&str],
     }
 }
 
+// Perform `cargo check` on the bootloader and the kernel.
+// Fails if there were any warnings.
+fn check_warnings() -> Result<(), Box<dyn Error>> {
+    // Check the bootloader
+    let bootloader_build_dir =
+        Path::new("build").join("bootloader").canonicalize()?;
+    if !Command::new("cargo")
+            .current_dir("bootloader")
+            .env("RUSTFLAGS", "-Dwarnings")
+            .args(&[
+                "check", "--release", "--target-dir",
+                bootloader_build_dir.to_str().unwrap()
+            ]).status()?.success() {
+        return Err("Failed to build bootloader".into());
+    }
+
+    // Check the kernel
+    let kernel_build_dir =
+        Path::new("build").join("kernel").canonicalize()?;
+    if !Command::new("cargo")
+            .current_dir("kernel")
+            .env("RUSTFLAGS", "-Dwarnings")
+            .args(&[
+                "check", "--release", "--target-dir",
+                kernel_build_dir.to_str().unwrap()
+            ]).status()?.success() {
+        return Err("Failed to kernel".into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -134,6 +165,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         return Ok(());
+    }
+
+    if args.len() == 2 && args[1] == "check" {
+        return check_warnings();
     }
 
     // Check for nasm
