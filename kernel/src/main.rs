@@ -93,7 +93,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
             LockCell::new(None);
 
         // Create the master snapshot, and fork from it for all cores
-        let snapshot = {
+        let _snapshot = {
             let mut snap = SNAPSHOT.lock();
             if snap.is_none() {
                 *snap = Some(

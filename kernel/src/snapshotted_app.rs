@@ -223,8 +223,8 @@ impl<'a> FuzzTarget<'a> {
             vm:       vm,
             rng:      Rng::new(),
             stats:    Default::default(),
-            server:   server,
-            udp:      udp,
+            _server:  server,
+            _udp:     udp,
             sync:     0,
         }
     }
@@ -280,10 +280,10 @@ pub struct Worker<'a> {
     pub rng: Rng,
 
     /// This workers UDP connection to the server
-    udp: UdpBind,
+    _udp: UdpBind,
     
     /// The network address for this worker's communication with the server
-    server: UdpAddress,
+    _server: UdpAddress,
 
     /// Local worker statistics, to be merged into the master on an interval
     stats: Statistics,
