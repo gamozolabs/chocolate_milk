@@ -11,6 +11,7 @@ extern crate alloc;
 use core::mem::MaybeUninit;
 use core::convert::TryInto;
 use alloc::vec::Vec;
+use alloc::sync::Arc;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::borrow::{Cow, ToOwned};
@@ -224,6 +225,21 @@ impl<T: Deserialize> Deserialize for Box<T> {
     fn deserialize<R: Reader>(reader: &mut R) -> Option<Self> {
         let thing: T = Deserialize::deserialize(reader)?;
         Some(Box::new(thing))
+    }
+}
+
+/// Implement `Serialize` for `Arc`
+impl<T: Serialize> Serialize for Arc<T> {
+    fn serialize<W: Writer>(&self, writer: &mut W) -> Option<()> {
+        Serialize::serialize(self.as_ref(), writer)
+    }
+}
+
+/// Implement `Deserialize` for `Arc`
+impl<T: Deserialize> Deserialize for Arc<T> {
+    fn deserialize<R: Reader>(reader: &mut R) -> Option<Self> {
+        let thing: T = Deserialize::deserialize(reader)?;
+        Some(Arc::new(thing))
     }
 }
 

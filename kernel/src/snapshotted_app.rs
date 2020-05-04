@@ -238,7 +238,7 @@ pub struct Worker<'a, C> {
     /// List of all modules
     /// Maps from base address to module, to end of module (inclusive) and the
     /// module name
-    module_list: BTreeMap<u64, (u64, String)>,
+    module_list: BTreeMap<u64, (u64, Arc<String>)>,
 }
 
 impl<'a, C> Worker<'a, C> {
@@ -574,11 +574,11 @@ impl<'a, C> Worker<'a, C> {
 
     /// Attempt to resolve the `addr` into a module + offset based on the
     /// current `module_list`
-    pub fn resolve_module(&mut self, addr: u64) -> (Option<&str>, u64) {
+    pub fn resolve_module(&mut self, addr: u64) -> (Option<&Arc<String>>, u64){
         if let Some((base, (end, name))) =
                 self.module_list.range(..=addr).next_back() {
             if addr <= *end {
-                (Some(&name), addr - base)
+                (Some(name), addr - base)
             } else {
                 (None, addr)
             }
@@ -631,9 +631,7 @@ impl<'a, C> Worker<'a, C> {
             }
 
             // Convert the module name into a UTF-8 Rust string
-            let name_utf8 = String::from_utf16(&name).ok()?;
-
-            print!("WOO {} {:x} {:x}\n", name_utf8, base, size);
+            let name_utf8 = Arc::new(String::from_utf16(&name).ok()?);
 
             // Save the module information into the module list
             module_list.insert(base,
@@ -1212,6 +1210,9 @@ pub struct FuzzSession<'a, C> {
     /// All observed coverage information
     coverage: Aht<CoverageRecord<'a>, (), 65536>,
 
+    /// Coverage which has yet to be reported to the server
+    pending_coverage: LockCell<Vec<CoverageRecord<'a>>, LockInterrupts>,
+
     /// Hash table of inputs
     input_dedup: Aht<Vec<u8>, (), 65536>,
 
@@ -1464,19 +1465,20 @@ impl<'a, C> FuzzSession<'a, C> {
             .expect("Couldn't resolve target address");
 
         FuzzSession {
-            master_vm:      Arc::new(master),
-            coverage:       Aht::new(),
-            stats:          LockCell::new(Statistics::default()),
-            timeout:        None,
-            inject:         None,
-            vmexit_filter:  None,
-            input_dedup:    Aht::new(),
-            inputs:         AtomicVec::new(),
-            server:         udp,
-            server_addr:    server_address,
-            workers:        AtomicU64::new(0),
-            id:             cpu::rdtsc(),
-            global_context: None,
+            master_vm:        Arc::new(master),
+            coverage:         Aht::new(),
+            pending_coverage: LockCell::new(Vec::new()),
+            stats:            LockCell::new(Statistics::default()),
+            timeout:          None,
+            inject:           None,
+            vmexit_filter:    None,
+            input_dedup:      Aht::new(),
+            inputs:           AtomicVec::new(),
+            server:           udp,
+            server_addr:      server_address,
+            workers:          AtomicU64::new(0),
+            id:               cpu::rdtsc(),
+            global_context:   None,
         }
     }
 
@@ -1584,6 +1586,13 @@ impl<'a, C> FuzzSession<'a, C> {
     pub fn report_coverage(&self, cr: &CoverageRecord) -> bool {
         if self.coverage.entry_or_insert(cr, cr.offset as usize,
                                          || Box::new(())).inserted() {
+            // Coverage was new, queue it to be reported to the server
+            self.pending_coverage.lock().push(CoverageRecord {
+                module: cr.module.as_ref().map(|x| Cow::Owned((**x).clone())),
+                offset: cr.offset,
+            });
+
+            /*
             // Coverage was new, report it to the server
             loop {
                 // Report the coverage
@@ -1618,7 +1627,7 @@ impl<'a, C> FuzzSession<'a, C> {
                         _ => None,
                     }
                 }).is_some() { break; }
-            }
+            }*/
 
             true
         } else {

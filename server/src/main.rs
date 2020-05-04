@@ -96,7 +96,7 @@ fn stats(coverage: Arc<Mutex<BTreeSet<CoverageRecord>>>,
             }
         }
 
-        let cases_delta = total_cases - last_cases;
+        let cases_delta = total_cases.saturating_sub(last_cases);
         let coverage = coverage.lock().unwrap().len();
         print!("\x1b[32;1mTOTALS: workers {:5} ({:3}) | cases {:14} \
                 [{:12.2} / s] | \

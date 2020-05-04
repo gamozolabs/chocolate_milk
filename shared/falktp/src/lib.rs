@@ -4,13 +4,15 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::borrow::Cow;
+use alloc::string::String;
 use noodle::*;
 
 noodle!(serialize, deserialize,
     #[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
     pub struct CoverageRecord<'a> {
-        pub module: Option<Cow<'a, str>>,
+        pub module: Option<Cow<'a, Arc<String>>>,
         pub offset: u64,
     }
 );
