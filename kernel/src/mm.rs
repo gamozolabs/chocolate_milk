@@ -92,6 +92,22 @@ pub fn alloc_virt_addr_4k(size: u64) -> VirtAddr {
     ret
 }
 
+/// Gets access to a slice of physical memory
+#[allow(dead_code)]
+#[inline]
+pub unsafe fn slice_phys<'a>(paddr: PhysAddr, size: u64) -> &'a [u8] {
+    let end = size.checked_sub(1).and_then(|x| {
+        x.checked_add(paddr.0)
+    }).expect("Integer overflow on read_phys");
+    assert!(end < KERNEL_PHYS_WINDOW_SIZE,
+            "Physical address outside of window");
+
+    // Return out a slice to this physical memory as mutable
+    core::slice::from_raw_parts(
+        (KERNEL_PHYS_WINDOW_BASE + paddr.0) as *const u8,
+        size as usize)
+}
+
 /// Gets mutable access to a slice of physical memory
 #[allow(dead_code)]
 #[inline]
@@ -270,37 +286,43 @@ impl PageFreeList {
 pub struct PhysicalMemory;
 
 impl PhysMem for PhysicalMemory {
-    unsafe fn translate(&mut self, paddr: PhysAddr, size: usize) -> *mut u8 {
+    unsafe fn translate(&mut self, paddr: PhysAddr, size: usize)
+            -> Option<*const u8> {
+        self.translate_mut(paddr, size).map(|x| x as *const u8)
+    }
+
+    unsafe fn translate_mut(&mut self, paddr: PhysAddr, size: usize)
+            -> Option<*mut u8> {
         // Compute the ending physical address
         let end = (size as u64).checked_sub(1).and_then(|x| {
             x.checked_add(paddr.0)
-        }).expect("Integer overflow on physical memory translation");
+        })?;
 
         // Make sure this physical address fits inside our window
-        assert!(end < KERNEL_PHYS_WINDOW_SIZE,
-                "Physical address outside of physical window");
+        if end >= KERNEL_PHYS_WINDOW_SIZE {
+            return None;
+        }
 
         // Convert the physical address into linear mapping view address
-        (paddr.0 + KERNEL_PHYS_WINDOW_BASE) as *mut u8
+        Some((paddr.0 + KERNEL_PHYS_WINDOW_BASE) as *mut u8)
     }
 
-    fn alloc_phys(&mut self, layout: Layout) -> PhysAddr {
+    fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
         if layout.size() == 4096 && layout.align() >= 4096 {
-            unsafe { core!().free_list().lock().pop() }
+            Some(unsafe { core!().free_list().lock().pop() })
         } else {
             // Get access to physical memory
             let mut phys_mem = unsafe {
                 core!().boot_args.free_memory_ref().lock()
             };
-            let phys_mem = phys_mem.as_mut().unwrap();
+            let phys_mem = phys_mem.as_mut()?;
 
             // Could not satisfy allocation from free list, allocate
             // directly from the physical memory pool
             let alc = phys_mem.allocate_prefer(layout.size() as u64,
                                                layout.align() as u64,
-                                               memory_range())
-                .expect("Failed to allocate physical memory");
-            PhysAddr(alc as u64)
+                                               memory_range())?;
+            Some(PhysAddr(alc as u64))
         }
     }
 
@@ -312,7 +334,7 @@ impl PhysMem for PhysicalMemory {
             // Compute the end address
             let end = size.checked_sub(1).and_then(|x| {
                 x.checked_add(phys.0)
-            }).expect("Integer overflow on free_phys");
+            }).unwrap();
 
             // Get access to physical memory
             let mut phys_mem = unsafe {
@@ -418,7 +440,8 @@ impl<T> PhysContig<T> {
         // Allocate physical memory for this allocation which is minimum
         // 4 KiB aligned
         let paddr = pmem.alloc_phys(Layout::from_size_align(
-            alc_size, core::cmp::max(4096, align_of::<T>())).unwrap());
+            alc_size, core::cmp::max(4096, align_of::<T>())).unwrap())
+            .unwrap();
         
         // Allocate a virtual address for this mapping
         let vaddr = alloc_virt_addr_4k(alc_size as u64);

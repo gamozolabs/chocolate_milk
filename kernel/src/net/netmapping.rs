@@ -85,6 +85,7 @@ impl PageFaultHandler for NetMapHandler {
 
                 // Allocate a page
                 pmem.alloc_phys(Layout::from_size_align(4096, 4096).unwrap())
+                    .unwrap()
             };
 
             // Get a mutable slice to the physical memory backing the page

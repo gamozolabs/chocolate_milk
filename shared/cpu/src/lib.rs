@@ -214,6 +214,22 @@ pub unsafe fn write_cr4(val: u64) {
     llvm_asm!("mov cr4, $0" :: "r"(val) : "memory" : "volatile", "intel");
 }
 
+/// Read `cr8`
+#[inline]
+pub fn read_cr8() -> u64 {
+    let val: u64;
+    unsafe {
+        llvm_asm!("mov $0, cr8" : "=r"(val) :: "memory" : "volatile", "intel");
+    }
+    val
+}
+
+/// Write to `cr8`
+#[inline]
+pub unsafe fn write_cr8(val: u64) {
+    llvm_asm!("mov cr8, $0" :: "r"(val) : "memory" : "volatile", "intel");
+}
+
 /// Gets the ES selector value
 #[inline]
 pub unsafe fn read_es() -> u16 {

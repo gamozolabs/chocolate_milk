@@ -70,7 +70,10 @@ pub enum ServerMessage<'a> {
 
     /// Report new statistics (always the totals)
     ReportStatistics {
-        fuzz_cases: u64,
+        fuzz_cases:   u64,
+        total_cycles: u64,
+        vm_cycles:    u64,
+        reset_cycles: u64,
     },
 });
 

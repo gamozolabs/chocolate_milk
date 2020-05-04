@@ -6,7 +6,6 @@ extern crate alloc;
 
 use core::mem::size_of;
 use core::alloc::Layout;
-use alloc::boxed::Box;
 
 /// Page table flag indicating the entry is valid
 pub const PAGE_PRESENT: u64 = 1 << 0;
@@ -117,26 +116,32 @@ pub struct VirtAddr(pub u64);
 pub trait PhysMem {
     /// Provide a virtual address to memory which contains the raw physical
     /// memory at `paddr` for `size` bytes
-    unsafe fn translate(&mut self, paddr: PhysAddr, size: usize) -> *mut u8;
+    unsafe fn translate(&mut self, paddr: PhysAddr, size: usize)
+        -> Option<*const u8>;
+    
+    /// Provide a virtual address to memory which contains the raw physical
+    /// memory at `paddr` for `size` bytes
+    unsafe fn translate_mut(&mut self, paddr: PhysAddr, size: usize)
+        -> Option<*mut u8>;
    
     /// Allocate physical memory with a requested layout
-    fn alloc_phys(&mut self, layout: Layout) -> PhysAddr;
+    fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr>;
 
     /// Free physical memory
     fn free_phys(&mut self, paddr: PhysAddr, size: u64);
 
     /// Same as `alloc_phys` but the memory will be zeroed
-    fn alloc_phys_zeroed(&mut self, layout: Layout) -> PhysAddr {
+    fn alloc_phys_zeroed(&mut self, layout: Layout) -> Option<PhysAddr> {
         // Create an allocation
-        let alc = self.alloc_phys(layout);
+        let alc = self.alloc_phys(layout)?;
 
         // Zero it out
         unsafe {
-            let bytes = self.translate(alc, layout.size());
+            let bytes = self.translate_mut(alc, layout.size())?;
             core::ptr::write_bytes(bytes, 0, layout.size());
         }
 
-        alc
+        Some(alc)
     }
 }
 
@@ -155,35 +160,24 @@ pub struct PageTable {
     /// The physical address of the top-level page table. This is typically
     /// the value in `cr3`, without the VPID bits.
     table: PhysAddr,
-
-    /// Tracks which tables and pages can be written to
-    /// Type for the `VirtAddr` is `Box<[u64; 512 / 64 + 512]>`
-    tracking: Option<VirtAddr>,
 }
 
 impl PageTable {
     /// Create a new empty page table
-    pub fn new<P: PhysMem>(phys_mem: &mut P) -> PageTable {
+    pub fn new<P: PhysMem>(phys_mem: &mut P) -> Option<Self> {
         // Allocate the root level table
         let table = phys_mem.alloc_phys_zeroed(
-            Layout::from_size_align(4096, 4096).unwrap());
+            Layout::from_size_align(4096, 4096).unwrap())?;
 
-        PageTable {
+        Some(PageTable {
             table,
-            tracking: None,
-        }
+        })
     }
-    
-    /// Create a new page table which tracks which pages are writable
-    pub fn new_tracking<P: PhysMem>(phys_mem: &mut P) -> PageTable {
-        // Allocate the root level table
-        let table = phys_mem.alloc_phys_zeroed(
-            Layout::from_size_align(4096, 4096).unwrap());
 
+    /// Create a page table from an existing page table
+    pub unsafe fn from_table(table: PhysAddr) -> Self {
         PageTable {
-            table,
-            tracking: Some(VirtAddr(
-                Box::into_raw(Box::new([0; 512 / 64 + 512])) as u64)),
+            table: PhysAddr(table.0 & 0xffffffffff000),
         }
     }
 
@@ -243,7 +237,7 @@ impl PageTable {
             // Allocate the page
             let page = phys_mem.alloc_phys(
                 Layout::from_size_align(page_size as usize,
-                                        page_size as usize).unwrap());
+                                        page_size as usize).unwrap())?;
 
             // Create the page table entry for this page
             let ent = page.0 | PAGE_PRESENT |
@@ -255,7 +249,8 @@ impl PageTable {
             if let Some(init) = &init {
                 // Translate the page
                 let sliced = unsafe {
-                    let bytes = phys_mem.translate(page, page_size as usize);
+                    let bytes = phys_mem.translate_mut(
+                        page, page_size as usize)?;
 
                     // Get access to the memory we just allocated
                     core::slice::from_raw_parts_mut(
@@ -292,9 +287,7 @@ impl PageTable {
     /// page tables which no longer contain any mappings will be unlinked from
     /// the table and also freed.
     pub unsafe fn free<P: PhysMem>(&mut self, phys_mem: &mut P,
-                                   vaddr: VirtAddr, size: u64) {
-        assert!(self.tracking.is_none(),
-            "Frees for tracking page tables not yet supported");
+                                   vaddr: VirtAddr, size: u64) -> Option<()> {
         // Determine the end of the mapping
         let end = vaddr.0.checked_add(
             size.checked_sub(1).expect("Virtual free of zero bytes"))
@@ -339,8 +332,8 @@ impl PageTable {
             'next_level: for (ii, &entry) in
                     table_entries.iter().enumerate().rev() {
                 // Convert the table entry into a virtual address
-                let vad = phys_mem.translate(
-                    entry, core::mem::size_of::<u64>());
+                let vad = phys_mem.translate_mut(
+                    entry, core::mem::size_of::<u64>())?;
 
                 // Unmap this entry as it is no longer used
                 core::ptr::write(vad as *mut u64, 0);
@@ -357,8 +350,8 @@ impl PageTable {
                     let next_entry = table_entries[ii - 1];
 
                     // Get the virtual address of the next entry
-                    let nvad = phys_mem.translate(
-                        next_entry, core::mem::size_of::<u64>());
+                    let nvad = phys_mem.translate_mut(
+                        next_entry, core::mem::size_of::<u64>())?;
 
                     // Read the next entry
                     let nent = core::ptr::read(nvad as *const u64);
@@ -455,6 +448,8 @@ impl PageTable {
             // unmapping a ~1 MiB allocation.
             cpu::write_cr3(cpu::read_cr3());
         }
+
+        Some(())
     }
 
     /// Translate a virtual address in the `self` page table into its
@@ -531,7 +526,11 @@ impl PageTable {
             }
 
             // Get a virtual address for this entry
-            let vad = phys_mem.translate(ptp, size_of::<u64>());
+            let vad = if dirty {
+                phys_mem.translate_mut(ptp, size_of::<u64>())?
+            } else {
+                phys_mem.translate(ptp, size_of::<u64>())?
+            };
             let ent = core::ptr::read(vad as *const u64);
 
             // Check if this page is present
@@ -594,11 +593,6 @@ impl PageTable {
     pub unsafe fn map_raw<P: PhysMem>(
             &mut self, phys_mem: &mut P, vaddr: VirtAddr, page_type: PageType,
             raw: u64) -> Option<()> {
-        // Only allow 4K pages in tracked mappings
-        if page_type != PageType::Page4K && self.tracking.is_some() {
-            return None;
-        }
-
         // We're mapping a non-present page or we're mapping a large page
         // without the page size bit set, this page will _never_ be valid so
         // just return fail.
@@ -652,27 +646,24 @@ impl PageTable {
             (vaddr.0 >> 12) & 0x1ff,
         ];
 
-        // Track the level into the tracking table
-        let mut tracking = self.tracking;
-
         // Create page tables as needed while walking to the final page
         for ii in 1..depth {
             // Check if there is a table along the path
             if entries[ii].is_none() {
                 // Allocate a new empty table
                 let table = phys_mem.alloc_phys_zeroed(
-                    Layout::from_size_align(4096, 4096).unwrap());
+                    Layout::from_size_align(4096, 4096).unwrap())?;
 
                 // Convert the address of the page table entry where we need
                 // to insert the new table
-                let ptr = phys_mem.translate(entries[ii - 1].unwrap(),
-                    core::mem::size_of::<u64>());
+                let ptr = phys_mem.translate_mut(entries[ii - 1].unwrap(),
+                    core::mem::size_of::<u64>())?;
 
                 if ii >= 2 {
                     // Get access to the entry with the reference count of the
                     // table we're updating
-                    let ptr = phys_mem.translate(entries[ii - 2].unwrap(),
-                        core::mem::size_of::<u64>());
+                    let ptr = phys_mem.translate_mut(entries[ii - 2].unwrap(),
+                        core::mem::size_of::<u64>())?;
                     
                     // Read the entry
                     let nent = core::ptr::read(ptr as *const u64);
@@ -686,22 +677,6 @@ impl PageTable {
                     core::ptr::write(ptr as *mut u64, nent);
                 }
 
-                if let Some(ttbl) = tracking {
-                    // Convert the tracking table into it's underlying type
-                    let ttbl = &mut *(ttbl.0 as *mut [u64; 512 / 64 + 512]);
-
-                    let bit = indicies[ii - 1] % 64;
-                    let idx = indicies[ii - 1] / 64;
-                    
-                    // Set that there is a table at this index
-                    ttbl[idx as usize] |= 1 << bit;
-
-                    // Create a new bit index table
-                    let nxt =
-                        Box::into_raw(Box::new([0u64; 512 / 64 + 512])) as u64;
-                    ttbl[512 / 64 + indicies[ii - 1] as usize] = nxt;
-                }
-
                 // Insert the new table at the entry in the table above us
                 core::ptr::write(ptr as *mut u64,
                     table.0 | PAGE_USER | PAGE_WRITE | PAGE_PRESENT);
@@ -711,22 +686,13 @@ impl PageTable {
                     table.0 + indicies[ii] * core::mem::size_of::<u64>() as u64
                 ));
             }
-
-            // Traverse the tracking table regardless of if we created a new
-            // page or not.
-            if let Some(ttbl) = tracking {
-                // Convert the tracking table into it's underlying type
-                let ttbl = &mut *(ttbl.0 as *mut [u64; 512 / 64 + 512]);
-                let nxt = ttbl[512 / 64 + indicies[ii - 1] as usize];
-                tracking = Some(VirtAddr(nxt));
-            }
         }
         
         {
             // Get access to the entry with the reference count of the
             // table we're updating with the new page
-            let ptr = phys_mem.translate(entries[depth - 2].unwrap(),
-                core::mem::size_of::<u64>());
+            let ptr = phys_mem.translate_mut(entries[depth - 2].unwrap(),
+                core::mem::size_of::<u64>())?;
             
             // Read the entry
             let nent = core::ptr::read(ptr as *const u64);
@@ -740,96 +706,13 @@ impl PageTable {
             core::ptr::write(ptr as *mut u64, nent);
         }
 
-        if let Some(ttbl) = tracking {
-            // Convert the tracking table into it's underlying type
-            let ttbl = &mut *(ttbl.0 as *mut [u64; 512 / 64 + 512]);
-
-            let bit = indicies[depth - 1] % 64;
-            let idx = indicies[depth - 1] / 64;
-            
-            // Set that there is a table at this index
-            ttbl[idx as usize] |= 1 << bit;
-        }
-
         // At this point, the tables have been created, and the page doesn't
         // already exist. Thus, we can write in the mapping!
-        let ptr = phys_mem.translate(entries[depth - 1].unwrap(),
-            core::mem::size_of::<u64>());
+        let ptr = phys_mem.translate_mut(entries[depth - 1].unwrap(),
+            core::mem::size_of::<u64>())?;
         core::ptr::write(ptr as *mut u64, raw);
 
         Some(())
-    }
-
-    /// Invoke a closure on every dirtied page
-    pub unsafe fn for_each_dirty_page<P, F>(&mut self, phys_mem: &mut P,
-                                            mut callback: F)
-            where P: PhysMem,
-                  F: FnMut(VirtAddr, PhysAddr) {
-        /// Accessed and present
-        const AP: u64 = PAGE_PRESENT | PAGE_ACCESSED;
-        
-        /// Accessed and dirty
-        const AD: u64 = PAGE_ACCESSED | PAGE_DIRTY;
-        
-        /// Dirty and present
-        const DP: u64 = PAGE_PRESENT | PAGE_DIRTY;
-
-        // Track the level into the tracking table
-        let tracking =
-            &*(self.tracking.unwrap().0 as *mut [u64; 512 / 64 + 512]);
-
-        let mut bit = [0u64; 4];
-
-        macro_rules! tracking {
-            ($rec:expr, $pt:expr, $tracking:expr, $e:expr, $($es:expr),+) => {
-                let table = phys_mem.translate($pt, 4096) as *mut u64;
-
-                for (ii, &bits) in $tracking[..512 / 64].iter().enumerate() {
-                    let mut bits: u64 = bits;
-                    while bits != 0 {
-                        let tz = bits.trailing_zeros() as u64;
-                        bits &= !(1 << tz);
-
-                        // Compute the page index
-                        let pfn = ii as u64 * 64 + tz;
-
-                        // Get the page table entry
-                        let pte = table.offset(pfn as isize);
-
-                        if $rec == 3 {
-                            // Skip the entry if it's not both dirty and
-                            // present
-                            if (*pte & DP) != DP { continue; }
-                        } else {
-                            // Skip the entry if it's not both accessed and
-                            // present
-                            if (*pte & AP) != AP { continue; }
-                        }
-
-                        // Clear the accessed and dirty bits
-                        *pte &= !AD;
-            
-                        // Compute the physical address of the table/page
-                        let _next_table = PhysAddr(*pte & 0xffffffffff000);
-
-                        bit[$rec] = pfn;
-                        let _tracking =
-                            &*($tracking[512 / 64 + bit[$rec] as usize] as
-                               *mut [u64; 512 / 64 + 512]);
-                        tracking!($rec + 1, _next_table, _tracking, $($es),*);
-                    }
-                }
-            };
-            ($rec:expr, $pt:expr, $tracking:expr, $e:expr) => {
-                let vaddr = VirtAddr(bit[0] << 39 |
-                                     bit[1] << 30 |
-                                     bit[2] << 21 |
-                                     bit[3] << 12);
-                callback(vaddr, $pt);
-            };
-        }
-        
-        tracking!(0, self.table(), tracking, 0, 0, 0, 0, 0);
     }
 }
 

@@ -29,6 +29,8 @@ pub mod time;
 pub mod vtx;
 pub mod snapshotted_app;
 pub mod test_fuzzer;
+pub mod ept;
+pub mod paging;
 
 use page_table::PhysAddr;
 
@@ -83,33 +85,12 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // NMIs and soft reboots work.
     acpi::core_checkin();
 
+    // ====================================================================
+    // Put your whatever code here, typically I just branch to a module
+    // which has a "main" or something and call `mod::main()`
+    // ====================================================================
+    
     test_fuzzer::fuzz();
-
-        /*
-        use alloc::sync::Arc;
-
-        FuzzJob::new()
-            .create_vm(create_vm);
-
-        snapshot.fuzz(Some(10_000), |worker| {
-            worker.vm.guest_regs.rip = 0x07ff7c6866e20;
-        },
-        |_worker, _vmexit| {
-            false
-        });
-
-        let mut next_print = time::future(1_000_000);
-        {
-            let mut worker = snapshot.worker();
-
-            loop {
-                if core!().id == 0 && cpu::rdtsc() >= next_print {
-                    snapshot.print_stats();
-                    next_print = time::future(1_000_000);
-                }
-            }
-        }
-    }*/
 
     cpu::halt();
 }

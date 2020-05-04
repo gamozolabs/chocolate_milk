@@ -35,6 +35,15 @@ struct Client<'a> {
 
     /// Number of fuzz cases performed on this client
     fuzz_cases: u64,
+    
+    /// Number of cycles spent resetting the VM
+    reset_cycles: u64,
+
+    /// Total cycles spent fuzzing
+    total_cycles: u64,
+
+    /// Number of cycles spent inside the VM
+    vm_cycles: u64,
 
     /// Set of coverage for this client
     coverage: BTreeSet<CoverageRecord<'a>>,
@@ -63,12 +72,20 @@ fn stats(coverage: Arc<Mutex<BTreeSet<CoverageRecord>>>,
 
             let uptime = (Instant::now() - client.first_packet).as_secs_f64();
 
+            let reset_pct =
+                client.reset_cycles as f64 / client.total_cycles as f64;
+            let vm_pct =
+                client.vm_cycles as f64 / client.total_cycles as f64;
+
             print!("\x1b[34;1m    workers {:3} | cov {:8} | \
-                        cases {:14} [{:12.2} / s] | {:15?} {}\x1b[0m\n",
+                        cases {:14} [{:12.2} / s] | vm {:8.4} | \
+                        reset {:8.4} | {:15?} {}\x1b[0m\n",
                    client.workers.len(),
                    client.coverage.len(),
                    client.fuzz_cases,
                    client.fuzz_cases as f64 / uptime,
+                   vm_pct,
+                   reset_pct,
                    addr.ip(),
                    if unresponsive { "???" } else { "" });
 
@@ -141,9 +158,13 @@ fn main() -> io::Result<()> {
             .expect("Failed to deserialize ServerMessage");
 
         match msg {
-            ServerMessage::ReportStatistics { fuzz_cases } => {
+            ServerMessage::ReportStatistics { fuzz_cases, total_cycles,
+                    vm_cycles, reset_cycles } => {
                 if let Some(client) = client {
-                    client.fuzz_cases = fuzz_cases;
+                    client.fuzz_cases   = fuzz_cases;
+                    client.total_cycles = total_cycles;
+                    client.vm_cycles    = vm_cycles;
+                    client.reset_cycles = reset_cycles;
                 }
             }
             ServerMessage::Login(session_id, core_id) => {
@@ -158,6 +179,9 @@ fn main() -> io::Result<()> {
                         first_packet: Instant::now(),
                         last_packet:  Instant::now(),
                         fuzz_cases:   0,
+                        total_cycles: 0,
+                        reset_cycles: 0,
+                        vm_cycles:    0,
                         coverage:     BTreeSet::new(),
                     });
                 }

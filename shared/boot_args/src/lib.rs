@@ -29,7 +29,7 @@ pub const KERNEL_PHYS_WINDOW_BASE: u64 = 0xffff_cafe_0000_0000;
 pub const KERNEL_VMEM_BASE: u64 = 0xffff_8000_0000_0000;
 
 /// Size to allocate for kernel stacks
-pub const KERNEL_STACK_SIZE: u64 = 128 * 1024;
+pub const KERNEL_STACK_SIZE: u64 = 512 * 1024;
 
 /// Padding deadspace to add between kernel stacks
 pub const KERNEL_STACK_PAD: u64 = 32 * 1024;

@@ -161,7 +161,8 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
             let mut pmem = mm::PhysicalMemory(pmem);
             
             // Create the trampoline page table
-            let mut trampoline_table = PageTable::new(&mut pmem);
+            let mut trampoline_table = PageTable::new(&mut pmem)
+                .expect("Failed to create trampoline table");
 
             // Create the 2 different physical map windows for the trampoline
             // page table
@@ -182,7 +183,8 @@ extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
             }
 
             // Create a new page table
-            let mut table = PageTable::new(&mut pmem);
+            let mut table = PageTable::new(&mut pmem)
+                .expect("Failed to create page table");
 
             // Get the support CPU features
             let features = cpu::get_cpu_features();

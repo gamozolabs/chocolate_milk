@@ -13,26 +13,30 @@ use rangeset::{Range, RangeSet};
 pub struct PhysicalMemory<'a>(pub &'a mut RangeSet);
 
 impl<'a> PhysMem for PhysicalMemory<'a> {
-    unsafe fn translate(&mut self, paddr: PhysAddr, size: usize) -> *mut u8 {
+    unsafe fn translate(&mut self, paddr: PhysAddr, size: usize)
+            -> Option<*const u8> {
+        self.translate_mut(paddr, size).map(|x| x as *const u8)
+    }
+
+    unsafe fn translate_mut(&mut self, paddr: PhysAddr, size: usize)
+            -> Option<*mut u8> {
         assert!(size > 0, "Attempted to translate zero size memory");
 
         // Convert the physical address into a `usize` which is addressable in
         // the bootloader
-        let paddr: usize = paddr.0.try_into()
-            .expect("Physical address outside of addressible range");
-        let _pend: usize = paddr.checked_add(size - 1)
-            .expect("Integer overflow on physical address translation");
+        let paddr: usize = paddr.0.try_into().ok()?;
+        let _pend: usize = paddr.checked_add(size - 1)?;
 
         // At this point, `paddr` for `size` bytes fits in the 32-bit address
         // space we have mapped in!
-        paddr as *mut u8
+        Some(paddr as *mut u8)
     }
 
-    fn alloc_phys(&mut self, layout: Layout) -> PhysAddr {
-        PhysAddr(
+    fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
+        Some(PhysAddr(
             self.0.allocate(layout.size() as u64, layout.align() as u64)
                 .expect("Failed to allocate physical memory") as u64
-        )
+        ))
     }
 
     fn free_phys(&mut self, addr: PhysAddr, size: u64) {

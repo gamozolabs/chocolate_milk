@@ -1,10 +1,10 @@
 //! Fuzzable snapshotted application backed by an Intel VT-x VM
 
-use core::cell::Cell;
 use core::mem::size_of;
+use core::cell::Cell;
+use core::convert::TryInto;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::alloc::Layout;
-use core::convert::TryInto;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
 use alloc::boxed::Box;
@@ -14,11 +14,13 @@ use alloc::collections::{BTreeMap};
 
 use crate::mm;
 use crate::time;
+use crate::ept::{EPT_READ, EPT_WRITE, EPT_EXEC, EPT_USER_EXEC};
+use crate::ept::EPT_MEMTYPE_WB;
 use crate::net::{NetDevice, UdpBind, UdpAddress};
-use crate::vtx::{Vm, FxSave, RegisterState, VmExit};
-use crate::vtx::Exception;
+use crate::vtx::{Vm, VmExit, Register, Exception, FxSave};
 use crate::net::netmapping::NetMapping;
 use crate::core_locals::LockInterrupts;
+use crate::paging::*;
 
 use aht::Aht;
 use falktp::{CoverageRecord, ServerMessage};
@@ -26,19 +28,29 @@ use noodle::*;
 use lockcell::LockCell;
 use atomicvec::AtomicVec;
 use page_table::{PhysAddr, VirtAddr, PhysMem, PageType, Mapping};
-use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_USER};
 
 /// Trait to allow conversion of slices of bytes to primitives and back
 /// generically
-pub trait Primitive: Sized {
-    fn cast(buf: &[u8]) -> Self;
+pub unsafe trait Primitive: Default + Sized {
+    fn cast(&self) -> &[u8];
+    fn cast_mut(&mut self) -> &mut [u8];
 }
 
 macro_rules! primitive {
     ($ty:ty) => {
-        impl Primitive for $ty {
-            fn cast(buf: &[u8]) -> Self {
-                <$ty>::from_ne_bytes(buf.try_into().unwrap())
+        unsafe impl Primitive for $ty {
+            fn cast(&self) -> &[u8] {
+                unsafe {
+                    core::slice::from_raw_parts(
+                        self as *const $ty as *const u8, size_of::<$ty>())
+                }
+            }
+            
+            fn cast_mut(&mut self) -> &mut [u8] {
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        self as *mut $ty as *mut u8, size_of::<$ty>())
+                }
             }
         }
     }
@@ -54,6 +66,61 @@ primitive!(i16);
 primitive!(i32);
 primitive!(i64);
 primitive!(i128);
+
+/// Different types of paging modes
+#[derive(Clone, Copy)]
+pub enum PagingMode {
+    /// 32-bit paging without PAE
+    Bits32,
+
+    /// 32-bit paging with PAE
+    Bits32Pae,
+
+    /// 4-level 64-bit paging
+    Bits64,
+}
+
+/// Different x86 segments
+#[derive(Clone, Copy)]
+pub enum Segment {
+    Es,
+    Ds,
+    Fs,
+    Gs,
+    Ss,
+    Cs,
+}
+
+/// Different addresses for x86
+#[derive(Clone, Copy)]
+pub enum Address {
+    /// Physical linear address
+    PhysicalLinear {
+        addr: u64
+    },
+
+    /// Physical address with a segment base and an offset
+    PhysicalSegOff {
+        seg: Segment,
+        off: u64,
+    },
+
+    /// Virtual address with a segment base, offset, paging mode, and a page
+    /// table
+    Virtual {
+        seg:  Segment,
+        off:  u64,
+        mode: PagingMode,
+        cr3:  u64
+    },
+
+    /// Linear address with a paging mode and a page table
+    Linear {
+        addr: u64,
+        mode: PagingMode,
+        cr3:  u64
+    },
+}
 
 /// Number of microseconds to wait before syncing worker statistics into the
 /// `FuzzTarget`
@@ -92,13 +159,22 @@ impl Rng {
 /// This structure is synced on `STATISTIC_SYNC_INTERVAL` from the workers to
 /// the master `FuzzTarget`. This interval based syncing ensures that the
 /// lock contention is kept low, regardless of number of fuzz cases or cores.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Statistics {
     /// Number of fuzz cases performed on the target
     fuzz_cases: u64,
 
-    /// Frequencies of various VM exit reasons
-    vmexits: BTreeMap<VmExit, u64>,
+    /// Number of cycles spent resetting the VM
+    reset_cycles: u64,
+
+    /// Total cycles spent fuzzing
+    total_cycles: u64,
+
+    /// Number of cycles spent inside the VM
+    vm_cycles: u64,
+
+    /// Number of VM exits
+    vmexits: u64,
 }
 
 impl Statistics {
@@ -107,36 +183,38 @@ impl Statistics {
     fn sync_into(&mut self, master: &mut Statistics) {
         // Merge number of fuzz cases
         master.fuzz_cases += self.fuzz_cases;
-
-        // Merge vmexit reasons
-        for (reason, freq) in self.vmexits.iter() {
-            *master.vmexits.entry(*reason).or_insert(0) += freq;
-        }
+        master.reset_cycles += self.reset_cycles;
+        master.vm_cycles += self.vm_cycles;
+        master.total_cycles += self.total_cycles;
+        master.vmexits += self.vmexits;
 
         // Reset our statistics
-        self.fuzz_cases = 0;
-        self.vmexits.clear();
+        *self = Default::default();
     }
 }
 
 /// Network backed VM memory information
 struct NetBacking<'a> {
-    /// Mapping of valid pages to their offsets in the `memory` buffer
-    virt_to_offset: BTreeMap<VirtAddr, usize>,
-
-    /// Raw memory backing the snasphot
+    /// Raw guest physical memory backing the snasphot
     memory: NetMapping<'a>,
+
+    /// Mapping of physical region base to offset into `memory` and the end
+    /// (inclusive) of the region
+    phys_ranges: BTreeMap<u64, (usize, u64)>,
 }
 
-pub struct Worker<'a> {
+pub struct Worker<'a, C> {
     /// Master worker that we are forked from
-    master: Option<Arc<Worker<'a>>>,
+    master: Option<Arc<Self>>,
 
     /// Network mapped memory for the VM
     network_mem: Option<Arc<NetBacking<'a>>>,
 
     /// The fuzz session this worker belongs to
-    session: Option<Arc<FuzzSession<'a>>>,
+    session: Option<Arc<FuzzSession<'a, C>>>,
+    
+    /// Optional user-controlled global context
+    pub global_context: Option<Arc<C>>,
 
     /// Raw virtual machine that this worker uses
     pub vm: Vm,
@@ -163,43 +241,45 @@ pub struct Worker<'a> {
     module_list: BTreeMap<u64, (u64, String)>,
 }
 
-impl<'a> Worker<'a> {
+impl<'a, C> Worker<'a, C> {
     /// Create a new empty VM from network backed memory
     fn from_net(memory: Arc<NetBacking<'a>>) -> Self {
         Worker {
-            master:      None,
-            network_mem: Some(memory),
-            vm:          Vm::new_user(),
-            rng:         Rng::new(),
-            stats:       Statistics::default(),
-            sync:        0,
-            session:     None,
-            worker_id:   !0,
-            module_list: BTreeMap::new(),
-            fuzz_input:  None,
+            master:         None,
+            network_mem:    Some(memory),
+            vm:             Vm::new(),
+            rng:            Rng::new(),
+            stats:          Statistics::default(),
+            sync:           0,
+            session:        None,
+            worker_id:      !0,
+            module_list:    BTreeMap::new(),
+            fuzz_input:     None,
+            global_context: None,
         }
     }
     
     /// Create a new VM forked from a master
-    fn fork(session: Arc<FuzzSession<'a>>, master: Arc<Self>, worker_id: u64)
-            -> Self {
+    fn fork(session: Arc<FuzzSession<'a, C>>,
+            master: Arc<Self>, worker_id: u64) -> Self {
         // Create a new VM with the masters guest registers as the current
         // register state
-        let mut vm = Vm::new_user();
-        vm.guest_regs = master.vm.guest_regs;
+        let mut vm = Vm::new();
+        vm.guest_regs.clone_from(&master.vm.guest_regs);
 
         // Create the new VM referencing the master
         Worker {
-            master:      Some(master),
-            network_mem: None,
-            vm:          vm,
-            rng:         Rng::new(),
-            stats:       Statistics::default(),
-            sync:        0,
-            session:     Some(session),
-            worker_id:   worker_id,
-            module_list: BTreeMap::new(),
-            fuzz_input:  Some(Vec::new()),
+            master:         Some(master),
+            network_mem:    None,
+            vm:             vm,
+            rng:            Rng::new(),
+            stats:          Statistics::default(),
+            sync:           0,
+            global_context: session.global_context.clone(),
+            session:        Some(session),
+            worker_id:      worker_id,
+            module_list:    BTreeMap::new(),
+            fuzz_input:     Some(Vec::new()),
         }
     }
 
@@ -222,6 +302,11 @@ impl<'a> Worker<'a> {
 
     /// Perform a single fuzz case to completion
     pub fn fuzz_case(&mut self) -> VmExit {
+        let fuzz_start = cpu::rdtsc();
+
+        // Start a timer
+        let it = cpu::rdtsc();
+
         // Get access to the session
         let session = self.session.as_ref().unwrap().clone();
 
@@ -229,12 +314,11 @@ impl<'a> Worker<'a> {
         let master = self.master.as_ref().expect("Cannot fuzz without master");
 
         // Load the original snapshot registers
-        self.vm.guest_regs = master.vm.guest_regs;
-       
+        self.vm.guest_regs.clone_from(&master.vm.guest_regs);
+
         // Reset memory to its original state
         unsafe {
-            self.vm.page_table.for_each_dirty_page(
-                    &mut mm::PhysicalMemory, |addr, page| {
+            self.vm.ept.for_each_dirty_page(|addr, page| {
                 let orig_page = master.get_page(addr)
                     .expect("Dirtied page without master!?");
 
@@ -255,6 +339,12 @@ impl<'a> Worker<'a> {
             });
         }
 
+        // Reset the VMCS state, this also invalidates the TLB entries since
+        // we have now changed the paging structures with EPT above
+        self.vm.reset();
+
+        self.stats.reset_cycles += cpu::rdtsc() - it;
+
         // Invoke the injection callback
         if let Some(inject) = session.inject {
             inject(self);
@@ -274,31 +364,149 @@ impl<'a> Worker<'a> {
             // Check if single stepping is requested
             if single_step > 0 {
                 // Enable single stepping
-                self.vm.guest_regs.rfl |= 1 << 8;
+                self.vm.set_reg(Register::Rflags,
+                    self.vm.reg(Register::Rflags) | (1 << 8));
 
                 // Decrement number of single steps requested
                 single_step -= 1;
             } else {
                 // Disable single stepping
-                self.vm.guest_regs.rfl &= !(1 << 8);
+                self.vm.set_reg(Register::Rflags,
+                    self.vm.reg(Register::Rflags) & !(1 << 8));
             }
 
             // Set the pre-emption timer for randomly breaking into the VM
             // to record coverage information
-            self.vm.preemption_timer = Some(3); //(self.rng.rand() & 0x3f) as u32);
+            self.vm.preemption_timer = Some((self.rng.rand() & 0xfff) as u32);
 
             // Run the VM until a VM exit
-            let mut vmexit = self.vm.run();
+            let (vmexit, vm_cycles) = self.vm.run();
+            self.stats.vmexits += 1;
+            self.stats.vm_cycles += vm_cycles;
 
             match vmexit {
-                VmExit::Exception(
-                        Exception::PageFault { addr, write, .. }) => {
+                VmExit::EptViolation { addr, write, .. } => {
                     if self.translate(addr, write).is_some() {
-                        continue 'vm_loop;
+                        continue;
                     }
                 }
+                VmExit::ExternalInterrupt => {
+                    // Host interrupt happened, ignore it
+                    continue;
+                }
+                VmExit::ReadMsr { inst_len } => {
+                    // Get the MSR ID we're reading
+                    let msr = self.vm.reg(Register::Rcx);
+
+                    // Get the MSR value
+                    let val = match msr {
+                        0xc000_0102 => self.vm.reg(Register::KernelGsBase),
+                        _ => panic!("Unexpected MSR read {:#x} @ {:#x}\n",
+                                    msr, self.vm.reg(Register::Rip)),
+                    };
+
+                    // Set the low and high parts of the result
+                    self.vm.set_reg(Register::Rax, (val >>  0) as u32 as u64);
+                    self.vm.set_reg(Register::Rdx, (val >> 32) as u32 as u64);
+
+                    self.vm.set_reg(Register::Rip,
+                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    continue 'vm_loop;
+                }
+                VmExit::WriteMsr { inst_len } => {
+                    // Get the MSR ID we're writing
+                    let msr = self.vm.reg(Register::Rcx);
+
+                    // Get the value we're writing
+                    let val = (self.vm.reg(Register::Rdx) << 32) |
+                        self.vm.reg(Register::Rax);
+
+                    // Get the MSR value
+                    match msr {
+                        0xc000_0102 => {
+                            self.vm.set_reg(Register::KernelGsBase, val);
+                        }
+                        _ => panic!("Unexpected MSR write {:#x} @ {:#x}\n",
+                                    msr, self.vm.reg(Register::Rip)),
+                    }
+
+                    // Advance PC
+                    self.vm.set_reg(Register::Rip,
+                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    continue 'vm_loop;
+                }
+                VmExit::WriteCr { cr, gpr, inst_len } => {
+                    // Get the GPR source for the write
+                    let gpr = match gpr {
+                         0 => self.vm.reg(Register::Rax),
+                         1 => self.vm.reg(Register::Rcx),
+                         2 => self.vm.reg(Register::Rdx),
+                         3 => self.vm.reg(Register::Rbx),
+                         4 => self.vm.reg(Register::Rsp),
+                         5 => self.vm.reg(Register::Rbp),
+                         6 => self.vm.reg(Register::Rsi),
+                         7 => self.vm.reg(Register::Rdi),
+                         8 => self.vm.reg(Register::R8),
+                         9 => self.vm.reg(Register::R9),
+                        10 => self.vm.reg(Register::R10),
+                        11 => self.vm.reg(Register::R11),
+                        12 => self.vm.reg(Register::R12),
+                        13 => self.vm.reg(Register::R13),
+                        14 => self.vm.reg(Register::R14),
+                        15 => self.vm.reg(Register::R15),
+                        _ => panic!("Invalid GPR for write CR"),
+                    };
+
+                    // Update the CR
+                    match cr {
+                        0 => self.vm.set_reg(Register::Cr0, gpr),
+                        3 => self.vm.set_reg(Register::Cr3, gpr),
+                        4 => self.vm.set_reg(Register::Cr4, gpr),
+                        _ => panic!("Invalid CR register for write CR"),
+                    }
+                    
+                    // Advance RIP to the next instruction
+                    self.vm.set_reg(Register::Rip,
+                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    continue 'vm_loop;
+                }
+                VmExit::ReadCr { cr, gpr, inst_len } => {
+                    // Get the CR that should be read
+                    let cr = match cr {
+                        0 => self.vm.reg(Register::Cr0),
+                        3 => self.vm.reg(Register::Cr3),
+                        4 => self.vm.reg(Register::Cr4),
+                        _ => panic!("Invalid CR register for read CR"),
+                    };
+
+                    match gpr {
+                         0 => self.vm.set_reg(Register::Rax, cr),
+                         1 => self.vm.set_reg(Register::Rcx, cr),
+                         2 => self.vm.set_reg(Register::Rdx, cr),
+                         3 => self.vm.set_reg(Register::Rbx, cr),
+                         4 => self.vm.set_reg(Register::Rsp, cr),
+                         5 => self.vm.set_reg(Register::Rbp, cr),
+                         6 => self.vm.set_reg(Register::Rsi, cr),
+                         7 => self.vm.set_reg(Register::Rdi, cr),
+                         8 => self.vm.set_reg(Register::R8,  cr),
+                         9 => self.vm.set_reg(Register::R9,  cr),
+                        10 => self.vm.set_reg(Register::R10, cr),
+                        11 => self.vm.set_reg(Register::R11, cr),
+                        12 => self.vm.set_reg(Register::R12, cr),
+                        13 => self.vm.set_reg(Register::R13, cr),
+                        14 => self.vm.set_reg(Register::R14, cr),
+                        15 => self.vm.set_reg(Register::R15, cr),
+                        _ => panic!("Invalid GPR for read CR"),
+                    }
+
+                    // Advance RIP to the next instruction
+                    self.vm.set_reg(Register::Rip,
+                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    continue 'vm_loop;
+                }
                 VmExit::Exception(Exception::DebugException) => {
-                    let modoff = self.resolve_module(self.vm.guest_regs.rip);
+                    let modoff =
+                        self.resolve_module(self.vm.reg(Register::Rip));
                     if session.report_coverage(&CoverageRecord {
                         module: modoff.0.map(|x| Cow::Borrowed(x)),
                         offset: modoff.1,
@@ -307,7 +515,6 @@ impl<'a> Worker<'a> {
                         if let Some(input) = &self.fuzz_input {
                             if session.input_dedup.entry_or_insert(
                                     input, 0, || Box::new(())).inserted() {
-                                print!("Saving input {:02x?}\n", input);
                                 session.inputs.push(Box::new(input.clone()));
                             }
                         }
@@ -315,7 +522,8 @@ impl<'a> Worker<'a> {
                     continue 'vm_loop;
                 }
                 VmExit::PreemptionTimer => {
-                    let modoff = self.resolve_module(self.vm.guest_regs.rip);
+                    let modoff =
+                        self.resolve_module(self.vm.reg(Register::Rip));
                     if session.report_coverage(&CoverageRecord {
                         module: modoff.0.map(|x| Cow::Borrowed(x)),
                         offset: modoff.1,
@@ -324,31 +532,14 @@ impl<'a> Worker<'a> {
                         if let Some(input) = &self.fuzz_input {
                             if session.input_dedup.entry_or_insert(
                                     input, 0, || Box::new(())).inserted() {
-                                print!("Saving input {:02x?}\n", input);
-                                session.inputs.push(Box::new(input.clone()));
+                                session.inputs.push(
+                                    Box::new(input.clone()));
                             }
                         }
                     }
                     continue 'vm_loop;
                 }
-                VmExit::ExternalInterrupt => {
-                    // Host interrupt happened, ignore it
-                    continue 'vm_loop;
-                }
                 _ => {},
-            }
-
-            // Convert a potential `InvalidOpcode` which could be a syscall
-            // into a syscall vmexit. This helps for tracking statistics and
-            // vmexit handling for the `vmexit_filter`
-            if vmexit == VmExit::Exception(Exception::InvalidOpcode) {
-                // Check if the reason for the invalid opcode was a syscall
-                let mut inst_bytes = [0u8; 2];
-                if self.read_into(VirtAddr(self.vm.guest_regs.rip),
-                        &mut inst_bytes).is_some() &&
-                        inst_bytes == [0x0f, 0x05] {
-                    vmexit = VmExit::Syscall(self.vm.guest_regs.rax as u32);
-                }
             }
             
             // Attempt to handle the vmexit with the user's callback
@@ -365,10 +556,8 @@ impl<'a> Worker<'a> {
         // Update number of fuzz cases
         self.stats.fuzz_cases += 1;
 
-        // Update VM exit reason statistics
-        *self.stats.vmexits.entry(vmexit).or_insert(0) += 1;
-
         // Sync the local statistics into the master on an interval
+        self.stats.total_cycles += cpu::rdtsc() - fuzz_start;
         if cpu::rdtsc() >= self.sync {
             self.stats.sync_into(&mut session.stats.lock());
             if self.worker_id == 0 {
@@ -405,41 +594,46 @@ impl<'a> Worker<'a> {
         let mut module_list = BTreeMap::new();
 
         // Get the base of the TEB
-        let gs_base = self.vm.guest_regs.gs_base;
+        let gs_base = self.vm.reg(Register::GsBase);
+
+        print!("{:#x}\n", gs_base);
 
         // Get the address of the `_PEB`
-        let peb = self.read::<u64>(VirtAddr(gs_base + 0x60))?;
+        let peb = self.read_virt::<u64>(VirtAddr(gs_base + 0x60))?;
 
         // Get the address of the `_PEB_LDR_DATA`
-        let peb_ldr_data = self.read::<u64>(VirtAddr(peb + 0x18))?;
+        let peb_ldr_data = self.read_virt::<u64>(VirtAddr(peb + 0x18))?;
 
         // Get the in load order module list links
-        let mut mod_flink = self.read::<u64>(VirtAddr(peb_ldr_data + 0x10))?;
-        let mod_blink = self.read::<u64>(VirtAddr(peb_ldr_data + 0x18))?;
+        let mut mod_flink =
+            self.read_virt::<u64>(VirtAddr(peb_ldr_data + 0x10))?;
+        let mod_blink = self.read_virt::<u64>(VirtAddr(peb_ldr_data + 0x18))?;
 
         // Traverse the linked list
         while mod_flink != 0 {
-            let base = self.read::<u64>(VirtAddr(mod_flink + 0x30))?;
-            let size = self.read::<u32>(VirtAddr(mod_flink + 0x40))?;
+            let base = self.read_virt::<u64>(VirtAddr(mod_flink + 0x30))?;
+            let size = self.read_virt::<u32>(VirtAddr(mod_flink + 0x40))?;
             if size <= 0 {
                 return None;
             }
 
             // Get the length of the module name unicode string
-            let name_len = self.read::<u16>(VirtAddr(mod_flink + 0x58))?;
-            let name_ptr = self.read::<u64>(VirtAddr(mod_flink + 0x60))?;
+            let name_len = self.read_virt::<u16>(VirtAddr(mod_flink + 0x58))?;
+            let name_ptr = self.read_virt::<u64>(VirtAddr(mod_flink + 0x60))?;
             if name_ptr == 0 || name_len <= 0 || (name_len % 2) != 0 {
                 return None;
             }
 
             let mut name = vec![0u16; name_len as usize / 2];
             for (ii, wc) in name.iter_mut().enumerate() {
-                *wc = self.read::<u16>(VirtAddr(
+                *wc = self.read_virt::<u16>(VirtAddr(
                     name_ptr.checked_add((ii as u64).checked_mul(2)?)?))?;
             }
 
             // Convert the module name into a UTF-8 Rust string
             let name_utf8 = String::from_utf16(&name).ok()?;
+
+            print!("WOO {} {:x} {:x}\n", name_utf8, base, size);
 
             // Save the module information into the module list
             module_list.insert(base,
@@ -447,7 +641,7 @@ impl<'a> Worker<'a> {
 
             // Go to the next link in the table
             if mod_flink == mod_blink { break; }
-            mod_flink = self.read::<u64>(VirtAddr(mod_flink))?;
+            mod_flink = self.read_virt::<u64>(VirtAddr(mod_flink))?;
         }
 
         // Establish the new module list
@@ -456,20 +650,269 @@ impl<'a> Worker<'a> {
         Some(())
     }
 
-    /// Reads the contents at `vaddr` into a `T` which implements `Primitive`
-    pub fn read<T: Primitive>(&mut self, vaddr: VirtAddr) -> Option<T> {
-        let mut buf = [0u8; 16];
-        let ptr = &mut buf[..size_of::<T>()];
-        self.read_into(vaddr, ptr)?;
-        Some(T::cast(ptr))
+    /// Get the base address for a given segment
+    pub fn seg_base(&self, segment: Segment) -> u64 {
+        match segment {
+            Segment::Es => self.vm.reg(Register::EsBase),
+            Segment::Ds => self.vm.reg(Register::DsBase),
+            Segment::Fs => self.vm.reg(Register::FsBase),
+            Segment::Gs => self.vm.reg(Register::GsBase),
+            Segment::Ss => self.vm.reg(Register::SsBase),
+            Segment::Cs => self.vm.reg(Register::CsBase),
+        }
     }
 
-    /// Read the contents of the virtual memory at `vaddr` in the guest into
-    /// the `buf` provided
+    /// Reads memory using the `addr` provided
+    pub fn read_addr(&mut self, addr: Address, mut buf: &mut [u8])
+            -> Option<()> {
+        // Nothing to do in the 0 byte case
+        if buf.len() == 0 { return Some(()); }
+
+        // Offset into the read we've completed
+        let mut loff = 0u64;
+
+        while buf.len() > 0 {
+            // Get the guest physical address for this page
+            let gpaddr = match addr {
+                Address::PhysicalLinear { addr } => addr.wrapping_add(loff),
+                Address::PhysicalSegOff { seg, off } => {
+                    self.seg_base(seg).wrapping_add(off).wrapping_add(loff)
+                }
+                Address::Virtual { seg, off, mode, cr3 } => {
+                    let linear = self.seg_base(seg).wrapping_add(off)
+                        .wrapping_add(loff);
+                    let (page, off, _) = match mode {
+                        PagingMode::Bits32 => {
+                            translate_32_no_pae(cr3, VirtAddr(linear),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits32Pae => {
+                            translate_32_pae(cr3, VirtAddr(linear),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits64 => {
+                            translate_64_4_level(cr3, VirtAddr(linear),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                    };
+                    page.0.wrapping_add(off)
+                }
+                Address::Linear { addr, mode, cr3 } => {
+                    let addr = addr.wrapping_add(loff);
+                    let (page, off, _) = match mode {
+                        PagingMode::Bits32 => {
+                            translate_32_no_pae(cr3, VirtAddr(addr),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits32Pae => {
+                            translate_32_pae(cr3, VirtAddr(addr),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits64 => {
+                            translate_64_4_level(cr3, VirtAddr(addr),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                    };
+                    page.0.wrapping_add(off)
+                }
+            };
+
+            // Get the host physical address for this page
+            let paddr = self.translate(PhysAddr(gpaddr), false)?;
+
+            // Compute the remaining number of bytes on the page
+            let page_remain = 0x1000 - (paddr.0 & 0xfff);
+
+            // Compute the number of bytes to copy
+            let to_copy = core::cmp::min(page_remain as usize, buf.len());
+
+            // Read the memory from the backing page into the user's buffer
+            let psl = unsafe { mm::slice_phys(paddr, to_copy as u64) };
+            buf[..to_copy].copy_from_slice(psl);
+
+            // Advance the buffers
+            loff += to_copy as u64;
+            buf   = &mut buf[to_copy..];
+        }
+
+        Some(())
+    }
+    
+    /// Writes memory using to the `addr` provided
+    pub fn write_addr(&mut self, addr: Address, mut buf: &[u8])
+            -> Option<()> {
+        // Nothing to do in the 0 byte case
+        if buf.len() == 0 { return Some(()); }
+
+        // Offset into the read we've completed
+        let mut loff = 0u64;
+
+        while buf.len() > 0 {
+            // Get the guest physical address for this page
+            let gpaddr = match addr {
+                Address::PhysicalLinear { addr } => addr.wrapping_add(loff),
+                Address::PhysicalSegOff { seg, off } => {
+                    self.seg_base(seg).wrapping_add(off).wrapping_add(loff)
+                }
+                Address::Virtual { seg, off, mode, cr3 } => {
+                    let linear = self.seg_base(seg).wrapping_add(off)
+                        .wrapping_add(loff);
+                    let (page, off, _) = match mode {
+                        PagingMode::Bits32 => {
+                            translate_32_no_pae(cr3, VirtAddr(linear),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits32Pae => {
+                            translate_32_pae(cr3, VirtAddr(linear),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits64 => {
+                            translate_64_4_level(cr3, VirtAddr(linear),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                    };
+                    page.0.wrapping_add(off)
+                }
+                Address::Linear { addr, mode, cr3 } => {
+                    let addr = addr.wrapping_add(loff);
+                    let (page, off, _) = match mode {
+                        PagingMode::Bits32 => {
+                            translate_32_no_pae(cr3, VirtAddr(addr),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits32Pae => {
+                            translate_32_pae(cr3, VirtAddr(addr),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                        PagingMode::Bits64 => {
+                            translate_64_4_level(cr3, VirtAddr(addr),
+                                |paddr| self.read_phys(paddr))?
+                        }
+                    };
+                    page.0.wrapping_add(off)
+                }
+            };
+
+            // Get the host physical address for this page
+            let paddr = self.translate(PhysAddr(gpaddr), true)?;
+
+            // Compute the remaining number of bytes on the page
+            let page_remain = 0x1000 - (paddr.0 & 0xfff);
+
+            // Compute the number of bytes to copy
+            let to_copy = core::cmp::min(page_remain as usize, buf.len());
+
+            // Read the memory from the backing page into the user's buffer
+            let psl = unsafe { mm::slice_phys_mut(paddr, to_copy as u64) };
+            psl.copy_from_slice(&buf[..to_copy]);
+
+            // Advance the buffers
+            loff += to_copy as u64;
+            buf   = &buf[to_copy..];
+        }
+
+        Some(())
+    }
+
+    /// Gets the current paging mode of the system
+    pub fn paging_mode(&self) -> Option<PagingMode> {
+        let cr0  = self.vm.reg(Register::Cr0);
+        let cr4  = self.vm.reg(Register::Cr4);
+        let efer = self.vm.reg(Register::Efer);
+
+        if cr0 & (1 << 31) == 0 {
+            // Paging disabled
+            None
+        } else {
+            // Paging enabled
+            if efer & (1 << 8) == 0 {
+                // EFER.LME not set (32-bit mode)
+                if cr4 & (1 << 5) == 0 {
+                    // CR4.PAE clear
+                    Some(PagingMode::Bits32)
+                } else {
+                    // CR4.PAE set
+                    Some(PagingMode::Bits32Pae)
+                }
+            } else {
+                // EFER.LME set (64-bit mode)
+                if cr4 & (1 << 5) == 0 {
+                    // CR4.PAE clear, invalid state
+                    None
+                } else {
+                    // CR4.PAE set
+                    Some(PagingMode::Bits64)
+                }
+            }
+        }
+    }
+    
+    /// Reads the contents at `vaddr` into a `T` which implements `Primitive`
+    /// using the current active page table
+    pub fn read_virt<T: Primitive>(&mut self, vaddr: VirtAddr) -> Option<T> {
+        self.read_virt_cr3(vaddr, self.vm.reg(Register::Cr3))
+    }
+    
+    /// Reads the contents at `vaddr` into a `T` which implements `Primitive`
+    /// using the page table in `cr3`
+    pub fn read_virt_cr3<T: Primitive>(&mut self, vaddr: VirtAddr, cr3: u64)
+            -> Option<T> {
+        let mut ret = T::default();
+        self.read_virt_cr3_into(vaddr, ret.cast_mut(), cr3)?;
+        Some(ret)
+    }
+    
+    /// Read the contents of the guest virtual memory at `vaddr` into the
+    /// `buf` provided using the current page table
     ///
     /// Returns `None` if the request cannot be fully satisfied. It is possible
     /// that some reading did occur, but is partial.
-    pub fn read_into(&mut self, mut vaddr: VirtAddr, mut buf: &mut [u8])
+    pub fn read_virt_into(&mut self, vaddr: VirtAddr,
+                          buf: &mut [u8]) -> Option<()> {
+        self.read_virt_cr3_into(vaddr, buf, self.vm.reg(Register::Cr3))
+    }
+    
+    /// Read the contents of the guest virtual memory at `vaddr` into the
+    /// `buf` provided using page table `cr3`
+    ///
+    /// Returns `None` if the request cannot be fully satisfied. It is possible
+    /// that some reading did occur, but is partial.
+    pub fn read_virt_cr3_into(&mut self, vaddr: VirtAddr,
+                              buf: &mut [u8], cr3: u64) -> Option<()> {
+        self.read_addr(Address::Linear {
+            addr: vaddr.0,
+            mode: self.paging_mode()?,
+            cr3:  cr3,
+        }, buf)
+    }
+    
+    /// Write the contents of `buf` to the guest virtual memory at `vaddr`
+    /// using page table `cr3`
+    ///
+    /// Returns `None` if the request cannot be fully satisfied. It is possible
+    /// that some reading did occur, but is partial.
+    pub fn write_virt_cr3_from(&mut self, vaddr: VirtAddr,
+                               buf: &[u8], cr3: u64) -> Option<()> {
+        self.write_addr(Address::Linear {
+            addr: vaddr.0,
+            mode: self.paging_mode()?,
+            cr3:  cr3,
+        }, buf)
+    }
+
+    /// Reads the contents at `gpaddr` into a `T` which implements `Primitive`
+    pub fn read_phys<T: Primitive>(&mut self, gpaddr: PhysAddr) -> Option<T> {
+        let mut ret = T::default();
+        self.read_phys_into(gpaddr, ret.cast_mut())?;
+        Some(ret)
+    }
+
+    /// Read the contents of the guest physical memory at `gpaddr` into the
+    /// `buf` provided
+    ///
+    /// Returns `None` if the request cannot be fully satisfied. It is possible
+    /// that some reading did occur, but is partial.
+    pub fn read_phys_into(&mut self, mut gpaddr: PhysAddr, mut buf: &mut [u8])
             -> Option<()> {
         // Nothing to do in the 0 byte case
         if buf.len() == 0 { return Some(()); }
@@ -480,7 +923,7 @@ impl<'a> Worker<'a> {
         while buf.len() > 0 {
             if (paddr.0 & 0xfff) == 0 {
                 // Crossed into a new page, translate
-                paddr = self.translate(vaddr, false)?;
+                paddr = self.translate(gpaddr, false)?;
             }
 
             // Compute the remaining number of bytes on the page
@@ -489,26 +932,31 @@ impl<'a> Worker<'a> {
             // Compute the number of bytes to copy
             let to_copy = core::cmp::min(page_remain as usize, buf.len());
 
-            // Get mutable access to the underlying page and copy the memory
-            // from the buffer into it
-            let psl = unsafe { mm::slice_phys_mut(paddr, to_copy as u64) };
+            // Read the memory from the backing page into the user's buffer
+            let psl = unsafe { mm::slice_phys(paddr, to_copy as u64) };
             buf[..to_copy].copy_from_slice(psl);
 
             // Advance the buffer pointers
-            paddr = PhysAddr(paddr.0 + to_copy as u64);
-            vaddr = VirtAddr(vaddr.0 + to_copy as u64);
-            buf   = &mut buf[to_copy..];
+            paddr  = PhysAddr(paddr.0 + to_copy as u64);
+            gpaddr = PhysAddr(gpaddr.0 + to_copy as u64);
+            buf    = &mut buf[to_copy..];
         }
 
         Some(())
     }
+    
+    /// Writes the contents of `T` to the `gpaddr`
+    pub fn write_phys<T: Primitive>(&mut self, gpaddr: PhysAddr, val: T)
+            -> Option<()> {
+        self.write_phys_from(gpaddr, val.cast())
+    }
 
-    /// Write the contents of `buf` into the virtual memory at `vaddr` for
-    /// the guest
+    /// Write the contents of `buf` into the guest physical memory at `gpaddr`
+    /// at the guest
     ///
     /// Returns `None` if the request cannot be fully satisfied. It is possible
     /// that some writing did occur, but is partial.
-    pub fn write_from(&mut self, mut vaddr: VirtAddr, mut buf: &[u8])
+    pub fn write_phys_from(&mut self, mut gpaddr: PhysAddr, mut buf: &[u8])
             -> Option<()>{
         // Nothing to do in the 0 byte case
         if buf.len() == 0 { return Some(()); }
@@ -519,7 +967,7 @@ impl<'a> Worker<'a> {
         while buf.len() > 0 {
             if (paddr.0 & 0xfff) == 0 {
                 // Crossed into a new page, translate
-                paddr = self.translate(vaddr, true)?;
+                paddr = self.translate(gpaddr, true)?;
             }
 
             // Compute the remaining number of bytes on the page
@@ -534,38 +982,51 @@ impl<'a> Worker<'a> {
             psl.copy_from_slice(&buf[..to_copy]);
 
             // Advance the buffer pointers
-            paddr = PhysAddr(paddr.0 + to_copy as u64);
-            vaddr = VirtAddr(vaddr.0 + to_copy as u64);
-            buf   = &buf[to_copy..];
+            paddr  = PhysAddr(paddr.0 + to_copy as u64);
+            gpaddr = PhysAddr(gpaddr.0 + to_copy as u64);
+            buf    = &buf[to_copy..];
         }
 
         Some(())
     }
 
-    /// Attempts to get a slice to the page backing `vaddr` in host addressable
-    /// memory
-    fn get_page(&self, vaddr: VirtAddr) -> Option<VirtAddr> {
+    /// Attempts to get a slice to the page backing `gpaddr` in host
+    /// addressable memory
+    fn get_page(&self, gpaddr: PhysAddr) -> Option<VirtAddr> {
         // Validate alignment
-        assert!(vaddr.0 & 0xfff == 0,
-                "get_page() requires an aligned virtual address");
-
-        // Get access to physical memory
-        let mut pmem = mm::PhysicalMemory;
+        assert!(gpaddr.0 & 0xfff == 0,
+                "get_page() requires an aligned guest physical address");
 
         // Attempt to translate the page, it is possible it has not yet been
         // mapped and we need to page it in from the network mapped storage in
         // the `FuzzTarget`
-        let translation = self.vm.page_table.translate(&mut pmem, vaddr);
+        let translation = self.vm.ept.translate(gpaddr);
         if let Some(Mapping { page: Some(orig_page), .. }) = translation {
             Some(VirtAddr(unsafe {
                 mm::slice_phys_mut(orig_page.0, 4096).as_ptr() as u64
             }))
         } else {
             if let Some(master) = &self.master {
-                master.get_page(vaddr)
+                master.get_page(gpaddr)
             } else if let Some(netmem) = &self.network_mem {
-                let offset = *netmem.virt_to_offset.get(&vaddr)?;
-                Some(VirtAddr(netmem.memory[offset..].as_ptr() as u64))
+                // Find the region which may contain our address
+                let (phys_base, (offset, end)) = netmem.phys_ranges
+                    .range(..=gpaddr.0).next_back()?;
+
+                // Make sure our address falls in the region
+                if gpaddr.0 < *phys_base || gpaddr.0 > *end {
+                    return None;
+                }
+
+                // Compute the offset into the memory based on our offset into
+                // the region
+                let offset = offset
+                    .checked_add((gpaddr.0 - phys_base) as usize)?;
+                assert!(offset & 0xfff == 0, "Whoa, page offset not aligned");
+
+                // Get a slice to the memory backing this requested region
+                let data = netmem.memory.get(offset..offset + 4096)?;
+                Some(VirtAddr(data.as_ptr() as u64))
             } else {
                 // Nobody can provide the memory for us, it's not present
                 None
@@ -573,30 +1034,29 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Translate a virtual address for the guest into a physical address on
+    /// Translate a physical address for the guest into a physical address on
     /// the host. If `write` is set, the translation will occur for a write
     /// access, and thus the copy-on-write will be performed on the page if
     /// needed to satisfy the write.
     ///
-    /// If the virtual address is not valid for the guest, this will return
+    /// If the physical address is not valid for the guest, this will return
     /// `None`.
     ///
-    /// The translation will only be valid for the page the `vaddr` resides in.
-    /// The returned physical address will have the offset from the virtual
-    /// address applied. Such that a request for virtual address `0x13371337`
+    /// The translation will only be valid for the page the `gpaddr` resides in
+    /// The returned physical address will have the offset from the physical
+    /// address applied. Such that a request for physical address `0x13371337`
     /// would return a physical address ending in `0x337`
-    fn translate(&mut self, vaddr: VirtAddr, write: bool) -> Option<PhysAddr> {
+    fn translate(&mut self, gpaddr: PhysAddr, write: bool) -> Option<PhysAddr> {
         // Get access to physical memory
         let mut pmem = mm::PhysicalMemory;
         
-        // Align the virtual address
-        let align_vaddr = VirtAddr(vaddr.0 & !0xfff);
+        // Align the guest physical address
+        let align_gpaddr = PhysAddr(gpaddr.0 & !0xfff);
 
         // Attempt to translate the page, it is possible it has not yet been
         // mapped and we need to page it in from the network mapped storage in
         // the `FuzzTarget`
-        let translation = self.vm.page_table.translate_dirty(
-            &mut pmem, align_vaddr, write);
+        let translation = self.vm.ept.translate_dirty(align_gpaddr, write);
         
         // First, determine if we need to perform a CoW or make a mapping for
         // an unmapped page
@@ -605,27 +1065,24 @@ impl<'a> Worker<'a> {
             // Page is mapped, it is possible it needs to be promoted to
             // writable
             let page_writable =
-                (unsafe { mm::read_phys::<u64>(pte) } & PAGE_WRITE) != 0;
+                (unsafe { mm::read_phys::<u64>(pte) } & EPT_WRITE) != 0;
 
             // If the page is writable, and this is is a write, OR if the
             // operation is not a write, then the existing allocation can
             // satisfy the translation request.
             if (write && page_writable) || !write {
-                return Some(PhysAddr((orig_page.0).0 + (vaddr.0 & 0xfff)));
+                return Some(PhysAddr((orig_page.0).0 + (gpaddr.0 & 0xfff)));
             }
         }
 
         // At this stage, we either must perform a CoW or map an unmapped page
 
         // Get the original contents of the page
-        let orig_page_vaddr = if let Some(master) = &self.master {
+        let orig_page_gpaddr = if let Some(master) = &self.master {
             // Get the page from the master
-            master.get_page(align_vaddr)?
-        } else if let Some(netmem) = &self.network_mem {
-            // Get the offset into the network backing which holds the page
-            // for the provided virtual address
-            let offset = *netmem.virt_to_offset.get(&align_vaddr)?;
-            VirtAddr(netmem.memory[offset..].as_ptr() as u64)
+            master.get_page(align_gpaddr)?
+        } else if let Some(_) = &self.network_mem {
+            self.get_page(align_gpaddr)?
         } else {
             // Page is not present, and cannot be filled from the master or
             // network memory
@@ -635,7 +1092,7 @@ impl<'a> Worker<'a> {
         // Look up the physical page backing for the mapping
 
         // Touch the page to make sure it's present
-        unsafe { core::ptr::read_volatile(orig_page_vaddr.0 as *const u8); }
+        unsafe { core::ptr::read_volatile(orig_page_gpaddr.0 as *const u8); }
         
         let orig_page = {
             // Get access to the host page table
@@ -647,7 +1104,7 @@ impl<'a> Worker<'a> {
             //
             // This will always succeed as we touched the memory above
             let (page, offset) =
-                page_table.translate(&mut pmem, orig_page_vaddr)
+                page_table.translate(&mut pmem, orig_page_gpaddr)
                     .map(|x| x.page).flatten()
                     .expect("Whoa, memory page not mapped?!");
             PhysAddr(page.0 + offset)
@@ -662,7 +1119,7 @@ impl<'a> Worker<'a> {
                 
             // Allocate a new page
             let page = pmem.alloc_phys(
-                Layout::from_size_align(4096, 4096).unwrap());
+                Layout::from_size_align(4096, 4096).unwrap()).unwrap();
 
             // Get mutable access to the underlying page
             let psl = unsafe { mm::slice_phys_mut(page, 4096) };
@@ -673,8 +1130,8 @@ impl<'a> Worker<'a> {
 
             // Promote the page via CoW
             unsafe {
-                mm::write_phys(pte, page.0 | PAGE_USER | PAGE_WRITE |
-                               PAGE_PRESENT);
+                mm::write_phys(pte, 
+                    page.0 | EPT_WRITE | EPT_READ | EPT_EXEC | EPT_USER_EXEC);
             }
 
             page
@@ -685,7 +1142,7 @@ impl<'a> Worker<'a> {
 
                 // Allocate a new page
                 let page = pmem.alloc_phys(
-                    Layout::from_size_align(4096, 4096).unwrap());
+                    Layout::from_size_align(4096, 4096).unwrap()).unwrap();
 
                 // Get mutable access to the underlying page
                 let psl = unsafe { mm::slice_phys_mut(page, 4096) };
@@ -696,9 +1153,10 @@ impl<'a> Worker<'a> {
 
                 unsafe {
                     // Map in the page as RW
-                    self.vm.page_table.map_raw(&mut pmem, align_vaddr,
+                    self.vm.ept.map_raw(align_gpaddr,
                         PageType::Page4K,
-                        page.0 | PAGE_USER | PAGE_WRITE | PAGE_PRESENT)
+                        page.0 | EPT_READ | EPT_WRITE | EPT_EXEC |
+                        EPT_USER_EXEC | EPT_MEMTYPE_WB)
                         .unwrap();
                 }
 
@@ -706,14 +1164,15 @@ impl<'a> Worker<'a> {
                 page
             } else {
                 // Page is only being accessed for read. Alias the guest's
-                // virtual memory directly into the network mapped page as
+                // physical memory directly into the network mapped page as
                 // read-only
                 
                 unsafe {
                     // Map in the page as read-only into the guest page table
-                    self.vm.page_table.map_raw(&mut pmem, align_vaddr,
-                        PageType::Page4K,
-                        orig_page.0 | PAGE_USER | PAGE_PRESENT).unwrap();
+                    self.vm.ept.map_raw(align_gpaddr, PageType::Page4K,
+                        orig_page.0 | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
+                        EPT_MEMTYPE_WB)
+                        .unwrap();
                 }
 
                 // Return the physical address of the backing page
@@ -721,30 +1180,34 @@ impl<'a> Worker<'a> {
             }
         };
         
-        // Return the physical address of the requested virtual address
-        Some(PhysAddr(page.0 + (vaddr.0 & 0xfff)))
+        // Return the host physical address of the requested guest physical
+        // address
+        Some(PhysAddr(page.0 + (gpaddr.0 & 0xfff)))
     }
 }
 
-type InjectCallback<'a> = fn(&mut Worker<'a>);
+type InjectCallback<'a, C> = fn(&mut Worker<'a, C>);
 
-type VmExitFilter<'a> = fn(&mut Worker<'a>, &VmExit) -> bool;
+type VmExitFilter<'a, C> = fn(&mut Worker<'a, C>, &VmExit) -> bool;
 
 /// A session for multiple workers to fuzz a shared job
-pub struct FuzzSession<'a> {
+pub struct FuzzSession<'a, C> {
     /// Master VM state
-    master_vm: Arc<Worker<'a>>,
+    master_vm: Arc<Worker<'a, C>>,
+
+    /// Optional user-controlled global context
+    global_context: Option<Arc<C>>,
 
     /// Timeout for each fuzz case
     timeout: Option<u64>,
 
     /// Callback to invoke before every fuzz case, for the fuzzer to inject
     /// information into the VM
-    inject: Option<InjectCallback<'a>>,
+    inject: Option<InjectCallback<'a, C>>,
 
     /// Callback to invoke when VM exits are hit to allow a user to handle VM
     /// exits to re-enter the VM
-    vmexit_filter: Option<VmExitFilter<'a>>,
+    vmexit_filter: Option<VmExitFilter<'a, C>>,
     
     /// All observed coverage information
     coverage: Aht<CoverageRecord<'a>, (), 65536>,
@@ -771,104 +1234,223 @@ pub struct FuzzSession<'a> {
     id: u64,
 }
 
-impl<'a> FuzzSession<'a> {
+impl<'a, C> FuzzSession<'a, C> {
     /// Create a new empty fuzz session
-    pub fn new<S>(server: &str, name: S) -> Self
+    pub fn from_falkdump<S>(server: &str, name: S) -> Self
             where S: AsRef<str> {
+        macro_rules! consume {
+            ($ptr:expr, $ty:ty) => {{
+                let ret = <$ty>::from_le_bytes(
+                    $ptr[..size_of::<$ty>()].try_into().unwrap());
+                $ptr = &$ptr[size_of::<$ty>()..];
+                ret
+            }}
+        }
+
         // Convert the generic name into a reference to a string
         let name: &str = name.as_ref();
 
         // Network map the memory file contents as read-only
-        let memory = NetMapping::new(server, &format!("{}.memory", name), true)
-            .expect("Failed to netmap memory file for snapshotted app");
+        let memory = NetMapping::new(server, name.as_ref(), true)
+            .expect("Failed to netmap falkdump");
 
-        // Network map the info file contents as read-only
-        let info = NetMapping::new(server, &format!("{}.info", name), true)
-            .expect("Failed to netmap info file for snapshotted app");
+        // Check the signature
+        assert!(&memory[..8] == b"FALKDUMP", "Invalid signature for falkdump");
 
-        // Create a new register state
-        let mut regs = RegisterState::default();
+        // Get a pointer to the file contents
+        let mut ptr = &memory[8..];
 
-        // Get access to the snapshot info
-        let mut ptr = &info[..];
+        // Get the size of the region region in bytes
+        let regs_size = consume!(ptr, u64);
+        ptr = &ptr[regs_size as usize..];
 
-        /// Consume a `$ty` from the snapshot info and update the pointer
-        macro_rules! consume {
-            ($ty:ty) => {{
-                let val: $ty = <$ty>::from_le_bytes(
-                    ptr[..size_of::<$ty>()].try_into().unwrap());
-                ptr = &ptr[size_of::<$ty>()..];
-                val
-            }}
+        // Get the number of regions
+        let regions = consume!(ptr, u64);
+
+        // Parse out the physical region information
+        let mut phys_ranges = BTreeMap::new();
+        for _ in 0..regions {
+            let start  = consume!(ptr, u64);
+            let end    = consume!(ptr, u64);
+            let offset = consume!(ptr, u64);
+
+            assert!(end > start && end & 0xfff == 0xfff && start & 0xfff == 0);
+
+            // Log the region
+            phys_ranges.insert(start, (offset as usize, end));
         }
+        
+        // Create a new master VM from the information provided
+        let netbacking = Arc::new(NetBacking { memory, phys_ranges });
+        let mut master = Worker::from_net(netbacking.clone());
+        
+        // Parse the registers from the register state
+        let mut ptr = &netbacking.memory[16..16 + regs_size as usize];
+        let _version = consume!(ptr, u32);
+        let _size    = consume!(ptr, u32);
+        master.vm.set_reg(Register::Rax, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rbx, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rcx, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rdx, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rsi, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rdi, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rsp, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rbp, consume!(ptr, u64));
+        master.vm.set_reg(Register::R8 , consume!(ptr, u64));
+        master.vm.set_reg(Register::R9 , consume!(ptr, u64));
+        master.vm.set_reg(Register::R10, consume!(ptr, u64));
+        master.vm.set_reg(Register::R11, consume!(ptr, u64));
+        master.vm.set_reg(Register::R12, consume!(ptr, u64));
+        master.vm.set_reg(Register::R13, consume!(ptr, u64));
+        master.vm.set_reg(Register::R14, consume!(ptr, u64));
+        master.vm.set_reg(Register::R15, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rip, consume!(ptr, u64));
+        master.vm.set_reg(Register::Rflags, consume!(ptr, u64));
 
-        // Parse out the register fields from the snapshot info
-        regs.gs_base = consume!(u64);
-        regs.rfl = consume!(u64);
-        regs.r15 = consume!(u64);
-        regs.r14 = consume!(u64);
-        regs.r13 = consume!(u64);
-        regs.r12 = consume!(u64);
-        regs.r11 = consume!(u64);
-        regs.r10 = consume!(u64);
-        regs.r9  = consume!(u64);
-        regs.r8  = consume!(u64);
-        regs.rdi = consume!(u64);
-        regs.rsi = consume!(u64);
-        regs.rbp = consume!(u64);
-        regs.rdx = consume!(u64);
-        regs.rcx = consume!(u64);
-        regs.rbx = consume!(u64);
-        regs.rax = consume!(u64);
-        regs.rsp = consume!(u64);
+        master.vm.set_reg(Register::Cs,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::CsLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::CsAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::CsBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Ds,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::DsLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::DsAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::DsBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Es,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::EsLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::EsAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::EsBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Fs,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::FsLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::FsAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::FsBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Gs,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::GsLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::GsAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::GsBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Ss,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::SsLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::SsAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::SsBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Ldtr,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::LdtrLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::LdtrAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::LdtrBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Tr,      consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::TrLimit, consume!(ptr, u32) as u64);
+        master.vm.set_reg(Register::TrAccessRights,
+                          (consume!(ptr, u32) as u64) >> 8);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::TrBase, consume!(ptr, u64));
+        
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::GdtrLimit, consume!(ptr, u32) as u64);
+        let _ = consume!(ptr, u32);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::GdtrBase, consume!(ptr, u64));
+        
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::IdtrLimit, consume!(ptr, u32) as u64);
+        let _ = consume!(ptr, u32);
+        let _ = consume!(ptr, u32);
+        master.vm.set_reg(Register::IdtrBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Cr0, consume!(ptr, u64));
+        let _ = consume!(ptr, u64);
+        master.vm.set_reg(Register::Cr2, consume!(ptr, u64));
+        master.vm.set_reg(Register::Cr3, consume!(ptr, u64));
+        master.vm.set_reg(Register::Cr4, consume!(ptr, u64) | (1 << 13));
+        
+        master.vm.set_reg(Register::KernelGsBase, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Cr8, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::CStar, consume!(ptr, u64));
+        master.vm.set_reg(Register::LStar, consume!(ptr, u64));
+        master.vm.set_reg(Register::FMask, consume!(ptr, u64));
+        master.vm.set_reg(Register::Star,  consume!(ptr, u64));
 
-        // Parse the `FxSave` out of the info
+        master.vm.set_reg(Register::SysenterCs,  consume!(ptr, u64));
+        master.vm.set_reg(Register::SysenterEsp, consume!(ptr, u64));
+        master.vm.set_reg(Register::SysenterEip, consume!(ptr, u64));
+        
+        master.vm.set_reg(Register::Efer, consume!(ptr, u64));
+
+        let _ = consume!(ptr, u64);
+        let _ = consume!(ptr, u64);
+        let _ = consume!(ptr, u64);
+        let _ = consume!(ptr, u64);
+        let _ = consume!(ptr, u64);
+        let _ = consume!(ptr, u64);
+        let _ = consume!(ptr, u64);
+        master.vm.set_reg(Register::Dr7, consume!(ptr, u64));
+
         unsafe {
-            regs.fxsave = core::ptr::read_unaligned(
-                ptr[..512].as_ptr() as *const FxSave);
-            ptr = &ptr[512..];
+            // Remainder should be fxsave area
+            assert!(ptr.len() == 512);
+
+            master.vm.set_fxsave(
+                core::ptr::read_unaligned(
+                    ptr[..512].as_ptr() as *const FxSave));
+        }
+        
+        let efer = master.vm.reg(Register::Efer);
+        if efer & (1 << 8) != 0 {
+            // Long mode, QEMU gives some non-zero limits, zero them out
+            master.vm.set_reg(Register::EsLimit, 0);
+            master.vm.set_reg(Register::CsLimit, 0);
+            master.vm.set_reg(Register::SsLimit, 0);
+            master.vm.set_reg(Register::DsLimit, 0);
+            master.vm.set_reg(Register::FsLimit, 0);
+            master.vm.set_reg(Register::GsLimit, 0);
         }
 
-        // Construct the virtual to memory offset table
-        let mut virt_to_offset = BTreeMap::new();
+        /// Perform some filtering of the access rights as QEMU and VT-x have
+        /// slightly different expectations for these bits
+        macro_rules! filter_ars {
+            ($ar:expr, $lim:expr) => {
+                // Mark any non-present segment as inactive
+                if master.vm.reg($ar) & (1 << 7) == 0 {
+                    master.vm.set_reg($ar, 0x10000);
+                }
 
-        // File contains a dynamic amount of MEMORY_BASIC_INFORMATION
-        // structures until the end of the file
-        assert!(ptr.len() % 48 == 0, "Invalid shape for info file");
-        let mut offset = 0;
-        for chunk in ptr.chunks(48) {
-            // Parse out the section base and size
-            let base = u64::from_le_bytes(
-                chunk[0x00..0x08].try_into().unwrap());
-            let size = u64::from_le_bytes(
-                chunk[0x18..0x20].try_into().unwrap());
-
-            // Make sure the size is non-zero and the base and the size are
-            // both 4 KiB aligned
-            assert!(size > 0 && base & 0xfff == 0 && size & 0xfff == 0);
-
-            // Create the virtual to offset mappings
-            for page in (base..=(base.checked_add(size - 1).unwrap()))
-                    .step_by(4096) {
-                // Create a mapping from each page in the virtual address
-                // space of the dumped process, into the offset into the
-                // memory backing for the snapshot.
-                virt_to_offset.insert(VirtAddr(page), offset);
-                offset += 4096;
+                // If any bit in the bottom 12 bits of the limit is zero, then
+                // G must be zero
+                if master.vm.reg($lim) & 0xfff != 0xfff {
+                    master.vm.set_reg($ar, master.vm.reg($ar) & !(1 << 15));
+                }
             }
         }
 
-        // Make sure all of the memory has been accounted for in the snapshot
-        assert!(offset == memory.len());
+        filter_ars!(Register::EsAccessRights, Register::EsLimit);
+        filter_ars!(Register::CsAccessRights, Register::CsLimit);
+        filter_ars!(Register::SsAccessRights, Register::SsLimit);
+        filter_ars!(Register::DsAccessRights, Register::DsLimit);
+        filter_ars!(Register::FsAccessRights, Register::FsLimit);
+        filter_ars!(Register::GsAccessRights, Register::GsLimit);
+        filter_ars!(Register::LdtrAccessRights, Register::LdtrLimit);
+        filter_ars!(Register::TrAccessRights, Register::TrLimit);
 
-        // Create a new master VM from the information provided
-        let mut master =
-            Worker::from_net(Arc::new(NetBacking {
-                virt_to_offset,
-                memory
-            }));
-        master.vm.guest_regs = regs;
-        
         // Get access to a network device
         let netdev = NetDevice::get().expect("Failed to get network device");
 
@@ -882,18 +1464,19 @@ impl<'a> FuzzSession<'a> {
             .expect("Couldn't resolve target address");
 
         FuzzSession {
-            master_vm:     Arc::new(master),
-            coverage:      Aht::new(),
-            stats:         LockCell::new(Statistics::default()),
-            timeout:       None,
-            inject:        None,
-            vmexit_filter: None,
-            input_dedup:   Aht::new(),
-            inputs:        AtomicVec::new(),
-            server:        udp,
-            server_addr:   server_address,
-            workers:       AtomicU64::new(0),
-            id:            cpu::rdtsc(),
+            master_vm:      Arc::new(master),
+            coverage:       Aht::new(),
+            stats:          LockCell::new(Statistics::default()),
+            timeout:        None,
+            inject:         None,
+            vmexit_filter:  None,
+            input_dedup:    Aht::new(),
+            inputs:         AtomicVec::new(),
+            server:         udp,
+            server_addr:    server_address,
+            workers:        AtomicU64::new(0),
+            id:             cpu::rdtsc(),
+            global_context: None,
         }
     }
 
@@ -901,7 +1484,7 @@ impl<'a> FuzzSession<'a> {
     /// of the snapshot such that they can be mutated to create the basis for
     /// all fuzz cases.
     pub fn init_master_vm<F>(mut self, callback: F) -> Self
-            where F: FnOnce(&mut Worker) {
+            where F: FnOnce(&mut Worker<C>) {
         callback(Arc::get_mut(&mut self.master_vm).unwrap());
         self
     }
@@ -914,21 +1497,28 @@ impl<'a> FuzzSession<'a> {
 
     /// Set the injection callback routine. This will be invoked every time
     /// the VM is reset and a new fuzz case is about to begin.
-    pub fn inject(mut self, inject: InjectCallback<'a>) -> Self {
+    pub fn inject(mut self, inject: InjectCallback<'a, C>) -> Self {
         self.inject = Some(inject);
+        self
+    }
+    
+    /// Set the global context for the session
+    pub fn global_context(mut self, context: C) -> Self {
+        self.global_context = Some(Arc::new(context));
         self
     }
     
     /// Set the VM exit filter for the workers. This will be invoked on an
     /// unhandled VM exit and gives an opportunity for the fuzzer to handle
     /// a VM exit to allow re-entry into the VM
-    pub fn vmexit_filter(mut self, vmexit_filter: VmExitFilter<'a>) -> Self {
+    pub fn vmexit_filter(mut self, vmexit_filter: VmExitFilter<'a, C>)
+            -> Self {
         self.vmexit_filter = Some(vmexit_filter);
         self
     }
 
     /// Get a new worker for this fuzz session
-    pub fn worker(session: Arc<Self>) -> Worker<'a> {
+    pub fn worker(session: Arc<Self>) -> Worker<'a, C> {
         // Log into the server with a new worker
         session.login();
 
@@ -944,9 +1534,13 @@ impl<'a> FuzzSession<'a> {
         // Attempt to log into the server
         let mut packet = self.server.device().allocate_packet();
         {
+            let stats = self.stats.lock();
             let mut pkt = packet.create_udp(&self.server_addr);
             ServerMessage::ReportStatistics {
-                fuzz_cases: self.stats.lock().fuzz_cases
+                fuzz_cases:   stats.fuzz_cases,
+                total_cycles: stats.total_cycles,
+                vm_cycles:    stats.vm_cycles,
+                reset_cycles: stats.reset_cycles,
             }.serialize(&mut pkt).unwrap();
         }
         self.server.device().send(packet, true);
@@ -991,7 +1585,6 @@ impl<'a> FuzzSession<'a> {
         if self.coverage.entry_or_insert(cr, cr.offset as usize,
                                          || Box::new(())).inserted() {
             // Coverage was new, report it to the server
-
             loop {
                 // Report the coverage
                 let mut packet = self.server.device().allocate_packet();
@@ -1033,5 +1626,4 @@ impl<'a> FuzzSession<'a> {
         }
     }
 }
-
 
