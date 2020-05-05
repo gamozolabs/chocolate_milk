@@ -596,8 +596,6 @@ impl<'a, C> Worker<'a, C> {
         // Get the base of the TEB
         let gs_base = self.vm.reg(Register::GsBase);
 
-        print!("{:#x}\n", gs_base);
-
         // Get the address of the `_PEB`
         let peb = self.read_virt::<u64>(VirtAddr(gs_base + 0x60))?;
 

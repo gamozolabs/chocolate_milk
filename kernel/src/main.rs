@@ -90,7 +90,70 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // which has a "main" or something and call `mod::main()`
     // ====================================================================
     
-    test_fuzzer::fuzz();
+    if core!().id == 0 {
+        use net::{NetDevice, UdpBind, UdpAddress};
+        use falktp::DatagramTransceiver;
+        use crate::noodle::Writer;
+
+        /// A session of lossless UDP transactions. Allows sending and
+        /// receiving data in a stable and windows way over UDP. Totally not
+        /// just too lazy to implement TCP.
+        struct LosslessUdp {
+            /// A UDP binding which we send from
+            udp: UdpBind,
+
+            /// The address of what we are talking to
+            address: UdpAddress,
+        }
+
+        impl LosslessUdp {
+            /// Create a new lossless UDP session to `server`. There is no
+            /// protocol negotiation here, it's just expected that both
+            /// parties are complying.
+            ///
+            /// This is not zero-cost, as we have to resolve the target address
+            /// over ARP.
+            fn new(server: &str) -> Option<Self> {
+                // Get access to a network device
+                let netdev = NetDevice::get()?;
+
+                // Bind to a random UDP port on this network device
+                let udp = NetDevice::bind_udp(netdev.clone())?;
+
+                // Resolve the target
+                let address =
+                    UdpAddress::resolve(&netdev, udp.port(), server)?;
+
+                Some(LosslessUdp {
+                    udp,
+                    address,
+                })
+            }
+        }
+
+        impl DatagramTransceiver for LosslessUdp {
+            fn send(&mut self, data: &[u8], flush: bool) {
+                let mut packet = self.udp.device().allocate_packet();
+                {
+                    let mut pkt = packet.create_udp(&self.address);
+                    pkt.write(data);
+                }
+                self.udp.device().send(packet, flush);
+            }
+
+            fn recv<T, F: FnMut(&[u8]) -> Option<T>>(&mut self, mut func: F)
+                    -> Option<T> {
+                self.udp.recv_timeout(50_000, |_, udp| {
+                    Some(func(udp.payload))
+                })?
+            }
+        }
+
+        let mut ludp = LosslessUdp::new("192.168.100.1:1911").unwrap();
+        ludp.send_message(&[b'A'; 129]);
+    }
+
+    //test_fuzzer::fuzz();
 
     cpu::halt();
 }
