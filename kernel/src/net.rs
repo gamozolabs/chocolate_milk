@@ -35,9 +35,9 @@ const ETHTYPE_IPV4: u16 = 0x0800;
 /// UDP protocol for the IP header
 const IPPROTO_UDP: u8 = 0x11;
 
-/// UDP address
+/// UDP/TCP address
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct UdpAddress {
+pub struct NetAddress {
     pub src_eth:  [u8; 6],
     pub dst_eth:  [u8; 6],
     pub src_ip:   Ipv4Addr,
@@ -46,18 +46,18 @@ pub struct UdpAddress {
     pub dst_port: u16,
 }
 
-impl UdpAddress {
+impl NetAddress {
     /// Convert a `src_port` and destination string in the form "1.2.3.4:1337"
-    /// into a `UdpAddress`
+    /// into a `NetAddress`
     pub fn resolve(device: &NetDevice, src_port: u16, dst: &str)
-            -> Option<UdpAddress> {
+            -> Option<NetAddress> {
         let mut iter = dst.split(":");
         let dst_ip   = Ipv4Addr::from(iter.next().unwrap());
         let dst_port = u16::from_str_radix(iter.next().unwrap(), 10)
             .expect("Invalid UDP address:port string");
         assert!(iter.next().is_none(), "Invalid UDP address:port string");
 
-        Some(UdpAddress {
+        Some(NetAddress {
             src_eth:  device.mac(),
             dst_eth:  device.arp(dst_ip)?,
             src_ip:   device.dhcp_lease.lock().as_ref().unwrap().client_ip,
@@ -478,7 +478,7 @@ pub struct UdpBuilder<'a> {
     udp_payload: usize,
 
     /// Address to construct the packet with
-    addr: &'a UdpAddress,
+    addr: &'a NetAddress,
 }
 
 impl<'a> UdpBuilder<'a> {
@@ -791,7 +791,7 @@ impl Packet {
     /// Create a new raw UDP packet
     /// Returns the index into the packet where the message should be placed.
     #[inline]
-    pub fn create_udp<'a, 'b: 'a>(&'b mut self, addr: &'a UdpAddress)
+    pub fn create_udp<'a, 'b: 'a>(&'b mut self, addr: &'a NetAddress)
             -> UdpBuilder<'a> {
         // Return the index of where to populate the message payload
         UdpBuilder {
