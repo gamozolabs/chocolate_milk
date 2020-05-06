@@ -210,9 +210,6 @@ pub fn panic(info: &PanicInfo) -> ! {
         // Save the panic info for this core
         PANIC_PENDING.store(info as *const _ as *mut _, Ordering::SeqCst);
         
-        cpu::halt();
-
-        /*
         unsafe {
             // Forcibly get access to the current APIC. This is likely safe in
             // almost every situation as the APIC is not very stateful.
@@ -221,7 +218,9 @@ pub fn panic(info: &PanicInfo) -> ! {
 
             // Notify the BSP that we paniced by sending it an NMI
             apic.ipi(0, (1 << 14) | (4 << 8));
-        }*/
+        }
+        
+        cpu::halt();
     }
 }
 

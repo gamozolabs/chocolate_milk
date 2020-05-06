@@ -4,7 +4,8 @@ use core::mem::size_of;
 use core::convert::TryInto;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
-use crate::net::{NetDevice, Packet, Udp, Ipv4Addr, UdpAddress};
+use crate::net::{NetDevice, Packet, Ipv4Addr, NetAddress};
+use crate::net::udp::Udp;
 
 /// Amount of time to wait for a DHCP response from the server in microseconds.
 /// If the DHCP process takes longer than this we will give up and return
@@ -267,7 +268,7 @@ fn parse_dhcp_packet<'a>(xid: u32, udp: Udp<'a>) ->
 fn create_dhcp_packet(packet: &mut Packet, xid: u32,
                       mac: [u8; 6], options: &[u8]) {
     // Initialize the packet for a UDP DHCP packet
-    let addr = UdpAddress {
+    let addr = NetAddress {
         src_eth:  mac,
         dst_eth:  [0xff; 6],
         src_ip:   0.into(),

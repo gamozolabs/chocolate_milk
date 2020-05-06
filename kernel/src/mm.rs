@@ -4,17 +4,21 @@ use core::marker::PhantomData;
 use core::mem::{size_of, align_of};
 use core::ops::{Deref, DerefMut};
 use core::alloc::{Layout, GlobalAlloc};
-use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU32, AtomicPtr, Ordering};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 
-use crate::acpi::MAX_CORES;
+use crate::acpi::{self, ApicState, MAX_CORES};
 
 use rangeset::Range;
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::KERNEL_VMEM_BASE;
 use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
 use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_NX};
+
+/// Cores should check this during an NMI to see if they are being shot down
+/// If it is equal to their APIC ID, they are being shot down
+pub static SHOULD_SHOOTDOWN: AtomicU32 = AtomicU32::new(!0);
 
 /// Table which is indexed by an APIC identifier to map to a physical range
 /// which is local to it its NUMA node
@@ -307,8 +311,31 @@ impl PhysMem for PhysicalMemory {
         Some((paddr.0 + KERNEL_PHYS_WINDOW_BASE) as *mut u8)
     }
 
+    unsafe fn tlb_shootdown(&mut self) {
+        // Only do this if we have a valid APIC initialized
+        if let Some(our_apic_id) = core!().apic_id() {
+            // Forcibly get access to the current APIC. This is likely safe in
+            // almost every situation as the APIC is not very stateful.
+            let apic = &mut *core!().apic().shatter();
+            let apic = apic.as_mut().unwrap();
+
+            // Send an NMI to all cores, waiting for it to respond
+            for apic_id in 0..acpi::MAX_CORES as u32 {
+                // Don't NMI ourself
+                if apic_id == our_apic_id { continue; }
+
+                let state = acpi::core_state(apic_id);
+                if state == ApicState::Online {
+                    SHOULD_SHOOTDOWN.store(apic_id, Ordering::SeqCst);
+                    apic.ipi(apic_id, (1 << 14) | (4 << 8));
+                    while SHOULD_SHOOTDOWN.load(Ordering::SeqCst) != !0 {}
+                }
+            }
+        }
+    }
+
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
-        if layout.size() == 4096 && layout.align() >= 4096 {
+        let ret = if layout.size() == 4096 && layout.align() >= 4096 {
             Some(unsafe { core!().free_list().lock().pop() })
         } else {
             // Get access to physical memory
@@ -323,7 +350,8 @@ impl PhysMem for PhysicalMemory {
                                                layout.align() as u64,
                                                memory_range())?;
             Some(PhysAddr(alc as u64))
-        }
+        };
+        ret
     }
 
     fn free_phys(&mut self, phys: PhysAddr, size: u64) {

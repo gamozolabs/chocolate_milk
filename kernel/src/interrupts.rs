@@ -346,6 +346,15 @@ pub unsafe extern fn interrupt_handler(
 
     // Handle NMIs specially
     if number == 2 {
+        // Check if this was a TLB shootdown
+        if let Some(apic_id) = core!().apic_id() {
+            if crate::mm::SHOULD_SHOOTDOWN.compare_and_swap(
+                    apic_id, !0, Ordering::SeqCst) == apic_id {
+                cpu::write_cr3(cpu::read_cr3());
+                return;
+            }
+        }
+
         // If this is core ID 0, other cores have paniced and are informing us
         // of their panic.
         if core!().id == 0  {

@@ -596,6 +596,11 @@ impl NetDriver for IntelGbit {
 
         // Set the packet length to 64 bytes minimum
         if packet.len() < 64 {
+            // Zero out padding bytes
+            let pl = packet.len();
+            packet.raw[pl..64].iter_mut().for_each(|x| *x = 0);
+
+            // Set the length 64 bytes
             packet.set_len(64);
         }
 
@@ -632,8 +637,11 @@ impl NetDriver for IntelGbit {
         tx_state.descriptors[tail_idx] =
             LegacyTxDesc {
                 buffer: packet.phys_addr().0,
-                cmd:    (1 << 3) | (1 << 1) | (1 << 0),
-                len:    packet.len() as u16,
+                cmd: (1 << 3) | (1 << 1) | (1 << 0) |
+                    if packet.tcp_checksum.is_some() { 1 << 2 } else { 0 },
+                len: packet.len() as u16,
+                css: packet.tcp_checksum.map(|x| x.0).unwrap_or(0),
+                cso: packet.tcp_checksum.map(|x| x.1).unwrap_or(0),
                 ..Default::default()
             };
  
@@ -673,6 +681,21 @@ impl NetDriver for IntelGbit {
             // Put the packet back into the free list
             packets.push(packet);
         }
+    }
+    
+    unsafe fn reset(&self) {
+        // Write all `f`s to the IMC to disable all interrupts
+        self.write(self.regs.imc, !0);
+
+        // Reset the NIC
+        self.write(self.regs.ctrl, self.read(self.regs.ctrl) | (1 << 26));
+
+        // Wait for the reset to clear
+        while (self.read(self.regs.ctrl) & (1 << 26)) != 0 {}
+        crate::time::sleep(20000);
+
+        // Write all `f`s to the IMC to disable all interrupts
+        self.write(self.regs.imc, !0);
     }
 }
 

@@ -123,6 +123,9 @@ pub trait PhysMem {
     /// memory at `paddr` for `size` bytes
     unsafe fn translate_mut(&mut self, paddr: PhysAddr, size: usize)
         -> Option<*mut u8>;
+
+    /// Initiate a TLB shootdown on all cores
+    unsafe fn tlb_shootdown(&mut self);
    
     /// Allocate physical memory with a requested layout
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr>;
@@ -447,6 +450,9 @@ impl PageTable {
             // reduces the cost of invalidating many pages. For example,
             // unmapping a ~1 MiB allocation.
             cpu::write_cr3(cpu::read_cr3());
+
+            // Request a TLB shootdown
+            phys_mem.tlb_shootdown();
         }
 
         Some(())

@@ -24,7 +24,8 @@ impl NetDevice {
         let request_ip: Ipv4Addr = ip.into();
         
         // Get our own IP
-        let our_ip = self.dhcp_lease.lock().as_ref().unwrap().client_ip;
+        let our_ip: Ipv4Addr =
+            self.dhcp_lease.lock().as_ref().unwrap().client_ip;
 
         'send_arp: for _ in 0..10000 {
             // Allocate a packet
@@ -90,6 +91,9 @@ impl NetDevice {
                             return Some(arp.sender_mac);
                         }
                     }
+
+                    // We couldn't handle the packet, discard it
+                    self.discard(packet);
                 }
             }
         }

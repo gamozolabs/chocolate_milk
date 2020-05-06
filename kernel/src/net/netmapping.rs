@@ -12,7 +12,8 @@ use page_table::{PAGE_NX, PAGE_WRITE, PAGE_PRESENT};
 use lockcell::LockCell;
 use crate::core_locals::LockInterrupts;
 use crate::mm::{self, PhysicalMemory};
-use crate::net::{NetDevice, UdpAddress, UdpBind};
+use crate::net::{NetDevice, NetAddress};
+use crate::net::udp::UdpBind;
 use crate::interrupts::{register_fault_handler, FaultReg, PageFaultHandler};
 
 /// Structure to handle `NetMapping` page faults
@@ -30,7 +31,7 @@ pub struct NetMapHandler {
     size: usize,
 
     /// Address of the server we are communicating with
-    server: UdpAddress,
+    server: NetAddress,
 
     /// Set to `true` if this is a read only mapping
     read_only: bool,
@@ -200,7 +201,7 @@ impl<'a> NetMapping<'a> {
         let udp = NetDevice::bind_udp(netdev.clone())?;
 
         // Resolve the target
-        let server = UdpAddress::resolve(
+        let server = NetAddress::resolve(
             &netdev, udp.port(), server)
             .expect("Couldn't resolve target address");
 

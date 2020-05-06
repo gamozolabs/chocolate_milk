@@ -32,6 +32,8 @@ impl<'a> PhysMem for PhysicalMemory<'a> {
         Some(paddr as *mut u8)
     }
 
+    unsafe fn tlb_shootdown(&mut self) {}
+
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
         Some(PhysAddr(
             self.0.allocate(layout.size() as u64, layout.align() as u64)

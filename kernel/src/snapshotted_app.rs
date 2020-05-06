@@ -16,7 +16,8 @@ use crate::mm;
 use crate::time;
 use crate::ept::{EPT_READ, EPT_WRITE, EPT_EXEC, EPT_USER_EXEC};
 use crate::ept::EPT_MEMTYPE_WB;
-use crate::net::{NetDevice, UdpBind, UdpAddress};
+use crate::net::{NetDevice, NetAddress};
+use crate::net::udp::UdpBind;
 use crate::vtx::{Vm, VmExit, Register, Exception, FxSave};
 use crate::net::netmapping::NetMapping;
 use crate::core_locals::LockInterrupts;
@@ -1224,7 +1225,7 @@ pub struct FuzzSession<'a, C> {
     server: UdpBind,
 
     /// Address to use when communicating with the server
-    server_addr: UdpAddress,
+    server_addr: NetAddress,
 
     /// Number of workers
     workers: AtomicU64,
@@ -1458,7 +1459,7 @@ impl<'a, C> FuzzSession<'a, C> {
             .expect("Failed to bind to UDP for network");
 
         // Resolve the target
-        let server_address = UdpAddress::resolve(
+        let server_address = NetAddress::resolve(
             &netdev, udp.port(), server)
             .expect("Couldn't resolve target address");
 
