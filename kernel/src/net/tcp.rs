@@ -716,8 +716,8 @@ impl<'a> Drop for TcpBuilder<'a> {
             ip[16..20].copy_from_slice(&self.addr.dst_ip.0.to_be_bytes());
 
             // Compute the checksum and fill in the checksum field
-            let checksum = Packet::checksum(0, ip);
-            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+            let checksum = !Packet::checksum(0, ip);
+            ip[10..12].copy_from_slice(&checksum.to_ne_bytes());
         }
 
         {
@@ -752,23 +752,27 @@ impl<'a> Drop for TcpBuilder<'a> {
             // Window size
             tcp[0x0e..0x10].copy_from_slice(&self.window.to_be_bytes());
             
-            // Checksum
-            tcp[0x10..0x12].copy_from_slice(&(!Packet::checksum(0, &pseudo))
-                                            .to_be_bytes());
+            // Zero out the initial checksum value
+            tcp[0x10..0x12].copy_from_slice(&[0u8; 2]);
             
             // Urgent pointer
             tcp[0x12..0x14].copy_from_slice(&0u16.to_be_bytes());
 
             // Copy in the options
             tcp[0x14..0x14 + self.options.len()].copy_from_slice(self.options);
+            
+            // Checksum
+            let csum = Packet::checksum(0, &pseudo);
+            let csum = Packet::checksum(csum as u32, &self.packet.raw[
+                14 + 20.. 
+                14 + 20 + 20 + self.options.len() + self.tcp_payload]);
+            self.packet.raw[14 + 20 + 0x10..14 + 20 + 0x12]
+                .copy_from_slice(&(!csum).to_ne_bytes());
         }
 
         // Set the length of the packet
         self.packet.set_len(14 + 20 + 20 + self.options.len() +
                             self.tcp_payload);
-
-        // Indicate we need a TCP checksum inserted
-        self.packet.tcp_checksum((14 + 20, 14 + 20 + 16));
     }
 }
 

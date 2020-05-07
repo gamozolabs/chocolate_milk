@@ -637,11 +637,8 @@ impl NetDriver for IntelGbit {
         tx_state.descriptors[tail_idx] =
             LegacyTxDesc {
                 buffer: packet.phys_addr().0,
-                cmd: (1 << 3) | (1 << 1) | (1 << 0) |
-                    if packet.tcp_checksum.is_some() { 1 << 2 } else { 0 },
+                cmd: (1 << 3) | (1 << 1) | (1 << 0),
                 len: packet.len() as u16,
-                css: packet.tcp_checksum.map(|x| x.0).unwrap_or(0),
-                cso: packet.tcp_checksum.map(|x| x.1).unwrap_or(0),
                 ..Default::default()
             };
  

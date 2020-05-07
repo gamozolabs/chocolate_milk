@@ -314,8 +314,8 @@ impl<'a> Drop for UdpBuilder<'a> {
             ip[16..20].copy_from_slice(&self.addr.dst_ip.0.to_be_bytes());
 
             // Compute the checksum and fill in the checksum field
-            let checksum = Packet::checksum(0, ip);
-            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+            let checksum = !Packet::checksum(0, ip);
+            ip[10..12].copy_from_slice(&checksum.to_ne_bytes());
         }
 
         {

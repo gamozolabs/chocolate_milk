@@ -368,6 +368,8 @@ impl<'a, C> Worker<'a, C> {
                 break 'vm_loop VmExit::Timeout;
             }
 
+            single_step = 0;
+
             // Check if single stepping is requested
             if single_step > 0 {
                 // Enable single stepping

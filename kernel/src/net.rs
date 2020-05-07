@@ -364,25 +364,15 @@ pub struct Packet {
 
     /// Size of the `raw` member, in bytes
     length: usize,
-
-    /// Checksum start offset and checksum offset for TCP checksum offload
-    tcp_checksum: Option<(u8, u8)>,
 }
 
 impl Packet {
     /// Creates new physical storage for a packet
     pub fn new() -> Packet {
         Packet {
-            raw:          PhysContig::new([0u8; 4096]),
-            length:       0,
-            tcp_checksum: None,
+            raw:    PhysContig::new([0u8; 4096]),
+            length: 0,
         }
-    }
-
-    /// Request a TCP checksum will be inserted by the NIC at `offset.1` and
-    /// the checksum will be computed starting from `offset.0`
-    fn tcp_checksum(&mut self, offset: (u8, u8)) {
-        self.tcp_checksum = Some(offset);
     }
 
     /// Compute a ones-complement checksum
@@ -404,7 +394,7 @@ impl Packet {
         // Carry over the carries and invert the whole thing
         let checksum = (checksum & 0xffff).wrapping_add(checksum >> 16);
         let checksum = (checksum & 0xffff).wrapping_add(checksum >> 16);
-        (!(checksum as u16)).to_be()
+        checksum as u16
     }
 
     /// Parse the ethernet header
@@ -474,11 +464,6 @@ impl Packet {
         if total_length < 20 || total_length as usize > eth.payload.len() {
             return None;
         }        
-
-        // Check the checksum
-        if Self::checksum(0, &header) != 0 {
-            return None;
-        }
 
         // Return out the parsed IP information
         Some(Ip {
