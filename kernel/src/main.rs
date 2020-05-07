@@ -90,24 +90,43 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // which has a "main" or something and call `mod::main()`
     // ====================================================================
     
+    /*
     if core!().id == 0 {
         use net::NetDevice;
 
         // Get access to a network device
         let netdev = NetDevice::get().unwrap();
-        let _udp = NetDevice::bind_udp(netdev.clone()).unwrap();
-
-        let mut buf = vec![0u8; 6 * 1024 * 1024 * 1024];
-
         let tcp = NetDevice::tcp_connect(netdev.clone(),
-            "192.168.100.1:2000").unwrap();
+            "192.168.100.1:1911").unwrap();
+
+        use crate::noodle::Serialize;
+        let mut message = alloc::vec::Vec::new();
+        falktp::ServerMessage::Login(5, 5).serialize(&mut message);
+        tcp.send(&message);
+    }*/
+
+    /*
+    //if core!().id == 0 {
+        let nm = net::netmapping::NetMapping::new("192.168.100.1:1911",
+                                                  "out.falkdump", true)
+            .unwrap();
+
+        print!("Netmapped {}\n", core!().id);
 
         let it = cpu::rdtsc();
-        tcp.recv(&mut buf).unwrap();
-        print!("RXED all in {:16.6} seconds\n", time::elapsed(it));
-    }
+        for page in 0..64 * 1024 {
+            let elapsed = time::elapsed(it);
+            if elapsed > 5.0 {
+                print!("{:10.4} MiB/sec\n", (page * 4096) as f64 / time::elapsed(it) / 1024. / 1024.);
+                break;
+            }
+            
+            let slc = &nm[page * 4096..page * 4096 + 20];
+            unsafe { core::ptr::read_volatile(slc.as_ptr()); }
+        }
+    //}*/
 
-    //test_fuzzer::fuzz();
+    test_fuzzer::fuzz();
 
     cpu::halt();
 }

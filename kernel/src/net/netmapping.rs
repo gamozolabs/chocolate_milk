@@ -3,6 +3,7 @@
 use core::ops::{Deref, DerefMut};
 use core::alloc::Layout;
 use core::convert::TryInto;
+use alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::borrow::Cow;
 use noodle::*;
@@ -12,8 +13,8 @@ use page_table::{PAGE_NX, PAGE_WRITE, PAGE_PRESENT};
 use lockcell::LockCell;
 use crate::core_locals::LockInterrupts;
 use crate::mm::{self, PhysicalMemory};
-use crate::net::{NetDevice, NetAddress};
-use crate::net::udp::UdpBind;
+use crate::net::NetDevice;
+use crate::net::tcp::TcpConnection;
 use crate::interrupts::{register_fault_handler, FaultReg, PageFaultHandler};
 
 /// Structure to handle `NetMapping` page faults
@@ -21,8 +22,8 @@ pub struct NetMapHandler {
     /// Virtual address of the base of the mapping
     vaddr: VirtAddr,
 
-    /// A UDP port which we are bound to and able to recv from and send to
-    udp: UdpBind,
+    /// A TCP port which we are bound to and able to recv from and send to
+    tcp: TcpConnection,
     
     /// File ID of the open file on the server
     file_id: u64,
@@ -30,11 +31,11 @@ pub struct NetMapHandler {
     /// Size of the file in bytes
     size: usize,
 
-    /// Address of the server we are communicating with
-    server: NetAddress,
-
     /// Set to `true` if this is a read only mapping
     read_only: bool,
+
+    /// Buffer to use for serializing data
+    buffer: Vec<u8>,
 
     /// Used to prevent multiple cores from handling the exception at the
     /// same time.
@@ -78,7 +79,15 @@ impl PageFaultHandler for NetMapHandler {
             // Compute the offset into the mapping that this fault represents
             // and page align it
             let offset = ((fault_addr.0 & !0xfff) - self.vaddr.0) as usize;
-            
+
+            // Request the file contents at this offset
+            self.buffer.clear();
+            ServerMessage::ReadPage {
+                id:     self.file_id,
+                offset: offset,
+            }.serialize(&mut self.buffer).unwrap();
+            self.tcp.send(&self.buffer).unwrap();
+
             // Allocate the backing page for the mapping
             let page = {
                 // Get access to physical memory
@@ -92,66 +101,12 @@ impl PageFaultHandler for NetMapHandler {
             // Get a mutable slice to the physical memory backing the page
             let new_page = mm::slice_phys_mut(page, 4096);
 
-            // Compute the number of bytes we expect to receive
-            let to_recv = core::cmp::min(4096, self.size - offset);
-
-            // Zero out any remainder of the page that will not be copied into
-            new_page[to_recv..].iter_mut().for_each(|x| *x = 0);
-
-            let mut retries = 0;
-            'retry: loop {
-                retries += 1;
-                if retries > 100 {
-                    panic!("Failed to download backing page");
+            // Receive the raw payload
+            match ServerMessage::deserialize(&mut self.tcp) {
+                Some(ServerMessage::ReadPageResponse(page)) => {
+                    new_page.copy_from_slice(&page);
                 }
-
-                // Request the file contents at this offset
-                let mut packet = self.udp.device().allocate_packet();
-                {
-                    let mut pkt = packet.create_udp(&self.server);
-                    ServerMessage::Read {
-                        id:     self.file_id,
-                        offset: offset,
-                        size:   to_recv,
-                    }.serialize(&mut pkt).unwrap();
-                }
-                self.udp.device().send(packet, true);
-
-                // Wait for a success
-                if self.udp.recv_timeout(100_000, |_, udp| {
-                    let mut ptr = &udp.payload[..];
-                    match ServerMessage::deserialize(&mut ptr)? {
-                        ServerMessage::ReadOk  => Some(()),
-                        ServerMessage::ReadErr =>
-                            panic!("Could not satisfy network mapping read"),
-                        _ => unreachable!(),
-                    }
-                }).is_none() {
-                    // Retry
-                    continue 'retry;
-                }
-
-                // Receive the raw payload
-                let mut recv_off = 0;
-                while recv_off < to_recv {
-                    // Receive packets until we got everything we expected
-                    if self.udp.recv_timeout(100_000, |_, udp| {
-                        assert!(udp.payload.len() <= to_recv - recv_off,
-                            "Whoa, larger packet than expected");
-
-                        // Copy the payload into the page
-                        new_page[recv_off..recv_off + udp.payload.len()]
-                            .copy_from_slice(&udp.payload);
-
-                        recv_off += udp.payload.len();
-                        Some(())
-                    }).is_none() {
-                        continue 'retry;
-                    }
-                }
-
-                // Received everything!
-                break;
+                _ => panic!("Unexpected server message during read page"),
             }
 
             // Get access to physical memory
@@ -194,39 +149,26 @@ impl<'a> NetMapping<'a> {
     /// Create a network mapped view of `filename`
     /// `server` should be the `ip:port` for the server
     pub fn new(server: &str, filename: &str, read_only: bool) -> Option<Self> {
+        // Create a buffer for serializing data
+        let mut buffer = Vec::new();
+
         // Get access to a network device
         let netdev = NetDevice::get()?;
 
-        // Bind to a random UDP port on this network device
-        let udp = NetDevice::bind_udp(netdev.clone())?;
+        // Connect to the server
+        let mut tcp = NetDevice::tcp_connect(netdev, server)?;
 
-        // Resolve the target
-        let server = NetAddress::resolve(
-            &netdev, udp.port(), server)
-            .expect("Couldn't resolve target address");
+        // Send the get file ID request
+        buffer.clear();
+        ServerMessage::GetFileId(Cow::Borrowed(filename))
+            .serialize(&mut buffer);
+        tcp.send(&buffer)?;
 
-        // Allocate a packet
-        let mut packet = netdev.allocate_packet();
-        {
-            let mut pkt = packet.create_udp(&server);
-            ServerMessage::GetFileId(Cow::Borrowed(filename))
-                .serialize(&mut pkt).unwrap();
-        }
-        netdev.send(packet, true);
-
-        // Wait for the response packet
-        let (file_id, size) = udp.recv_timeout(5_000_000, |_, udp| {
-            // Deserialize the message
-            let mut ptr = &udp.payload[..];
-            let msg = ServerMessage::deserialize(&mut ptr)
-                .expect("Failed to deserialize File ID response");
-
-            match msg {
-                ServerMessage::FileId { id, size } => Some(Some((id, size))),
-                ServerMessage::FileIdErr           => Some(None),
-                _ => unreachable!(),
-            }
-        })??;
+        // Get the response
+        let (file_id, size) = match ServerMessage::deserialize(&mut tcp)? {
+            ServerMessage::FileId { id, size } => (id, size),
+            _ => return None,
+        };
 
         // Nothing to map
         if size <= 0 { return None; }
@@ -239,10 +181,10 @@ impl<'a> NetMapping<'a> {
         let handler = Box::new(NetMapHandler {
             vaddr:     virt_addr,
             file_id:   file_id,
-            udp:       udp,
+            tcp:       tcp,
             size:      size,
-            server:    server,
             read_only: read_only,
+            buffer:    buffer,
             handling:  LockCell::new_no_preempt(()),
         });
 

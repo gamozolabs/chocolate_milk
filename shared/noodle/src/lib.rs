@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 #![feature(const_generics)]
 #![allow(incomplete_features)]
 
@@ -37,7 +37,16 @@ impl Writer for Vec<u8> {
     }
 }
 
+/// `Reader` implementation for types that implement `Read`
+#[cfg(feature = "std")]
+impl<T: std::io::Read> Reader for T {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Option<()> {
+        self.read_exact(buf).ok()
+    }
+}
+
 /// Basic `Reader` implementation for slices of bytes
+#[cfg(not(feature = "std"))]
 impl Reader for &[u8] {
     fn read_exact(&mut self, buf: &mut [u8]) -> Option<()> {
         buf.copy_from_slice(self.get(..buf.len())?);

@@ -16,8 +16,8 @@ use crate::mm;
 use crate::time;
 use crate::ept::{EPT_READ, EPT_WRITE, EPT_EXEC, EPT_USER_EXEC};
 use crate::ept::EPT_MEMTYPE_WB;
-use crate::net::{NetDevice, NetAddress};
-use crate::net::udp::UdpBind;
+use crate::net::NetDevice;
+use crate::net::tcp::TcpConnection;
 use crate::vtx::{Vm, VmExit, Register, Exception, FxSave};
 use crate::net::netmapping::NetMapping;
 use crate::core_locals::LockInterrupts;
@@ -204,6 +204,7 @@ struct NetBacking<'a> {
     phys_ranges: BTreeMap<u64, (usize, u64)>,
 }
 
+/// A VM worker which is likely part of a large fuzzing group
 pub struct Worker<'a, C> {
     /// Master worker that we are forked from
     master: Option<Arc<Self>>,
@@ -236,6 +237,9 @@ pub struct Worker<'a, C> {
     /// Unique worker identifier
     worker_id: u64,
 
+    /// A connection to the server
+    server: Option<TcpConnection>,
+
     /// List of all modules
     /// Maps from base address to module, to end of module (inclusive) and the
     /// module name
@@ -256,6 +260,7 @@ impl<'a, C> Worker<'a, C> {
             worker_id:      !0,
             module_list:    BTreeMap::new(),
             fuzz_input:     None,
+            server:         None,
             global_context: None,
         }
     }
@@ -280,6 +285,7 @@ impl<'a, C> Worker<'a, C> {
             session:        Some(session),
             worker_id:      worker_id,
             module_list:    BTreeMap::new(),
+            server:         None,
             fuzz_input:     Some(Vec::new()),
         }
     }
@@ -563,7 +569,7 @@ impl<'a, C> Worker<'a, C> {
             self.stats.sync_into(&mut session.stats.lock());
             if self.worker_id == 0 {
                 // Report to the server
-                session.report_statistics();
+                session.report_statistics(self.server.as_mut().unwrap());
             }
 
             // Set the next sync time
@@ -1221,11 +1227,8 @@ pub struct FuzzSession<'a, C> {
     /// Global statistics for the fuzz cases
     stats: LockCell<Statistics, LockInterrupts>,
 
-    /// Open connection to the server
-    server: UdpBind,
-
     /// Address to use when communicating with the server
-    server_addr: NetAddress,
+    server_addr: String,
 
     /// Number of workers
     workers: AtomicU64,
@@ -1451,18 +1454,6 @@ impl<'a, C> FuzzSession<'a, C> {
         filter_ars!(Register::LdtrAccessRights, Register::LdtrLimit);
         filter_ars!(Register::TrAccessRights, Register::TrLimit);
 
-        // Get access to a network device
-        let netdev = NetDevice::get().expect("Failed to get network device");
-
-        // Bind to a random UDP port on this network device
-        let udp = NetDevice::bind_udp(netdev.clone())
-            .expect("Failed to bind to UDP for network");
-
-        // Resolve the target
-        let server_address = NetAddress::resolve(
-            &netdev, udp.port(), server)
-            .expect("Couldn't resolve target address");
-
         FuzzSession {
             master_vm:        Arc::new(master),
             coverage:         Aht::new(),
@@ -1473,10 +1464,9 @@ impl<'a, C> FuzzSession<'a, C> {
             vmexit_filter:    None,
             input_dedup:      Aht::new(),
             inputs:           AtomicVec::new(),
-            server:           udp,
-            server_addr:      server_address,
             workers:          AtomicU64::new(0),
             id:               cpu::rdtsc(),
+            server_addr:      server.into(),
             global_context:   None,
         }
     }
@@ -1520,65 +1510,43 @@ impl<'a, C> FuzzSession<'a, C> {
 
     /// Get a new worker for this fuzz session
     pub fn worker(session: Arc<Self>) -> Worker<'a, C> {
-        // Log into the server with a new worker
-        session.login();
-
         // Get a new worker ID
         let worker_id = session.workers.fetch_add(1, Ordering::SeqCst);
 
         // Fork the worker from the master
-        Worker::fork(session.clone(), session.master_vm.clone(), worker_id)
+        let mut worker =
+            Worker::fork(session.clone(),
+                session.master_vm.clone(), worker_id);
+
+        // Connect to the server and associate this connection with the
+        // worker
+        let netdev = NetDevice::get()
+            .expect("Failed to get network device for creating worker");
+        worker.server = Some(
+            NetDevice::tcp_connect(netdev, &session.server_addr)
+            .expect("Failed to connect to server"));
+        
+        // Log into the server with a new worker
+        session.login(worker.server.as_mut().unwrap());
+
+        worker
     }
 
     /// Update statistics to the server
-    pub fn report_statistics(&self) {
-        // Attempt to log into the server
-        let mut packet = self.server.device().allocate_packet();
-        {
-            let stats = self.stats.lock();
-            let mut pkt = packet.create_udp(&self.server_addr);
-            ServerMessage::ReportStatistics {
-                fuzz_cases:   stats.fuzz_cases,
-                total_cycles: stats.total_cycles,
-                vm_cycles:    stats.vm_cycles,
-                reset_cycles: stats.reset_cycles,
-            }.serialize(&mut pkt).unwrap();
-        }
-        self.server.device().send(packet, true);
+    pub fn report_statistics(&self, server: &mut TcpConnection) {
+        let stats = self.stats.lock();
+
+        ServerMessage::ReportStatistics {
+            fuzz_cases:   stats.fuzz_cases,
+            total_cycles: stats.total_cycles,
+            vm_cycles:    stats.vm_cycles,
+            reset_cycles: stats.reset_cycles,
+        }.serialize(server).unwrap();
     }
 
     /// Log in with the server
-    pub fn login(&self) {
-        loop {
-            // Attempt to log into the server
-            let mut packet = self.server.device().allocate_packet();
-            {
-                let mut pkt = packet.create_udp(&self.server_addr);
-                ServerMessage::Login(self.id, core!().id)
-                    .serialize(&mut pkt).unwrap();
-            }
-            self.server.device().send(packet, true);
-
-            // Wait for the acknowledge from the server
-            if self.server.recv_timeout(50_000, |_, udp| {
-                // Deserialize the message
-                let mut ptr = &udp.payload[..];
-                let msg = ServerMessage::deserialize(&mut ptr)
-                    .expect("Failed to deserialize File ID response");
-                
-                // Check if we got an ack
-                match msg {
-                    ServerMessage::LoginAck(sid, core) => {
-                        if sid == self.id && core == core!().id {
-                            Some(())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            }).is_some() { break; }
-        }
+    pub fn login(&self, server: &mut TcpConnection) {
+        ServerMessage::Login(self.id, core!().id).serialize(server).unwrap();
     }
 
     /// Report coverage
@@ -1602,30 +1570,6 @@ impl<'a, C> FuzzSession<'a, C> {
                         .serialize(&mut pkt).unwrap();
                 }
                 self.server.device().send(packet, true);
-
-                // Wait for the acknowledge from the server
-                if self.server.recv_timeout(100, |_, udp| {
-                    // Deserialize the message
-                    let mut ptr = &udp.payload[..];
-                    let msg = ServerMessage::deserialize(&mut ptr)
-                        .expect("Failed to deserialize File ID response");
-                    
-                    // Check if we got an ack
-                    match msg {
-                        ServerMessage::ReportCoverageAck(x) => {
-                            // Check if the ack is acknowledging the coverage
-                            // we reported
-                            if &*x == cr {
-                                // Ack matches, break out of the recv
-                                Some(())
-                            } else {
-                                // Nope
-                                None
-                            }
-                        }
-                        _ => None,
-                    }
-                }).is_some() { break; }
             }*/
 
             true

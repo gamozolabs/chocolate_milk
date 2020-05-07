@@ -7,14 +7,14 @@ use crate::net::{Packet, NetDevice, NetAddress};
 use crate::core_locals::LockInterrupts;
 use alloc::sync::Arc;
 use alloc::collections::VecDeque;
-use noodle::Writer;
+use noodle::{Reader, Writer};
 use lockcell::LockCell;
 
 /// Maximum number of bytes to use for TCP windows
 const WINDOW_SIZE: u16 = 65535;
 
 /// Number of microseconds to wait before timing out on a SYN-ACK response
-const CONNECT_TIMEOUT: u64 = 100_000;
+const CONNECT_TIMEOUT: u64 = 1_000_000;
 
 /// TCP final flag (indicates last packet from sender)
 pub const TCP_FIN: u16 = 1 << 0;
@@ -36,6 +36,21 @@ pub const TCP_ACK: u16 = 1 << 4;
 /// TCP connection
 pub struct TcpConnection(Arc<LockCell<TcpConnectionInt, LockInterrupts>>);
 
+/// States of a TCP connection
+#[derive(PartialEq, Eq)]
+enum TcpState {
+    /// Connection is closed
+    Closed,
+
+    /// We've sent the initial SYN and are awaiting a SYN-ACK
+    SynSent,
+
+    /// We have sent an ACK in response to a SYN-ACK
+    /// It's possible we get another SYN-ACK in this state in the case that
+    /// the ACK we responded with was dropped
+    Established,
+}
+
 /// TCP connection
 pub struct TcpConnectionInt {
     /// Reference to the network device we are a bound on
@@ -47,8 +62,8 @@ pub struct TcpConnectionInt {
     /// Address of the remote server
     server: NetAddress,
 
-    /// Tracks if the connection is established
-    connection_established: bool,
+    /// Tracks the state of the TCP connection
+    state: TcpState,
 
     /// Current sequence
     seq: u32,
@@ -75,62 +90,136 @@ pub struct TcpConnectionInt {
 impl TcpConnectionInt {
     /// Handle a packet which is destined for our window
     pub fn discard(&mut self, tcp: &Tcp) {
-        if self.connection_established == false {
-            return;
+        // Handle the packet
+        self.handle_packet(tcp, None);
+    }
+
+    /// Handle a packet we got from the remote side
+    ///
+    /// This could be a packet providing us with new data, or simply just an
+    /// ack of data we sent it. We should handle all cases of any TCP packet
+    /// we get here.
+    ///
+    /// If `window_bypass` is `Some`, it contains a reference to a slice of
+    /// bytes which will directly receive any bytes that are received during
+    /// packet handling. If the received bytes exceeds this buffer, the
+    /// remaining bytes will go into the connection's window buffer.
+    ///
+    /// This window bypass allows us to directly copy packet bytes into the
+    /// user's buffer in the common-case, rather than taking a middle step
+    /// through the connection window.
+    pub fn handle_packet(&mut self, tcp: &Tcp,
+                         window_bypass: Option<&mut [u8]>) -> Option<usize> {
+        // The caller should filter to make sure it doesn't handle packets for
+        // another port. This gives the caller the opportunity to discard the
+        // packet back to the network stack.
+        assert!(self.port == tcp.dst_port);
+
+        // Nothing to do
+        if self.state == TcpState::Closed {
+            return None;
         }
 
+        // We only ever expect acks at this point
         if tcp.flags & TCP_ACK == 0 {
-            // All packets should be acks at this point
-            return;
-        }
-        
-        // Drop packets that are not in order
-        if tcp.seq != self.ack { return; }
-        
-        // Get remainder of bytes in our window
-        let window_rem = WINDOW_SIZE as usize - self.window.len();
-
-        if tcp.payload.len() > window_rem {
-            // Can't store something larger than our window
-            return;
+            return None;
         }
 
-        // Get number of unacknowledged bytes
+        // Get number of unacknowledged bytes, this tells us how much we have
+        // sent the remote end, but we're waiting for them to acknowledge them
         let unacked = self.seq.wrapping_sub(self.remote_ack);
 
-        // Get the amount of bytes that this ack would increase
-        // the ack count by
+        // See how much the remote ack is advancing the state
         let ack_increase = tcp.ack.wrapping_sub(self.remote_ack);
+
+        // Make sure the remote end is not acknowledging bytes that were never
+        // sent. If it was, drop the packet.
         if ack_increase > unacked {
-            // Acknowledged bytes that were not sent by us
-            return;
+            return None;
+        }
+         
+        // Drop out-of-order packets, this is going to be extremely rare in
+        // the environment we run in, it's just not worth the extra complexity.
+        if self.state == TcpState::Established && tcp.seq != self.ack {
+            return None;
+        }
+        
+        // Tracks the number of bytes copied into the window bypass
+        let mut copied = 0;
+
+        // Tracks if we need to send an ack
+        let mut needs_ack = false;
+
+        // Check if the packet contains any data
+        if self.state == TcpState::Established && tcp.payload.len() > 0 {
+            // Compute how much room our window has left
+            let window_rem = WINDOW_SIZE as usize - self.window.len();
+
+            // Drop packets that exceed our window, the remote side should
+            // never send more than our window.
+            // Even if we have a window bypass, we still want to validate
+            // against our broadcast window, not our true capacity.
+            if tcp.payload.len() > window_rem {
+                return None;
+            }
+
+            // Get a slice referencing the payload from this packet
+            let mut payload = &tcp.payload[..];
+
+            // Check if the user directly wants bytes
+            if let Some(window_bypass) = window_bypass {
+                // Determine the smaller of the two slices
+                let to_copy = core::cmp::min(window_bypass.len(),
+                    payload.len());
+
+                // Copy whatever we can into the window bypass
+                window_bypass[..to_copy].copy_from_slice(&payload[..to_copy]);
+
+                // Track the number of copied bytes into the window bypass
+                copied = to_copy;
+
+                // Advance the payload pointer
+                payload = &payload[to_copy..];
+            }
+
+            // Save the data into our window
+            self.window.extend(payload);
+        
+            // Update the ack to indicate we read the bytes
+            self.ack = self.ack.wrapping_add(tcp.payload.len() as u32);
+            needs_ack = true;
         }
 
-        // Update the server state
+        // Check if this packet may be a SYN-ACK which we are waiting for
+        if (self.state == TcpState::SynSent ||
+                self.state == TcpState::Established) &&
+                tcp.flags & TCP_SYN != 0 {
+            // If we just acked a SYN, update the connection state
+            self.state = TcpState::Established;
+
+            // Set our ack state to the server's sequence + 1
+            self.ack = tcp.seq.wrapping_add(1);
+            needs_ack = true;
+        }
+
+        // Send an ack if needed
+        if needs_ack {
+            let mut packet = self.device.allocate_packet();
+            {
+                packet.create_tcp(
+                    &self.server, TCP_ACK, self.seq, self.ack,
+                    (WINDOW_SIZE as usize - self.window.len()) as u16, &[]);
+            }
+            self.device.send(packet, true);
+        }
+
+        // Update the server state to the most recent packet information
         self.remote_seq    = tcp.seq;
         self.remote_ack    = tcp.ack;
         self.remote_window = tcp.window;
-    
-        // Extend the window
-        self.window.extend(tcp.payload);
 
-        // Update the ack to indicate we read the bytes
-        self.ack = self.remote_seq
-            .wrapping_add(tcp.payload.len() as u32);
-
-        // Ack everything so far
-        let mut packet = self.device.allocate_packet();
-        {
-            // Create a new TCP packet
-            packet.create_tcp(
-                &self.server, TCP_ACK,
-                self.seq, self.ack,
-                (WINDOW_SIZE as usize - self.window.len()) as u16,
-                &[]);
-        }
-
-        // Send the packet
-        self.device.send(packet, true);
+        // Return number of bytes copied into the window bypass
+        Some(copied)
     }
 }
 
@@ -139,8 +228,7 @@ impl TcpConnection {
     /// Currently this returns `Some(())` if and only if all bytes are sent.
     /// If the send never completes, this function never returns.
     pub fn send(&self, buf: &[u8]) -> Option<()> {
-        // Get access to the device as a new `Arc`
-        let device = self.0.lock().device.clone();
+        let mut device = None;
 
         // Pointer to the data to send
         let mut ptr = &buf[..];
@@ -152,6 +240,13 @@ impl TcpConnection {
             {
                 // Get mutable access to the TCP connection
                 let mut conn = self.0.lock();
+                if conn.state != TcpState::Established { return None; }
+
+                // Create a copy of the device to break some lifetime issues
+                // Probably a better way to do this
+                if device.is_none() {
+                    device = Some(conn.device.clone());
+                }
 
                 if cpu::rdtsc() >= timeout {
                     // We didn't get an ack in a timely manner and we either
@@ -172,50 +267,27 @@ impl TcpConnection {
                     conn.seq = conn.remote_ack;
                 }
 
-                if let Some(pkt) = device.recv() {
+                if ptr.len() == 0 && conn.remote_ack == conn.seq {
+                    // Everything has been written and has been acked
+                    return Some(());
+                }
+
+                if let Some(pkt) = device.as_ref().unwrap().recv() {
                     if let Some(tcp) = pkt.tcp() {
+                        // Check if this packet is destined for our port
                         if tcp.dst_port != conn.port {
                             // Packet wasn't for us
-                            device.discard(pkt);
                             core::mem::drop(conn);
+                            device.as_ref().unwrap().discard(pkt);
                             continue;
                         }
-
-                        if tcp.flags & TCP_ACK == 0 {
-                            // All packets should be acks at this point
-                            continue;
-                        }
-
-                        // Get number of unacknowledged bytes
-                        let unacked = conn.seq.wrapping_sub(conn.remote_ack);
-
-                        // Get the amount of bytes that this ack would increase
-                        // the ack count by
-                        let ack_increase =
-                            tcp.ack.wrapping_sub(conn.remote_ack);
-                        if ack_increase > unacked {
-                            // Acknowledged bytes that were not sent
-                            continue;
-                        }
-
-                        // Drop out-of-order packets
-                        if tcp.seq != conn.ack {
-                            continue;
-                        }
-
-                        // Update the server state
-                        conn.remote_seq    = tcp.seq;
-                        conn.remote_ack    = tcp.ack;
-                        conn.remote_window = tcp.window;
-                        
-                        if ptr.len() == 0 && conn.remote_ack == conn.seq {
-                            // Everything has been written and has been acked
-                            return Some(());
-                        }
+        
+                        // Handle the packet we received
+                        conn.handle_packet(&tcp, None);
                     } else {
                         // Packet was not TCP, discard it
                         core::mem::drop(conn);
-                        device.discard(pkt);
+                        device.as_ref().unwrap().discard(pkt);
                     }
                 }
             }
@@ -245,7 +317,7 @@ impl TcpConnection {
             let mut iter = ptr[..remain].chunks(mss);
             while let Some(chunk) = iter.next() {
                 // Allocate a packet
-                let mut packet = device.allocate_packet();
+                let mut packet = device.as_ref().unwrap().allocate_packet();
 
                 {
                     // Create a new TCP packet
@@ -264,7 +336,7 @@ impl TcpConnection {
                 conn.seq = conn.seq.wrapping_add(chunk.len() as u32);
 
                 // Send the packet
-                device.send(packet, iter.len() == 0);
+                device.as_ref().unwrap().send(packet, iter.len() == 0);
             }
 
             // Advance the pointer reflecting what we sent
@@ -279,8 +351,7 @@ impl TcpConnection {
     /// Doesn't return `Some(())` unless all bytes are successfuly read,
     /// currently this never times out if the data does not all get received
     pub fn recv(&self, buf: &mut [u8]) -> Option<()> {
-        // Get a new reference to the device to break some lifetimes
-        let device = self.0.lock().device.clone();
+        let mut device = None;
 
         // Get a pointer to the buffer
         let mut ptr = &mut buf[..];
@@ -288,6 +359,13 @@ impl TcpConnection {
         while ptr.len() > 0 {
             // Get mutable access to the TCP connection
             let mut conn = self.0.lock();
+            if conn.state != TcpState::Established { return None; }
+
+            // Create a copy of the device to break some lifetime issues
+            // Probably a better way to do this
+            if device.is_none() {
+                device = Some(conn.device.clone());
+            }
 
             {
                 // Compute the number of bytes to consume
@@ -300,92 +378,44 @@ impl TcpConnection {
                 ptr = &mut ptr[consumeable..];
             }
 
-            // Satisfied recv from the window
+            // Satisfied recv from the window, we're all done
             if ptr.len() == 0 { break; }
 
-            if let Some(pkt) = device.recv() {
+            if let Some(pkt) = device.as_ref().unwrap().recv() {
                 if let Some(tcp) = pkt.tcp() {
                     if tcp.dst_port != conn.port {
                         // Packet wasn't for us
                         core::mem::drop(conn);
-                        device.discard(pkt);
+                        device.as_ref().unwrap().discard(pkt);
                         continue;
                     }
 
-                    if tcp.flags & TCP_ACK == 0 {
-                        // All packets should be acks at this point
-                        continue;
+                    // Handle the packet we RXed
+                    if let Some(copied) =
+                            conn.handle_packet(&tcp, Some(&mut ptr)) {
+                        ptr = &mut ptr[copied..];
                     }
-                    
-                    // Get number of unacknowledged bytes
-                    let unacked = conn.seq.wrapping_sub(conn.remote_ack);
-
-                    // Get the amount of bytes that this ack would increase
-                    // the ack count by
-                    let ack_increase = tcp.ack.wrapping_sub(conn.remote_ack);
-                    if ack_increase > unacked {
-                        // Acknowledged bytes that were not sent by us
-                        continue;
-                    }
-                
-                    // If this is the next packet we are expecting
-                    if tcp.seq == conn.ack {
-                        // Update the server state
-                        conn.remote_seq    = tcp.seq;
-                        conn.remote_ack    = tcp.ack;
-                        conn.remote_window = tcp.window;
-
-                        // Update the ack to indicate we read the bytes
-                        conn.ack = conn.remote_seq
-                            .wrapping_add(tcp.payload.len() as u32);
-
-                        // Compute the number of bytes to copy
-                        let to_copy = core::cmp::min(ptr.len(),
-                            tcp.payload.len());
-
-                        // Copy the bytes in
-                        ptr[..to_copy].copy_from_slice(
-                            &tcp.payload[..to_copy]);
-
-                        // Advance the pointer
-                        ptr = &mut ptr[to_copy..];
-
-                        // Check if there was a remainder of data
-                        if tcp.payload.len() > to_copy {
-                            // Get a slice to the remainder of data
-                            let remainder = &tcp.payload[to_copy..];
-
-                            // Make sure we don't overflow our window size
-                            if remainder.len() + conn.window.len() <=
-                                    WINDOW_SIZE as usize {
-                                // Add the remainder to our TCP window
-                                conn.window.extend(&tcp.payload[to_copy..]);
-                            }
-                        }
-                    }
-
-                    // Ack everything so far
-                    let mut packet = device.allocate_packet();
-                    {
-                        // Create a new TCP packet
-                        packet.create_tcp(
-                            &conn.server, TCP_ACK,
-                            conn.seq, conn.ack,
-                            (WINDOW_SIZE as usize - conn.window.len()) as u16,
-                            &[]);
-                    }
-
-                    // Send the packet
-                    device.send(packet, true);
                 } else {
                     // Packet wasnt TCP, discard it
                     core::mem::drop(conn);
-                    device.discard(pkt);
+                    device.as_ref().unwrap().discard(pkt);
                 }
             }
         }
 
         Some(())
+    }
+}
+
+impl Reader for TcpConnection {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Option<()> {
+        self.recv(buf)
+    }
+}
+
+impl Writer for TcpConnection {
+    fn write(&mut self, buf: &[u8]) -> Option<()> {
+        self.send(buf)
     }
 }
 
@@ -429,18 +459,19 @@ impl NetDevice {
                 }
 
                 // Create the TCP connection
-                let ret = Arc::new(LockCell::new(TcpConnectionInt {
+                let rand_seq = cpu::rdtsc() as u32;
+                let ret = Arc::new(LockCell::new_no_preempt(TcpConnectionInt {
                     window: VecDeque::with_capacity(WINDOW_SIZE as usize),
                     device:        cur.clone(),
-                    seq:           cpu::rdtsc() as u32,
+                    seq:           rand_seq,
                     ack:           0,
                     server:        server,
                     remote_seq:    0,
-                    remote_ack:    0,
+                    remote_ack:    rand_seq,
                     remote_window: 0,
                     remote_mss:    536,
                     port:          port,
-                    connection_established: false,
+                    state:         TcpState::Closed,
                 }));
 
                 // Insert the TCP connection
@@ -463,6 +494,9 @@ impl NetDevice {
                 
                 // Update the sequence number by 1 since we sent a SYN
                 conn.seq = conn.seq.wrapping_add(1);
+
+                // Update TCP state
+                conn.state = TcpState::SynSent;
             }
 
             // Compute the TSC value at the timeout
@@ -470,6 +504,11 @@ impl NetDevice {
             loop {
                 // Wait for the SYN-ACK
                 let mut conn = ret.0.lock();
+                        
+                // Break if we've established the connection
+                if conn.state == TcpState::Established {
+                    break;
+                }
 
                 // Check if we have timed out
                 if cpu::rdtsc() >= timeout {
@@ -485,56 +524,14 @@ impl NetDevice {
                             continue;
                         }
 
-                        if tcp.flags & TCP_ACK == 0 {
-                            // All packets should be acks at this point
-                            continue;
-                        }
-
-                        // Make sure the sequence is what we expect
-                        if tcp.ack != conn.seq {
-                            continue;
-                        }
-
-                        if tcp.flags & TCP_RST != 0 {
-                            // Active connection rejection
-                            return None;
-                        }
-
-                        // Make sure this is a SYN response
-                        if tcp.flags & TCP_SYN != 0 {
-                            conn.remote_seq    = tcp.seq;
-                            conn.remote_ack    = tcp.ack;
-                            conn.remote_window = tcp.window;
-                            break;
-                        } else {
-                            // Unexpected packet
-                            continue;
-                        }
+                        // Handle the inbound packet
+                        conn.handle_packet(&tcp, None);
                     } else {
                         // Packet wasn't TCP, discard it
                         core::mem::drop(conn);
                         device.discard(pkt);
                     }
                 }
-            }
-
-            {
-                // Ack the SYN-ACK
-                let mut conn = ret.0.lock();
-                let mut packet = device.allocate_packet();
-                {
-                    // Create a new TCP packet
-                    conn.remote_seq = conn.remote_seq.wrapping_add(1);
-                    conn.ack = conn.remote_seq;
-                    packet.create_tcp(
-                        &conn.server, TCP_ACK, conn.seq, conn.ack,
-                        (WINDOW_SIZE as usize - conn.window.len()) as u16,
-                        &[]);
-                }
-                device.send(packet, true);
-            
-                // Connection is now established
-                conn.connection_established = true;
             }
             
             return Some(ret);

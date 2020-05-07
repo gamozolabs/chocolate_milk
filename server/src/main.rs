@@ -6,10 +6,10 @@
 use std::io::{self, Write};
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, Duration};
 use std::hash::{Hash, Hasher};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, TcpStream, TcpListener};
 use std::collections::{BTreeSet, HashMap};
 use std::collections::hash_map::DefaultHasher;
 
@@ -49,8 +49,7 @@ struct Client<'a> {
     coverage: BTreeSet<CoverageRecord<'a>>,
 }
 
-fn stats(coverage: Arc<Mutex<BTreeSet<CoverageRecord>>>,
-         clients: Arc<Mutex<HashMap<SocketAddr, Client>>>) {
+fn stats(context: Arc<Context>) {
     /// Time to wait between prints
     const PRINT_DELAY: Duration = Duration::from_millis(1000);
 
@@ -64,7 +63,7 @@ fn stats(coverage: Arc<Mutex<BTreeSet<CoverageRecord>>>,
         let mut total_workers = 0usize;
         let mut total_clients = 0u64;
 
-        let clients = clients.lock().unwrap();
+        let clients = context.clients.lock().unwrap();
         for (addr, client) in clients.iter() {
             // Compute the duration of time since the last report
             let tsl = Instant::now() - client.last_packet;
@@ -86,7 +85,7 @@ fn stats(coverage: Arc<Mutex<BTreeSet<CoverageRecord>>>,
                    client.fuzz_cases as f64 / uptime,
                    vm_pct,
                    reset_pct,
-                   addr.ip(),
+                   addr,
                    if unresponsive { "???" } else { "" });
 
             if !unresponsive {
@@ -97,7 +96,7 @@ fn stats(coverage: Arc<Mutex<BTreeSet<CoverageRecord>>>,
         }
 
         let cases_delta = total_cases.saturating_sub(last_cases);
-        let coverage = coverage.lock().unwrap().len();
+        let coverage = context.coverage.lock().unwrap().len();
         print!("\x1b[32;1mTOTALS: workers {:5} ({:3}) | cases {:14} \
                 [{:12.2} / s] | \
                 cov {:8}\x1b[0m\n\n",
@@ -111,51 +110,29 @@ fn stats(coverage: Arc<Mutex<BTreeSet<CoverageRecord>>>,
     }
 }
 
-fn main() -> io::Result<()> {
-    // Map from file IDs to the modified time and their contents
-    let mut file_db: HashMap<u64, (SystemTime, Vec<u8>)> = HashMap::new();
-
-    // Coverage records
-    let coverage: Arc<Mutex<BTreeSet<CoverageRecord>>> = Default::default();
-
-    // Clients
-    let clients: Arc<Mutex<HashMap<SocketAddr, Client>>> = Default::default();
-
-    // Create a new coverage file
-    let mut coverage_file = File::create("coverage.txt")?;
-
+fn handle_client(mut stream: TcpStream,
+                 context: Arc<Context>) -> io::Result<()> {
     // Get the current directory
     let cur_dir = std::fs::canonicalize("files")?;
 
-    // Bind to all network devices on UDP port 1911
-    let socket = UdpSocket::bind("0.0.0.0:1911")?;
+    // Get the IP of the peer
+    let src_ip = stream.peer_addr()?.ip();
 
-    // Buffer for sending packets (reused to prevent allocations)
+    // Create a send buffer that we don't reallocate for sending data
     let mut sendbuf = Vec::new();
 
-    {
-        let coverage = coverage.clone();
-        let clients  = clients.clone();
-        std::thread::spawn(move || stats(coverage, clients));
-    }
-
     loop {
-        // Read a UDP packet from the network
-        let mut buf = [0; 2048];
-        let (amt, src) = socket.recv_from(&mut buf)?;
-        let mut ptr = &buf[..amt];
+        // Deserialize the message
+        let msg = ServerMessage::deserialize(&mut stream)
+            .expect("Failed to deserialize ServerMessage");
 
         // Insert the client record if one does not exist
-        let mut clients = clients.lock().unwrap();
-        let mut client = clients.get_mut(&src);
+        let mut clients = context.clients.lock().unwrap();
+        let mut client = clients.get_mut(&src_ip);
 
         if let Some(ref mut client) = client {
             client.last_packet = Instant::now();
         }
-
-        // Deserialize the message
-        let msg = ServerMessage::deserialize(&mut ptr)
-            .expect("Failed to deserialize ServerMessage");
 
         match msg {
             ServerMessage::ReportStatistics { fuzz_cases, total_cycles,
@@ -173,7 +150,7 @@ fn main() -> io::Result<()> {
                 if client.is_none() ||
                         client.unwrap().session_id != session_id {
                     // Create a new session
-                    clients.insert(src, Client {
+                    clients.insert(src_ip, Client {
                         session_id:   session_id,
                         workers:      BTreeSet::new(),
                         first_packet: Instant::now(),
@@ -187,19 +164,14 @@ fn main() -> io::Result<()> {
                 }
 
                 // Get the new client
-                client = clients.get_mut(&src);
+                client = clients.get_mut(&src_ip);
 
                 // Log the new worker
                 client.unwrap().workers.insert(core_id);
-
-                // Send the ack response
-                sendbuf.clear();
-                ServerMessage::LoginAck(session_id, core_id)
-                    .serialize(&mut sendbuf).unwrap();
-                socket.send_to(&sendbuf, src)?;
             }
             ServerMessage::ReportCoverage(record) => {
-                let mut coverage = coverage.lock().unwrap();
+                let mut coverage = context.coverage.lock().unwrap();
+                let mut coverage_file = context.coverage_file.lock().unwrap();
 
                 if !coverage.contains(&record) {
                     if let Some(module) = &record.module {
@@ -215,12 +187,6 @@ fn main() -> io::Result<()> {
                         client.coverage.insert(record.clone().into_owned());
                     }
                 }
-
-                // Send the ack response
-                sendbuf.clear();
-                ServerMessage::ReportCoverageAck(record)
-                    .serialize(&mut sendbuf).unwrap();
-                socket.send_to(&sendbuf, src)?;
             }
             ServerMessage::GetFileId(filename) => {
                 // Normalize the filename
@@ -229,11 +195,6 @@ fn main() -> io::Result<()> {
                                               .join(&*filename)) {
                     // Jail the filename to the current directory
                     if !filename.starts_with(&cur_dir) {
-                        // Send the file error response
-                        sendbuf.clear();
-                        ServerMessage::FileIdErr.serialize(
-                            &mut sendbuf).unwrap();
-                        socket.send_to(&sendbuf, src)?;
                         continue;
                     }
 
@@ -245,6 +206,9 @@ fn main() -> io::Result<()> {
                     // Get the modified time of the file
                     let modified = filename.metadata().unwrap()
                         .modified().unwrap();
+
+                    // Get access to the file database
+                    let mut file_db = context.file_db.write().unwrap();
 
                     // Insert into the file database if needed
                     let file = file_db.entry(file_id)
@@ -266,43 +230,74 @@ fn main() -> io::Result<()> {
                         id:   file_id,
                         size: file.1.len(),
                     }.serialize(&mut sendbuf).unwrap();
-                    socket.send_to(&sendbuf, src)?;
-                } else {
-                    // Send the file error response
-                    sendbuf.clear();
-                    ServerMessage::FileIdErr.serialize(&mut sendbuf).unwrap();
-                    socket.send_to(&sendbuf, src)?;
+                    stream.write_all(&sendbuf)?;
                 }
             },
-            ServerMessage::Read { id, offset, size } => {
+            ServerMessage::ReadPage { id, offset } => {
                 if VERBOSE {
-                    print!("Read {:016x} offset {} for {}\n",
-                           id, offset, size);
+                    print!("Read page {:016x} offset {}\n",
+                           id, offset);
                 }
+                    
+                // Get access to the file database
+                let file_db = context.file_db.read().unwrap();
 
                 // Attempt to get access to the file contents at the requested
                 // location
                 let sliced = file_db.get(&id).and_then(|(_, x)| {
-                    x.get(offset..offset + size)
+                    x.get(offset..offset + 4096)
                 });
 
                 if let Some(sliced) = sliced {
-                    sendbuf.clear();
-                    ServerMessage::ReadOk.serialize(&mut sendbuf).unwrap();
-                    socket.send_to(&sendbuf, src)?;
+                    let mut tmp = [0u8; 4096];
+                    tmp.copy_from_slice(sliced);
 
-                    // Send the contents
-                    for chunk in sliced.chunks(1472) {
-                        socket.send_to(chunk, src)?;
-                    }
-                } else {
                     sendbuf.clear();
-                    ServerMessage::ReadErr.serialize(&mut sendbuf).unwrap();
-                    socket.send_to(&sendbuf, src)?;
+                    ServerMessage::ReadPageResponse(tmp)
+                        .serialize(&mut sendbuf).unwrap();
+                    stream.write_all(&sendbuf)?;
                 }
             },
-            x @ _ => panic!("Unhandled packet {:#?}\n", x),
+            _ => panic!("Unhandled packet\n"),
         }
     }
+}
+
+struct Context<'a> {
+    file_db:       RwLock<HashMap<u64, (SystemTime, Vec<u8>)>>,
+    coverage:      Mutex<BTreeSet<CoverageRecord<'a>>>,
+    clients:       Mutex<HashMap<IpAddr, Client<'a>>>,
+    coverage_file: Mutex<File>,
+}
+
+fn main() -> io::Result<()> {
+    let context = Arc::new(Context {
+        file_db:       Default::default(),
+        coverage:      Default::default(),
+        clients:       Default::default(),
+        coverage_file: Mutex::new(File::create("coverage.txt")?),
+    });
+
+    // Bind to all network devices on TCP port 1911
+    let listener = TcpListener::bind("0.0.0.0:1911")?;
+
+    {
+        let context = context.clone();
+        std::thread::spawn(move || stats(context));
+    }
+
+    let mut threads = Vec::new();
+    for stream in listener.incoming() {
+        let context = context.clone();
+        threads.push(std::thread::spawn(move || {
+            handle_client(stream?, context)
+        }));
+    }
+
+    for thread in threads {
+        thread.join().unwrap()?;
+    }
+
+    Ok(())
 }
 
