@@ -105,18 +105,17 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         tcp.send(&message);
     }*/
 
-    /*
-    //if core!().id == 0 {
+    /*if core!().id == 0 {
         let nm = net::netmapping::NetMapping::new("192.168.100.1:1911",
                                                   "out.falkdump", true)
             .unwrap();
 
-        print!("Netmapped {}\n", core!().id);
+        //print!("Netmapped {}\n", core!().id);
 
         let it = cpu::rdtsc();
         for page in 0..64 * 1024 {
             let elapsed = time::elapsed(it);
-            if elapsed > 5.0 {
+            if elapsed > 3.0 {
                 print!("{:10.4} MiB/sec\n", (page * 4096) as f64 / time::elapsed(it) / 1024. / 1024.);
                 break;
             }
@@ -124,7 +123,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
             let slc = &nm[page * 4096..page * 4096 + 20];
             unsafe { core::ptr::read_volatile(slc.as_ptr()); }
         }
-    //}*/
+    }*/
 
     test_fuzzer::fuzz();
 

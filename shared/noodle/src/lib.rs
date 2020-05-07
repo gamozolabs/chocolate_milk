@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::borrow::{Cow, ToOwned};
+use alloc::collections::VecDeque;
 
 /// Write the contents of `buf` into `self`. Used to allow custom adapters for
 /// writing during serialization. Return `None` if `buf` cannot be fully
@@ -23,34 +24,142 @@ pub trait Writer {
     fn write(&mut self, buf: &[u8]) -> Option<()>;
 }
 
-/// Read the contents of `self` into `buf`. Used to allow for custom adapters
-/// during serialization. Return `None` `buf` cannot fully be filled
+/// Reader trait
 pub trait Reader {
-    fn read_exact(&mut self, buf: &mut [u8]) -> Option<()>;
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize>;
+
+    fn read_exact(&mut self, mut buf: &mut [u8]) -> Option<()> {
+        while buf.len() > 0 {
+            let bread = self.read(buf)?;
+            buf = &mut buf[bread..];
+        }
+        Some(())
+    }
 }
 
-/// Basic `Writer` implementation for vectors of bytes
-impl Writer for Vec<u8> {
-    fn write(&mut self, buf: &[u8]) -> Option<()> {
-        self.extend_from_slice(buf);
+/// A buffered reader + writer
+pub struct BufferedIo<T: Writer + Reader> {
+    /// The type which we can read and write from
+    inner: T,
+
+    /// Reader buffer
+    read: VecDeque<u8>,
+
+    /// Writer buffer
+    write: VecDeque<u8>,
+}
+
+impl<T: Writer + Reader> BufferedIo<T> {
+    /// Create a new buffered I/O object
+    pub fn new(inner: T) -> Self {
+        BufferedIo {
+            inner: inner,
+            read:  VecDeque::with_capacity(16 * 1024),
+            write: VecDeque::with_capacity(16 * 1024),
+        }
+    }
+    /// Flush the internal TX buffer
+    pub fn flush(&mut self) -> Option<()> {
+        let (front, back) = self.write.as_slices();
+        if front.len() > 0 {
+            self.inner.write(front)?;
+        }
+        if back.len() > 0 {
+            self.inner.write(back)?;
+        }
+        self.write.clear();
         Some(())
+    }
+}
+
+impl<T: Writer + Reader> Writer for BufferedIo<T> {
+    /// Write the `buffer` contents to the buffered writer
+    fn write(&mut self, buf: &[u8]) -> Option<()> {
+        // Determine the space left in our write buffer
+        let remain = self.write.capacity() - self.write.len();
+
+        if buf.len() <= remain {
+            // If there's enough room to buffer the data, just buffer it
+            self.write.extend(buf);
+        } else {
+            // There's not enough room, flush the buffer and write everything
+            // out
+            self.flush()?;
+            self.inner.write(buf)?;
+        }
+
+        Some(())
+    }
+}
+
+impl<T: Writer + Reader> Reader for BufferedIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let mut ptr = &mut buf[..];
+        let mut tmp = [0u8; 2048];
+
+        while ptr.len() > 0 {
+            // Determine the amount we can copy from the internal buffer
+            let to_copy = core::cmp::min(ptr.len(), self.read.len());
+
+            // Read from our internal buffer
+            ptr[..to_copy].iter_mut().for_each(|x| {
+                *x = self.read.pop_front().unwrap();
+            });
+            ptr = &mut ptr[to_copy..];
+
+            // Read complete
+            if ptr.len() == 0 { break; }
+            
+            // We must have drained the internal buffer at this point
+            assert!(self.read.len() == 0);
+
+            // Get some more bytes into our internal buffer
+            let bread = self.inner.read(&mut tmp)?;
+            self.read.extend(&tmp[..bread]);
+        }
+
+        Some(buf.len())
     }
 }
 
 /// `Reader` implementation for types that implement `Read`
 #[cfg(feature = "std")]
 impl<T: std::io::Read> Reader for T {
-    fn read_exact(&mut self, buf: &mut [u8]) -> Option<()> {
-        self.read_exact(buf).ok()
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        self.read(buf).ok()
+    }
+}
+
+/// `Writer` implementation for types that implement `Write`
+#[cfg(feature = "std")]
+impl<T: std::io::Write> Writer for T {
+    fn write(&mut self, buf: &[u8]) -> Option<()> {
+        self.write_all(buf).ok()
     }
 }
 
 /// Basic `Reader` implementation for slices of bytes
 #[cfg(not(feature = "std"))]
 impl Reader for &[u8] {
-    fn read_exact(&mut self, buf: &mut [u8]) -> Option<()> {
-        buf.copy_from_slice(self.get(..buf.len())?);
-        *self = &self[buf.len()..];
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        // Determine number of bytes we can read
+        let to_read = core::cmp::min(buf.len(), self.len());
+
+        // We literally can't do anything, this is an error
+        if to_read == 0 { return None; }
+
+        buf[..to_read].copy_from_slice(&self[..to_read]);
+        *self = &self[to_read..];
+
+        Some(to_read)
+    }
+}
+
+/// Basic `Writer` implementation for vectors of bytes
+#[cfg(not(feature = "std"))]
+impl Writer for Vec<u8> {
+    fn write(&mut self, buf: &[u8]) -> Option<()> {
+        self.extend_from_slice(buf);
         Some(())
     }
 }

@@ -26,7 +26,7 @@ const X64_INTERRUPT_GATE: u32 = 0xe;
 /// List of all registered page fault handlers on the system
 static PAGE_FAULT_HANDLERS:
     LockCell<Vec<Box<dyn PageFaultHandler>>, LockInterrupts> =
-        LockCell::new_no_preempt(Vec::new());
+        LockCell::new(Vec::new());
 
 /// Fault handler registration
 ///
@@ -332,16 +332,14 @@ pub struct AllRegs {
 pub unsafe extern fn interrupt_handler(
         number: u8, frame: &mut InterruptFrame, error: u64,
         regs: &mut AllRegs) {
-    // Increment the level of interrupt depth. This will automatically get
-    // decremented when the scope ends.
-    let _interrupt_ref = core!().enter_interrupt();
-
     // Increment the exception refcount if this was an exception and not an
     // interrupt
-    let _exception_ref = if number < 32 {
-        Some(core!().enter_exception())
+    let _reflevel = if number < 32 {
+        core!().enter_exception()
     } else {
-        None
+        // Increment the level of interrupt depth. This will automatically get
+        // decremented when the scope ends.
+        core!().enter_interrupt()
     };
 
     // Handle NMIs specially

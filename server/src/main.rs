@@ -110,16 +110,19 @@ fn stats(context: Arc<Context>) {
     }
 }
 
-fn handle_client(mut stream: TcpStream,
+fn handle_client(stream: TcpStream,
                  context: Arc<Context>) -> io::Result<()> {
-    // Get the current directory
-    let cur_dir = std::fs::canonicalize("files")?;
+    // Disable Nagle's algoritm
+    stream.set_nodelay(true)?;
 
     // Get the IP of the peer
     let src_ip = stream.peer_addr()?.ip();
 
-    // Create a send buffer that we don't reallocate for sending data
-    let mut sendbuf = Vec::new();
+    // Convert the stream to a buffered I/O stream
+    let mut stream = BufferedIo::new(stream);
+
+    // Get the current directory
+    let cur_dir = std::fs::canonicalize("files")?;
 
     loop {
         // Deserialize the message
@@ -225,12 +228,11 @@ fn handle_client(mut stream: TcpStream,
                     }
 
                     // Send the ID response
-                    sendbuf.clear();
                     ServerMessage::FileId {
                         id:   file_id,
                         size: file.1.len(),
-                    }.serialize(&mut sendbuf).unwrap();
-                    stream.write_all(&sendbuf)?;
+                    }.serialize(&mut stream).unwrap();
+                    stream.flush().unwrap();
                 }
             },
             ServerMessage::ReadPage { id, offset } => {
@@ -238,7 +240,7 @@ fn handle_client(mut stream: TcpStream,
                     print!("Read page {:016x} offset {}\n",
                            id, offset);
                 }
-                    
+
                 // Get access to the file database
                 let file_db = context.file_db.read().unwrap();
 
@@ -252,10 +254,9 @@ fn handle_client(mut stream: TcpStream,
                     let mut tmp = [0u8; 4096];
                     tmp.copy_from_slice(sliced);
 
-                    sendbuf.clear();
                     ServerMessage::ReadPageResponse(tmp)
-                        .serialize(&mut sendbuf).unwrap();
-                    stream.write_all(&sendbuf)?;
+                        .serialize(&mut stream).unwrap();
+                    stream.flush().unwrap();
                 }
             },
             _ => panic!("Unhandled packet\n"),

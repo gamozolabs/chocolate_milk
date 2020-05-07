@@ -347,68 +347,57 @@ impl TcpConnection {
         }
     }
 
-    /// Receives data until `buf` is full
-    /// Doesn't return `Some(())` unless all bytes are successfuly read,
-    /// currently this never times out if the data does not all get received
-    pub fn recv(&self, buf: &mut [u8]) -> Option<()> {
-        let mut device = None;
-
+    /// Receives data from the TCP connection
+    pub fn recv(&self, buf: &mut [u8]) -> Option<usize> {
         // Get a pointer to the buffer
         let mut ptr = &mut buf[..];
 
-        while ptr.len() > 0 {
-            // Get mutable access to the TCP connection
-            let mut conn = self.0.lock();
-            if conn.state != TcpState::Established { return None; }
+        // Get mutable access to the TCP connection
+        let mut conn = self.0.lock();
+        if conn.state != TcpState::Established { return None; }
 
-            // Create a copy of the device to break some lifetime issues
-            // Probably a better way to do this
-            if device.is_none() {
-                device = Some(conn.device.clone());
+        {
+            // Compute the number of bytes to consume
+            let consumeable = core::cmp::min(conn.window.len(), ptr.len());
+            for ii in 0..consumeable {
+                ptr[ii] = conn.window.pop_front().unwrap();
             }
 
-            {
-                // Compute the number of bytes to consume
-                let consumeable = core::cmp::min(conn.window.len(), ptr.len());
-                for ii in 0..consumeable {
-                    ptr[ii] = conn.window.pop_front().unwrap();
-                }
+            // Advance the pointer
+            ptr = &mut ptr[consumeable..];
+        }
 
-                // Advance the pointer
-                ptr = &mut ptr[consumeable..];
-            }
-
-            // Satisfied recv from the window, we're all done
-            if ptr.len() == 0 { break; }
-
-            if let Some(pkt) = device.as_ref().unwrap().recv() {
+        // Only attempt to recv a packet from the NIC if we have more to read
+        if ptr.len() > 0 {
+            let device = conn.device.clone();
+            if let Some(pkt) = device.recv() {
                 if let Some(tcp) = pkt.tcp() {
                     if tcp.dst_port != conn.port {
                         // Packet wasn't for us
                         core::mem::drop(conn);
-                        device.as_ref().unwrap().discard(pkt);
-                        continue;
-                    }
-
-                    // Handle the packet we RXed
-                    if let Some(copied) =
-                            conn.handle_packet(&tcp, Some(&mut ptr)) {
-                        ptr = &mut ptr[copied..];
+                        device.discard(pkt);
+                    } else {
+                        // Handle the packet we RXed
+                        if let Some(copied) =
+                                conn.handle_packet(&tcp, Some(&mut ptr)) {
+                            ptr = &mut ptr[copied..];
+                        }
                     }
                 } else {
                     // Packet wasnt TCP, discard it
                     core::mem::drop(conn);
-                    device.as_ref().unwrap().discard(pkt);
+                    device.discard(pkt);
                 }
-            }
+            };
         }
 
-        Some(())
+        let remain = ptr.len();
+        Some(buf.len() - remain)
     }
 }
 
 impl Reader for TcpConnection {
-    fn read_exact(&mut self, buf: &mut [u8]) -> Option<()> {
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
         self.recv(buf)
     }
 }
@@ -460,7 +449,7 @@ impl NetDevice {
 
                 // Create the TCP connection
                 let rand_seq = cpu::rdtsc() as u32;
-                let ret = Arc::new(LockCell::new_no_preempt(TcpConnectionInt {
+                let ret = Arc::new(LockCell::new(TcpConnectionInt {
                     window: VecDeque::with_capacity(WINDOW_SIZE as usize),
                     device:        cur.clone(),
                     seq:           rand_seq,

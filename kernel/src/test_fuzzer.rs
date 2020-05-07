@@ -7,7 +7,7 @@ use crate::snapshotted_app::{Worker, FuzzSession};
 use lockcell::LockCell;
 
 pub fn fuzz() {
-    if core!().id != 0 { cpu::halt(); }
+    //if core!().id != 0 { cpu::halt(); }
 
     static SESSION:
         LockCell<Option<Arc<FuzzSession<()>>>, LockInterrupts> =

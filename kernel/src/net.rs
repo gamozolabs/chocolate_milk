@@ -162,10 +162,10 @@ impl NetDevice {
         // Create a new `NetDevice`
         let nd = NetDevice {
             mac:             driver.mac(),
-            udp_binds:       LockCell::new_no_preempt(BTreeMap::new()),
-            tcp_connections: LockCell::new_no_preempt(BTreeMap::new()),
+            udp_binds:       LockCell::new(BTreeMap::new()),
+            tcp_connections: LockCell::new(BTreeMap::new()),
             driver:          driver,
-            dhcp_lease:      LockCell::new_no_preempt(None),
+            dhcp_lease:      LockCell::new(None),
         };
         
         // Wrap up the network device in an `Arc`

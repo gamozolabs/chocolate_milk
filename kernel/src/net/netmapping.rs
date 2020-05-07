@@ -3,7 +3,6 @@
 use core::ops::{Deref, DerefMut};
 use core::alloc::Layout;
 use core::convert::TryInto;
-use alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::borrow::Cow;
 use noodle::*;
@@ -23,7 +22,7 @@ pub struct NetMapHandler {
     vaddr: VirtAddr,
 
     /// A TCP port which we are bound to and able to recv from and send to
-    tcp: TcpConnection,
+    tcp: BufferedIo<TcpConnection>,
     
     /// File ID of the open file on the server
     file_id: u64,
@@ -33,9 +32,6 @@ pub struct NetMapHandler {
 
     /// Set to `true` if this is a read only mapping
     read_only: bool,
-
-    /// Buffer to use for serializing data
-    buffer: Vec<u8>,
 
     /// Used to prevent multiple cores from handling the exception at the
     /// same time.
@@ -81,12 +77,11 @@ impl PageFaultHandler for NetMapHandler {
             let offset = ((fault_addr.0 & !0xfff) - self.vaddr.0) as usize;
 
             // Request the file contents at this offset
-            self.buffer.clear();
             ServerMessage::ReadPage {
                 id:     self.file_id,
                 offset: offset,
-            }.serialize(&mut self.buffer).unwrap();
-            self.tcp.send(&self.buffer).unwrap();
+            }.serialize(&mut self.tcp).unwrap();
+            self.tcp.flush();
 
             // Allocate the backing page for the mapping
             let page = {
@@ -149,20 +144,15 @@ impl<'a> NetMapping<'a> {
     /// Create a network mapped view of `filename`
     /// `server` should be the `ip:port` for the server
     pub fn new(server: &str, filename: &str, read_only: bool) -> Option<Self> {
-        // Create a buffer for serializing data
-        let mut buffer = Vec::new();
-
         // Get access to a network device
         let netdev = NetDevice::get()?;
 
         // Connect to the server
-        let mut tcp = NetDevice::tcp_connect(netdev, server)?;
+        let mut tcp = BufferedIo::new(NetDevice::tcp_connect(netdev, server)?);
 
         // Send the get file ID request
-        buffer.clear();
-        ServerMessage::GetFileId(Cow::Borrowed(filename))
-            .serialize(&mut buffer);
-        tcp.send(&buffer)?;
+        ServerMessage::GetFileId(Cow::Borrowed(filename)).serialize(&mut tcp);
+        tcp.flush();
 
         // Get the response
         let (file_id, size) = match ServerMessage::deserialize(&mut tcp)? {
@@ -184,8 +174,7 @@ impl<'a> NetMapping<'a> {
             tcp:       tcp,
             size:      size,
             read_only: read_only,
-            buffer:    buffer,
-            handling:  LockCell::new_no_preempt(()),
+            handling:  LockCell::new(()),
         });
 
         Some(NetMapping {

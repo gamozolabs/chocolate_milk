@@ -238,7 +238,7 @@ pub struct Worker<'a, C> {
     worker_id: u64,
 
     /// A connection to the server
-    server: Option<TcpConnection>,
+    server: Option<BufferedIo<TcpConnection>>,
 
     /// List of all modules
     /// Maps from base address to module, to end of module (inclusive) and the
@@ -399,6 +399,20 @@ impl<'a, C> Worker<'a, C> {
                 }
                 VmExit::ExternalInterrupt => {
                     // Host interrupt happened, ignore it
+                    continue;
+                }
+                VmExit::Exception(Exception::NMI) => {
+                    // NMIs mean we need to NMI ourself as we might need to
+                    // TLB shootdown or halt ourselves. The system may be going
+                    // down for a soft reboot
+                    unsafe {
+                        let mut apic = core!().apic().lock();
+                        let apic = apic.as_mut().unwrap();
+                        apic.ipi(core!().apic_id().unwrap(),
+                            (1 << 14) | (4 << 8));
+                    }
+
+                    // Handled the NMI, re-enter the VM
                     continue;
                 }
                 VmExit::ReadMsr { inst_len } => {
@@ -1523,8 +1537,8 @@ impl<'a, C> FuzzSession<'a, C> {
         let netdev = NetDevice::get()
             .expect("Failed to get network device for creating worker");
         worker.server = Some(
-            NetDevice::tcp_connect(netdev, &session.server_addr)
-            .expect("Failed to connect to server"));
+            BufferedIo::new(NetDevice::tcp_connect(netdev, &session.server_addr)
+            .expect("Failed to connect to server")));
         
         // Log into the server with a new worker
         session.login(worker.server.as_mut().unwrap());
@@ -1533,20 +1547,24 @@ impl<'a, C> FuzzSession<'a, C> {
     }
 
     /// Update statistics to the server
-    pub fn report_statistics(&self, server: &mut TcpConnection) {
-        let stats = self.stats.lock();
+    pub fn report_statistics(&self, server: &mut BufferedIo<TcpConnection>) {
+        {
+            let stats = self.stats.lock();
 
-        ServerMessage::ReportStatistics {
-            fuzz_cases:   stats.fuzz_cases,
-            total_cycles: stats.total_cycles,
-            vm_cycles:    stats.vm_cycles,
-            reset_cycles: stats.reset_cycles,
-        }.serialize(server).unwrap();
+            ServerMessage::ReportStatistics {
+                fuzz_cases:   stats.fuzz_cases,
+                total_cycles: stats.total_cycles,
+                vm_cycles:    stats.vm_cycles,
+                reset_cycles: stats.reset_cycles,
+            }.serialize(server).unwrap();
+        }
+        server.flush().unwrap();
     }
 
     /// Log in with the server
-    pub fn login(&self, server: &mut TcpConnection) {
+    pub fn login(&self, server: &mut BufferedIo<TcpConnection>) {
         ServerMessage::Login(self.id, core!().id).serialize(server).unwrap();
+        server.flush().unwrap();
     }
 
     /// Report coverage

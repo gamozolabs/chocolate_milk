@@ -379,18 +379,18 @@ impl<'a> IntelGbit {
         let mut nic = IntelGbit {
             regs,
             mmio,
-            rx_state: LockCell::new_no_preempt(RxState {
+            rx_state: LockCell::new(RxState {
                 descriptors: rx_descriptors,
                 buffers:     rx_buffers,
                 head:        0,
             }),
-            tx_state: LockCell::new_no_preempt(TxState {
+            tx_state: LockCell::new(TxState {
                 descriptors: tx_descriptors,
                 head:        0,
                 tail:        0, 
                 buffers:     (0..NUM_TX_DESCS).map(|_| None).collect(),
             }),
-            packets: LockCell::new_no_preempt(
+            packets: LockCell::new(
                          Vec::with_capacity(NUM_TX_DESCS + NUM_RX_DESCS)),
             mac: [0u8; 6],
         };
