@@ -33,9 +33,7 @@ pub fn fuzz() {
     let mut worker = FuzzSession::worker(session);
     
     // Parse the module lists for the target
-    if worker.get_module_list_win64().is_some() {
-        print!("Oooh, we discovered a 64-bit windows module list!\n");
-    }
+    worker.get_module_list_win64();
 
     loop {
         let _vmexit = worker.fuzz_case();

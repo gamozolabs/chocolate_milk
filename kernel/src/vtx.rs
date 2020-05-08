@@ -510,6 +510,10 @@ pub enum Register {
     FMask,
     Star,
 
+    InterruptabilityState,
+    ActivityState,
+    PendingDebug,
+
     NumRegisters,
 }
 
@@ -607,6 +611,10 @@ const REG_TYPES: &[(Register, RegType)] = &[
     (Register::LStar, RegType::Msr(IA32_LSTAR)),
     (Register::FMask, RegType::Msr(IA32_FMASK)),
     (Register::Star, RegType::Msr(IA32_STAR)),
+    (Register::InterruptabilityState,
+        RegType::Vmcs(Vmcs::GuestInterruptabilityState)),
+    (Register::ActivityState, RegType::Vmcs(Vmcs::GuestActivityState)),
+    (Register::PendingDebug, RegType::Vmcs(Vmcs::GuestPendingDebugExceptions)),
 ];
 
 /// General purpose register state
@@ -986,11 +994,7 @@ impl Vm {
         unsafe {
             // Set up guest state
             vmwrite(Vmcs::GuestVmcsLinkPtr, !0);
-
-            vmwrite(Vmcs::GuestInterruptabilityState, 0);
-            vmwrite(Vmcs::GuestActivityState, 0);
             vmwrite(Vmcs::GuestSMBase, 0);
-            vmwrite(Vmcs::GuestPendingDebugExceptions, 0);
 
             // Invalidate the EPT
             invalidate_ept(
@@ -1222,7 +1226,7 @@ impl Vm {
 
         unsafe {
             core!().disable_interrupts();
-
+           
             if let Some(timer) = self.preemption_timer {
                 if (self.pinbased_controls & (1 << 6)) == 0 {
                     // Enable the pre-emption timer

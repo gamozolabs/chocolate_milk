@@ -370,7 +370,11 @@ impl<'a, C> Worker<'a, C> {
             }
 
             // Check if single stepping is requested
-            if single_step > 0 {
+            // We cannot enable single stepping if STI blocking, MOV SS
+            // blocking, or the CPU activity is not "active" (eg. not halted)
+            if single_step > 0 &&
+                    (self.vm.reg(Register::InterruptabilityState) & 3) == 0 &&
+                    self.vm.reg(Register::ActivityState) == 0 {
                 // Enable single stepping
                 self.vm.set_reg(Register::Rflags,
                     self.vm.reg(Register::Rflags) | (1 << 8));

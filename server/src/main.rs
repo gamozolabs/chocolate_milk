@@ -19,10 +19,11 @@ use falktp::{CoverageRecord, ServerMessage};
 /// If `true` prints some extra spew
 const VERBOSE: bool = false;
 
-struct Client<'a> {
-    /// "Unique" session ID for the client. Used to track when a client reboots
-    /// and comes back with the same ip:port, but with a new session
-    session_id: u64,
+/// A fuzzing session. This represents a unique `FuzzSession` on a server and
+/// may span multiple cores and IPs (in the case of multiple NICs)
+struct Session<'a> {
+    /// Session ID, a "unique" identifier passed by the client
+    id: u64,
 
     /// Unique core IDs of the workers on this session
     workers: BTreeSet<u32>,
@@ -49,6 +50,16 @@ struct Client<'a> {
     coverage: BTreeSet<CoverageRecord<'a>>,
 }
 
+/// A client (a unique IP address), which may be part of a set of IP addresses
+/// on a single machine which are collaborating
+struct Client<'a> {
+    /// A session we belong to
+    session: Arc<RwLock<Session<'a>>>,
+
+    /// The session identifier of the session we belong to
+    session_id: u64,
+}
+
 fn stats(context: Arc<Context>) {
     /// Time to wait between prints
     const PRINT_DELAY: Duration = Duration::from_millis(1000);
@@ -59,48 +70,50 @@ fn stats(context: Arc<Context>) {
         std::thread::sleep(PRINT_DELAY);
 
         // Total number of fuzz cases and workers
-        let mut total_cases   = 0u64;
-        let mut total_workers = 0usize;
-        let mut total_clients = 0u64;
+        let mut total_cases    = 0u64;
+        let mut total_workers  = 0usize;
+        let mut total_sessions = 0u64;
 
-        let clients = context.clients.lock().unwrap();
-        for (addr, client) in clients.iter() {
+        let sessions = context.sessions.read().unwrap();
+        for (_, session) in sessions.iter() {
+            let session = session.read().unwrap();
+
             // Compute the duration of time since the last report
-            let tsl = Instant::now() - client.last_packet;
+            let tsl = Instant::now() - session.last_packet;
             let unresponsive = tsl > Duration::from_secs(5);
 
-            let uptime = (Instant::now() - client.first_packet).as_secs_f64();
+            let uptime = (Instant::now() - session.first_packet).as_secs_f64();
 
             let reset_pct =
-                client.reset_cycles as f64 / client.total_cycles as f64;
+                session.reset_cycles as f64 / session.total_cycles as f64;
             let vm_pct =
-                client.vm_cycles as f64 / client.total_cycles as f64;
+                session.vm_cycles as f64 / session.total_cycles as f64;
 
             print!("\x1b[34;1m    workers {:3} | cov {:8} | \
                         cases {:14} [{:12.2} / s] | vm {:8.4} | \
-                        reset {:8.4} | {:15?} {}\x1b[0m\n",
-                   client.workers.len(),
-                   client.coverage.len(),
-                   client.fuzz_cases,
-                   client.fuzz_cases as f64 / uptime,
+                        reset {:8.4} | {:016x} {}\x1b[0m\n",
+                   session.workers.len(),
+                   session.coverage.len(),
+                   session.fuzz_cases,
+                   session.fuzz_cases as f64 / uptime,
                    vm_pct,
                    reset_pct,
-                   addr,
+                   session.id,
                    if unresponsive { "???" } else { "" });
 
             if !unresponsive {
-                total_cases   += client.fuzz_cases;
-                total_workers += client.workers.len();
-                total_clients += 1;
+                total_cases    += session.fuzz_cases;
+                total_workers  += session.workers.len();
+                total_sessions += 1;
             }
         }
 
         let cases_delta = total_cases.saturating_sub(last_cases);
-        let coverage = context.coverage.lock().unwrap().len();
+        let coverage = context.coverage.read().unwrap().len();
         print!("\x1b[32;1mTOTALS: workers {:5} ({:3}) | cases {:14} \
                 [{:12.2} / s] | \
                 cov {:8}\x1b[0m\n\n",
-               total_workers, total_clients,
+               total_workers, total_sessions,
                total_cases,
                cases_delta as f64 / PRINT_DELAY.as_secs_f64(),
                coverage);
@@ -130,50 +143,88 @@ fn handle_client(stream: TcpStream,
             .expect("Failed to deserialize ServerMessage");
 
         // Insert the client record if one does not exist
-        let mut clients = context.clients.lock().unwrap();
-        let mut client = clients.get_mut(&src_ip);
+        let mut client = {
+            let clients = context.clients.read().unwrap();
+            clients.get(&src_ip).map(|x| x.clone())
+        };
 
-        if let Some(ref mut client) = client {
-            client.last_packet = Instant::now();
+        if let Some(ref client) = client {
+            client.session.write().unwrap().last_packet = Instant::now();
         }
 
         match msg {
             ServerMessage::ReportStatistics { fuzz_cases, total_cycles,
                     vm_cycles, reset_cycles } => {
                 if let Some(client) = client {
-                    client.fuzz_cases   = fuzz_cases;
-                    client.total_cycles = total_cycles;
-                    client.vm_cycles    = vm_cycles;
-                    client.reset_cycles = reset_cycles;
+                    let mut session = client.session.write().unwrap();
+                    session.fuzz_cases   = fuzz_cases;
+                    session.total_cycles = total_cycles;
+                    session.vm_cycles    = vm_cycles;
+                    session.reset_cycles = reset_cycles;
                 }
             }
             ServerMessage::Login(session_id, core_id) => {
                 // If there is no existing client or the session ID has changed
                 // create a new client
-                if client.is_none() ||
-                        client.unwrap().session_id != session_id {
-                    // Create a new session
-                    clients.insert(src_ip, Client {
-                        session_id:   session_id,
-                        workers:      BTreeSet::new(),
-                        first_packet: Instant::now(),
-                        last_packet:  Instant::now(),
-                        fuzz_cases:   0,
-                        total_cycles: 0,
-                        reset_cycles: 0,
-                        vm_cycles:    0,
-                        coverage:     BTreeSet::new(),
+                if let Some(ref cl) = client {
+                    // A client has logged in a second time, it's possible it
+                    // has rebooted and has a new session, if it does, remove
+                    // the old session and create a new session
+                    if cl.session_id != session_id {
+                        // Delete the old session from the session list
+                        context.sessions.write().unwrap().remove(
+                            &cl.session_id);
+
+                        // Delete the client from the client list
+                        {
+                            let mut clients = context.clients.write().unwrap();
+                            clients.remove(&src_ip);
+                        }
+
+                        // Set the client to none, such that we create a new
+                        // session and client context
+                        client = None;
+                    }
+                }
+                
+                if client.is_none() {
+                    // New client, potentially new session
+                    let mut sessions = context.sessions.write().unwrap();
+                    let session = sessions.entry(session_id)
+                            .or_insert_with(|| {
+                        Arc::new(RwLock::new(Session {
+                            id:           session_id,
+                            workers:      BTreeSet::new(),
+                            first_packet: Instant::now(),
+                            last_packet:  Instant::now(),
+                            fuzz_cases:   0,
+                            total_cycles: 0,
+                            reset_cycles: 0,
+                            vm_cycles:    0,
+                            coverage:     BTreeSet::new(),
+                        }))
                     });
+
+                    client = {
+                        // Update the client to reference this session
+                        let mut clients = context.clients.write().unwrap();
+                        clients.insert(src_ip, Arc::new(Client {
+                            session:    session.clone(),
+                            session_id: session_id,
+                        }));
+                        clients.get_mut(&src_ip).map(|x| x.clone())
+                    };
                 }
 
-                // Get the new client
-                client = clients.get_mut(&src_ip);
+                // Client is always valid at this point
+                let client = client.unwrap();
 
-                // Log the new worker
-                client.unwrap().workers.insert(core_id);
+                // Insert our core ID into the session
+                let mut session = client.session.write().unwrap();
+                session.workers.insert(core_id);
             }
             ServerMessage::Coverage(records) => {
-                let mut coverage = context.coverage.lock().unwrap();
+                let mut coverage = context.coverage.write().unwrap();
                 let mut coverage_file = context.coverage_file.lock().unwrap();
 
                 // Go through each coverage record that was reported
@@ -189,8 +240,9 @@ fn handle_client(stream: TcpStream,
 
                     // Update the per-client coverage records
                     if let Some(ref mut client) = client {
-                        if !client.coverage.contains(&record) {
-                            client.coverage.insert(record.clone());
+                        let mut session = client.session.write().unwrap();
+                        if !session.coverage.contains(&record) {
+                            session.coverage.insert(record.clone());
                         }
                     }
                 }
@@ -270,8 +322,9 @@ fn handle_client(stream: TcpStream,
 
 struct Context<'a> {
     file_db:       RwLock<HashMap<u64, (SystemTime, Vec<u8>)>>,
-    coverage:      Mutex<BTreeSet<CoverageRecord<'a>>>,
-    clients:       Mutex<HashMap<IpAddr, Client<'a>>>,
+    coverage:      RwLock<BTreeSet<CoverageRecord<'a>>>,
+    clients:       RwLock<HashMap<IpAddr, Arc<Client<'a>>>>,
+    sessions:      RwLock<HashMap<u64, Arc<RwLock<Session<'a>>>>>,
     coverage_file: Mutex<File>,
 }
 
@@ -280,6 +333,7 @@ fn main() -> io::Result<()> {
         file_db:       Default::default(),
         coverage:      Default::default(),
         clients:       Default::default(),
+        sessions:      Default::default(),
         coverage_file: Mutex::new(File::create("coverage.txt")?),
     });
 
