@@ -8,9 +8,11 @@ use alloc::boxed::Box;
 use lockcell::LockCell;
 use page_table::VirtAddr;
 
+use crate::mm::shootdown_state;
 use crate::apic::Apic;
-use crate::core_locals::LockInterrupts;
 use crate::acpi::{set_core_state, ApicState};
+use crate::panic::panicing;
+use crate::core_locals::LockInterrupts;
 
 /// If a given interrupt requires an EOI when it is handled, the corresponding
 /// offset into this table will indicate `true`.
@@ -346,11 +348,17 @@ pub unsafe extern fn interrupt_handler(
     if number == 2 {
         // Check if this was a TLB shootdown
         if let Some(apic_id) = core!().apic_id() {
-            if crate::mm::SHOULD_SHOOTDOWN.compare_and_swap(
-                    apic_id, !0, Ordering::SeqCst) == apic_id {
+            if shootdown_state().load(Ordering::SeqCst) == apic_id {
                 cpu::write_cr3(cpu::read_cr3());
+                shootdown_state().store(!0, Ordering::SeqCst);
                 return;
             }
+        }
+
+        // If we're in the process of panicing, get back to panicing, we don't
+        // want to re-panic
+        if core!().id == 0 && panicing().load(Ordering::SeqCst) {
+            return;
         }
 
         // If this is core ID 0, other cores have paniced and are informing us
@@ -359,18 +367,13 @@ pub unsafe extern fn interrupt_handler(
             // NMI, signalled that another core has paniced
             panic!("Panic occured on another core");
         } else {
-            {
-                // VMXOFF if we're in VMX root operation
-                let vmxon_lock = core!().vmxon_region().shatter();
-
-                if let Some(_) = &*vmxon_lock {
-                    // Disable VMX root operation
-                    llvm_asm!("vmxoff" :::: "intel", "volatile");
-                }
-
-                *vmxon_lock = None;
+            // VMXOFF if we're in VMX root operation
+            let vmxon_lock = core!().vmxon_region().shatter();
+            if (*vmxon_lock).is_some() {
+                // Disable VMX root operation
+                llvm_asm!("vmxoff" :::: "intel", "volatile");
             }
-
+            
             // Mark that we're in the halted state
             set_core_state(core!().apic_id().unwrap(), ApicState::Halted);
 

@@ -125,7 +125,7 @@ pub trait PhysMem {
         -> Option<*mut u8>;
 
     /// Initiate a TLB shootdown on all cores
-    unsafe fn tlb_shootdown(&mut self);
+    unsafe fn tlb_shootdown(&mut self, pt: &mut PageTable);
    
     /// Allocate physical memory with a requested layout
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr>;
@@ -452,7 +452,7 @@ impl PageTable {
             cpu::write_cr3(cpu::read_cr3());
 
             // Request a TLB shootdown
-            phys_mem.tlb_shootdown();
+            phys_mem.tlb_shootdown(self);
         }
 
         Some(())

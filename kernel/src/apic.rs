@@ -348,102 +348,101 @@ impl Apic {
         core!().interrupts().lock().as_mut().unwrap().remove_handler(
             APIC_TIMER_VECTOR, Self::timer_interrupt);
     }
-}
 
-impl Drop for Apic {
-    fn drop(&mut self) {
-        unsafe {
-            // Mask timer interrupts
-            self.write_apic(Register::LvtTimer,
-                LVT_MASK | self.read_apic(Register::LvtTimer));
+    /// Reset the APIC to the original state it was in before we took control
+    /// of it.
+    /// This is used during soft reboots
+    pub unsafe fn reset(&mut self) {
+        // Mask timer interrupts
+        self.write_apic(Register::LvtTimer,
+            LVT_MASK | self.read_apic(Register::LvtTimer));
 
-            // It is possible that we're dropping the `Apic` from a timer
-            // interrupt handler. In this case, there may be an interrupt which
-            // is currently in the servicing state. We will EOI on behalf of
-            // the timer as we're tearing down.
-            loop {
-                // Get the current interrupt vectors being serviced
-                let isr = self.isr();
+        // It is possible that we're dropping the `Apic` from a timer
+        // interrupt handler. In this case, there may be an interrupt which
+        // is currently in the servicing state. We will EOI on behalf of
+        // the timer as we're tearing down.
+        loop {
+            // Get the current interrupt vectors being serviced
+            let isr = self.isr();
 
-                if isr[0] == 0 && isr[1] == 0 {
-                    // No interrupts are being serviced
-                    break;
-                }
-
-                // At this point, we know there is at least one interrupt
-                // being serviced. EOI the APIC, and try again
-                Self::eoi();
-            }
-            
-            // Put the interrupt handler into draining mode
-            crate::interrupts::DRAINING_EOIS
-                .store(true, core::sync::atomic::Ordering::SeqCst);
-
-            // At this point the APIC has been software disabled. Check if
-            // there are any pending interrupts that we may have caused, and
-            // drain them from the pendings.
-            loop {
-                let irr     = self.irr();
-                let can_eoi = crate::interrupts::eoi_required();
-
-                // Check if there are any pending interrupts that we have
-                // registered EOI-expecting handlers for.
-                let pending_handleable =
-                    (irr[0] & can_eoi[0]) != 0 || (irr[1] & can_eoi[1]) != 0;
-
-                if !pending_handleable {
-                    // Nothing more to handle, break out of the loop
-                    break;
-                }
-
-                // Unconditionally enable interrupts
-                cpu::enable_interrupts();
+            if isr[0] == 0 && isr[1] == 0 {
+                // No interrupts are being serviced
+                break;
             }
 
-            // Unconditionally disable interrupts as we may have enabled them
-            // during the drain process.
-            cpu::disable_interrupts();
-            
-            // Restore the original APIC timer state
-            {
-                // Load the original state, ending in the initial count
-                self.write_apic(Register::DivideConfiguration, 
-                                self.orig_timer_state.dcr);
-                self.write_apic(Register::LvtTimer,
-                                self.orig_timer_state.lvt);
-                self.write_apic(Register::InitialCount,
-                                self.orig_timer_state.icr);
-            }
-
-            // Load the original SVR
-            self.write_apic(Register::SpuriousInterruptVector, self.orig_svr);
-            
-            // We do this assert when we first launch the APIC. The BIOS should
-            // never be disabling the APIC. We just added this assert here as
-            // an additional check incase we end up removing the other code.
-            // This should never fail.
-            assert!((self.orig_ia32_apic_base & IA32_APIC_BASE_EN) != 0,
-                "Disabling the APIC is not supported");
-
-            // Restore the original `IA32_APIC_BASE` to its original state.
-            // Preserving the x2apic mode if we upgraded it, as downgrading
-            // the x2apic requires going to fully disabled and back, which
-            // may or may not be supported on the processor.
-            // The x2apic is fully compatible with the xapic and leaving the
-            // x2apic enabled should still work as expected during soft
-            // reboot.
-            cpu::wrmsr(IA32_APIC_BASE,
-                       self.orig_ia32_apic_base |
-                       if let ApicMode::X2Apic = self.mode {
-                           IA32_APIC_BASE_EXTD
-                       } else { 0 });
-
-            // Reload the PIC's initial state
-            // Without this iPXE on QEMU-KVM is unable to timeout during a
-            // failed PXE transfer.
-            cpu::out8(0xa1, self.orig_pic_a1);
-            cpu::out8(0x21, self.orig_pic_21);
+            // At this point, we know there is at least one interrupt
+            // being serviced. EOI the APIC, and try again
+            Self::eoi();
         }
+        
+        // Put the interrupt handler into draining mode
+        crate::interrupts::DRAINING_EOIS
+            .store(true, core::sync::atomic::Ordering::SeqCst);
+
+        // At this point the APIC has been software disabled. Check if
+        // there are any pending interrupts that we may have caused, and
+        // drain them from the pendings.
+        loop {
+            let irr     = self.irr();
+            let can_eoi = crate::interrupts::eoi_required();
+
+            // Check if there are any pending interrupts that we have
+            // registered EOI-expecting handlers for.
+            let pending_handleable =
+                (irr[0] & can_eoi[0]) != 0 || (irr[1] & can_eoi[1]) != 0;
+
+            if !pending_handleable {
+                // Nothing more to handle, break out of the loop
+                break;
+            }
+
+            // Unconditionally enable interrupts
+            cpu::enable_interrupts();
+        }
+
+        // Unconditionally disable interrupts as we may have enabled them
+        // during the drain process.
+        cpu::disable_interrupts();
+        
+        // Restore the original APIC timer state
+        {
+            // Load the original state, ending in the initial count
+            self.write_apic(Register::DivideConfiguration, 
+                            self.orig_timer_state.dcr);
+            self.write_apic(Register::LvtTimer,
+                            self.orig_timer_state.lvt);
+            self.write_apic(Register::InitialCount,
+                            self.orig_timer_state.icr);
+        }
+
+        // Load the original SVR
+        self.write_apic(Register::SpuriousInterruptVector, self.orig_svr);
+        
+        // We do this assert when we first launch the APIC. The BIOS should
+        // never be disabling the APIC. We just added this assert here as
+        // an additional check incase we end up removing the other code.
+        // This should never fail.
+        assert!((self.orig_ia32_apic_base & IA32_APIC_BASE_EN) != 0,
+            "Disabling the APIC is not supported");
+
+        // Restore the original `IA32_APIC_BASE` to its original state.
+        // Preserving the x2apic mode if we upgraded it, as downgrading
+        // the x2apic requires going to fully disabled and back, which
+        // may or may not be supported on the processor.
+        // The x2apic is fully compatible with the xapic and leaving the
+        // x2apic enabled should still work as expected during soft
+        // reboot.
+        cpu::wrmsr(IA32_APIC_BASE,
+                   self.orig_ia32_apic_base |
+                   if let ApicMode::X2Apic = self.mode {
+                       IA32_APIC_BASE_EXTD
+                   } else { 0 });
+
+        // Reload the PIC's initial state
+        // Without this iPXE on QEMU-KVM is unable to timeout during a
+        // failed PXE transfer.
+        cpu::out8(0xa1, self.orig_pic_a1);
+        cpu::out8(0x21, self.orig_pic_21);
     }
 }
 

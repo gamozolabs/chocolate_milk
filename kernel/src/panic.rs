@@ -6,7 +6,6 @@ use core::sync::atomic::{AtomicPtr, AtomicBool, Ordering};
 
 use crate::acpi::{self, ApicState};
 use crate::apic::Apic;
-use crate::core_locals::CoreLocals;
 
 use serial::SerialPort;
 use page_table::PhysAddr;
@@ -17,9 +16,19 @@ use page_table::PhysAddr;
 static PANIC_PENDING: AtomicPtr<PanicInfo> =
     AtomicPtr::new(core::ptr::null_mut());
 
+/// Tracks if we're currently panicing on the BSP (used to prevent recursing
+/// into panics on subsequent NMIs by other panicing cores)
+static PANICING: AtomicBool = AtomicBool::new(false);
+
 /// Records if a soft reboot has been requested. If it has been, we will
 /// soft reboot as soon as we can.
 static SOFT_REBOOT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Get a reference to the current panicing state
+#[inline]
+pub unsafe fn panicing() -> &'static AtomicBool {
+    &PANICING
+}
 
 /// Attempt a soft reboot by checking to see if there is a command on the
 /// serial port to soft reboot.
@@ -89,27 +98,18 @@ pub unsafe fn soft_reboot(apic: &mut Apic) -> ! {
     // Disable all other cores
     disable_all_cores(apic);
     
-    {
-        // VMXOFF if we're in VMX root operation
-        let vmxon_lock = core!().vmxon_region().shatter();
-
-        if let Some(_) = &*vmxon_lock {
-            // Disable VMX root operation
-            llvm_asm!("vmxoff" :::: "intel", "volatile");
-        }
-
-        *vmxon_lock = None;
-    }
-
     // Destroy all devices which are handled by drivers
     crate::pci::destroy_devices();
 
-    // Destroy all the core locals, this will drop anything we've initialized
-    // for this core, like the APIC. Causing it to get reset to the original
-    // boot state.
-    let core_addr: *mut CoreLocals =
-        core!() as *const CoreLocals as *mut CoreLocals;
-    core::ptr::drop_in_place(core_addr);
+    // Reset the APIC state
+    apic.reset();
+    
+    // VMXOFF if we're in VMX root operation
+    let vmxon_lock = core!().vmxon_region().shatter();
+    if (*vmxon_lock).is_some() {
+        // Disable VMX root operation
+        llvm_asm!("vmxoff" :::: "intel", "volatile");
+    }
     
     // Convert the soft reboot virtual address into a function pointer that
     // takes one `PhysAddr` argument, which is the trampoline cr3
@@ -130,6 +130,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         // If we had a panic on the BSP, we handle it quite uniquely. We'll
         // shut down all other processors by sending them NMIs and waiting for
         // them to check into a halted state.
+        PANICING.store(true, Ordering::SeqCst);
         
         let our_info: *const PanicInfo = info;
 
@@ -145,17 +146,16 @@ pub fn panic(info: &PanicInfo) -> ! {
             // Disable all other cores, waiting for them to check-in notifying
             // us that they've gone into a permanent halt state.
             disable_all_cores(apic);
-
             apic
-        };
-
+        }; 
+        
         // Create our emergency serial port. We disabled all other cores so
         // we re-initialize the serial port to make sure it's in a sane state.
         let serial = unsafe {
             SerialPort::new(
                 (boot_args::KERNEL_PHYS_WINDOW_BASE + 0x400) as *const u16)
         };
-        
+
         /// Structure for holding the emergency serial port which is
         /// reinitialized and prepared for exclusive access during this panic.
         pub struct EmergencySerial(SerialPort);
@@ -171,7 +171,7 @@ pub fn panic(info: &PanicInfo) -> ! {
         let mut eserial = EmergencySerial(serial);
  
         // Create some space, in case we're splicing an existing line
-        let _ = write!(eserial, "\n\n\n");
+        let _ = write!(eserial, "\n\n");
         
         // Print information about the panic(s)
         for &(message, info) in &[
@@ -207,17 +207,21 @@ pub fn panic(info: &PanicInfo) -> ! {
         let _ = write!(eserial, "Starting soft reboot...\n");
         unsafe { soft_reboot(apic); }
     } else {
-        // Save the panic info for this core
-        PANIC_PENDING.store(info as *const _ as *mut _, Ordering::SeqCst);
-        
-        unsafe {
-            // Forcibly get access to the current APIC. This is likely safe in
-            // almost every situation as the APIC is not very stateful.
-            let apic = &mut *core!().apic().shatter();
-            let apic = apic.as_mut().unwrap();
+        // Check if the BSP is already panicing, if it is not, report our
+        // panic to it via an NMI
+        if PANICING.compare_and_swap(false, true, Ordering::SeqCst) == false {
+            // Save the panic info for this core
+            PANIC_PENDING.store(info as *const _ as *mut _, Ordering::SeqCst);
 
-            // Notify the BSP that we paniced by sending it an NMI
-            apic.ipi(0, (1 << 14) | (4 << 8));
+            unsafe {
+                // Forcibly get access to the current APIC. This is likely safe
+                // in almost every situation as the APIC is not very stateful.
+                let apic = &mut *core!().apic().shatter();
+                let apic = apic.as_mut().unwrap();
+
+                // Notify the BSP that we paniced by sending it an NMI
+                apic.ipi(0, (1 << 14) | (4 << 8));
+            }
         }
         
         cpu::halt();

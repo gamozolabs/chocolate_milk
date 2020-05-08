@@ -27,7 +27,7 @@ pub mod pci;
 pub mod net;
 pub mod time;
 pub mod vtx;
-pub mod snapshotted_app;
+pub mod fuzz_session;
 pub mod test_fuzzer;
 pub mod ept;
 pub mod paging;
@@ -48,15 +48,15 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
 
     // Initialize the core locals, this must happen first.
     core_locals::init(boot_args, core_id);
-     
-    // Calibrate the TSC so we can use `time` routines
-    if core_id == 0 { unsafe { time::calibrate(); } }
     
     // Initialize interrupts
     interrupts::init();
 
     // Initialize the APIC
     unsafe { apic::init(); }
+     
+    // Calibrate the TSC so we can use `time` routines
+    if core_id == 0 { unsafe { time::calibrate(); } }
     
     if core!().id == 0 {
         // One-time initialization for the whole kernel
@@ -89,41 +89,6 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // Put your whatever code here, typically I just branch to a module
     // which has a "main" or something and call `mod::main()`
     // ====================================================================
-    
-    /*
-    if core!().id == 0 {
-        use net::NetDevice;
-
-        // Get access to a network device
-        let netdev = NetDevice::get().unwrap();
-        let tcp = NetDevice::tcp_connect(netdev.clone(),
-            "192.168.100.1:1911").unwrap();
-
-        use crate::noodle::Serialize;
-        let mut message = alloc::vec::Vec::new();
-        falktp::ServerMessage::Login(5, 5).serialize(&mut message);
-        tcp.send(&message);
-    }*/
-
-    /*if core!().id == 0 {
-        let nm = net::netmapping::NetMapping::new("192.168.100.1:1911",
-                                                  "out.falkdump", true)
-            .unwrap();
-
-        //print!("Netmapped {}\n", core!().id);
-
-        let it = cpu::rdtsc();
-        for page in 0..64 * 1024 {
-            let elapsed = time::elapsed(it);
-            if elapsed > 3.0 {
-                print!("{:10.4} MiB/sec\n", (page * 4096) as f64 / time::elapsed(it) / 1024. / 1024.);
-                break;
-            }
-            
-            let slc = &nm[page * 4096..page * 4096 + 20];
-            unsafe { core::ptr::read_volatile(slc.as_ptr()); }
-        }
-    }*/
 
     test_fuzzer::fuzz();
 

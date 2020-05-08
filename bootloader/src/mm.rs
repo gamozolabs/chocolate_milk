@@ -6,7 +6,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use crate::realmode::{RegisterState, invoke_realmode};
 
 use crate::BOOT_ARGS;
-use page_table::{PhysAddr, PhysMem};
+use page_table::{PhysAddr, PhysMem, PageTable};
 use rangeset::{Range, RangeSet};
 
 /// A wrapper on a range set to allow implementing the `PhysMem` trait
@@ -32,7 +32,7 @@ impl<'a> PhysMem for PhysicalMemory<'a> {
         Some(paddr as *mut u8)
     }
 
-    unsafe fn tlb_shootdown(&mut self) {}
+    unsafe fn tlb_shootdown(&mut self, _pt: &mut PageTable) {}
 
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
         Some(PhysAddr(

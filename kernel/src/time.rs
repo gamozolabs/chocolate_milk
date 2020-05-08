@@ -55,6 +55,9 @@ pub unsafe fn calibrate() {
         return;
     }
 
+    // Start a timer
+    let start = cpu::rdtsc();
+
     // Program the PIT to use mode 0 (interrupt after countdown) to
     // count down from 65535. This causes an interrupt to occur after
     // about 54.92 milliseconds (65535 / 1193182). We mask interrupts
@@ -76,13 +79,15 @@ pub unsafe fn calibrate() {
         }
     }
 
+    // Stop the timer
+    let end = cpu::rdtsc();
+
     // Compute the time, in seconds, that the countdown was supposed to
     // take
     let elapsed = 65535f64 / 1193182f64;
 
     // Compute MHz for the rdtsc
-    let computed_rate = ((cpu::rdtsc() - start) as f64) /
-        elapsed / 1000000.0;
+    let computed_rate = ((end - start) as f64) / elapsed / 1000000.0;
 
     // Round to the nearest 100MHz value
     let rounded_rate = (((computed_rate / 100.0) + 0.5) as u64) * 100;

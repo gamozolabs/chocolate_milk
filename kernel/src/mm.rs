@@ -13,17 +13,23 @@ use crate::acpi::{self, ApicState, MAX_CORES};
 use rangeset::Range;
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::KERNEL_VMEM_BASE;
-use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
+use page_table::{PageTable, PhysMem, PhysAddr, PageType, VirtAddr};
 use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_NX};
 
 /// Cores should check this during an NMI to see if they are being shot down
 /// If it is equal to their APIC ID, they are being shot down
-pub static SHOULD_SHOOTDOWN: AtomicU32 = AtomicU32::new(!0);
+static SHOULD_SHOOTDOWN: AtomicU32 = AtomicU32::new(!0);
 
 /// Table which is indexed by an APIC identifier to map to a physical range
 /// which is local to it its NUMA node
 static APIC_TO_MEMORY_RANGE: AtomicPtr<[Option<Range>; MAX_CORES]> =
     AtomicPtr::new(core::ptr::null_mut());
+
+/// Gets the current TLB shootdown state
+#[inline]
+pub unsafe fn shootdown_state() -> &'static AtomicU32 {
+    &SHOULD_SHOOTDOWN
+}
 
 /// Get the preferred memory range for the currently running APIC. Returns
 /// `None` if we have no valid APIC ID yet, or we do not have NUMA knowledge
@@ -311,7 +317,10 @@ impl PhysMem for PhysicalMemory {
         Some((paddr.0 + KERNEL_PHYS_WINDOW_BASE) as *mut u8)
     }
 
-    unsafe fn tlb_shootdown(&mut self) {
+    /// Perform a TLB shootdown
+    /// Since this takes a mutable reference to the page table, it ensures
+    /// the page table lock is currently held.
+    unsafe fn tlb_shootdown(&mut self, _pt: &mut PageTable) {
         // Only do this if we have a valid APIC initialized
         if let Some(our_apic_id) = core!().apic_id() {
             // Forcibly get access to the current APIC. This is likely safe in

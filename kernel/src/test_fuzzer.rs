@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 //use crate::vtx::Register;
 use crate::core_locals::LockInterrupts;
-use crate::snapshotted_app::{Worker, FuzzSession};
+use crate::fuzz_session::{Worker, FuzzSession};
 
 use lockcell::LockCell;
 
@@ -20,7 +20,9 @@ pub fn fuzz() {
             *session = Some(
                 Arc::new(FuzzSession::from_falkdump(
                         "192.168.101.1:1911", "out.falkdump")
-                .init_master_vm(|_worker| {})
+                .init_master_vm(|_worker| {
+                    //_worker.vm.set_reg(crate::vtx::Register::Cr3, 4853);
+                })
                 //.timeout(100_000)
                 .inject(inject))
             );
@@ -31,7 +33,9 @@ pub fn fuzz() {
     let mut worker = FuzzSession::worker(session);
     
     // Parse the module lists for the target
-    worker.get_module_list_win64().expect("Failed to get module list");
+    if worker.get_module_list_win64().is_some() {
+        print!("Oooh, we discovered a 64-bit windows module list!\n");
+    }
 
     loop {
         let _vmexit = worker.fuzz_case();
