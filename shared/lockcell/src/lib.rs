@@ -5,8 +5,9 @@
 
 use core::ops::{Deref, DerefMut};
 use core::cell::UnsafeCell;
+use core::panic::Location;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, Ordering, spin_loop_hint};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, spin_loop_hint};
 
 /// Read the time stamp counter
 #[inline]
@@ -63,6 +64,9 @@ pub struct LockCell<T: ?Sized, I: InterruptState> {
     /// Tracks the core that currently holds the lock
     owner: AtomicU32,
 
+    /// Pointer to a `Location` with the caller
+    owner_location: AtomicU64,
+
     /// A holder of the `InterruptState` trait for this implementation
     _interrupt_state: PhantomData<I>,
 
@@ -83,6 +87,7 @@ impl<T, I: InterruptState> LockCell<T, I> {
             ticket:              AtomicU32::new(0),
             release:             AtomicU32::new(0),
             owner:               AtomicU32::new(0),
+            owner_location:      AtomicU64::new(0),
             val:                 UnsafeCell::new(val),
             disables_interrupts: false,
             _interrupt_state:    PhantomData,
@@ -96,6 +101,7 @@ impl<T, I: InterruptState> LockCell<T, I> {
             ticket:              AtomicU32::new(0),
             release:             AtomicU32::new(0),
             owner:               AtomicU32::new(0),
+            owner_location:      AtomicU64::new(0),
             val:                 UnsafeCell::new(val),
             disables_interrupts: true,
             _interrupt_state:    PhantomData,
@@ -140,7 +146,7 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
         let mut time_threshold: u32 = if I::in_exception() {
             10_000
         } else {
-            !0
+            10_000
         };
 
         // Timeout based off of the TSC to determine when to give up on the
@@ -150,7 +156,14 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
         while self.release.load(Ordering::SeqCst) != ticket {
             // If the current core is the owner of the load
             if self.owner.load(Ordering::SeqCst) == core_id {
-                panic!("Deadlock detected");
+                let owner_loc = self.owner_location.load(Ordering::SeqCst);
+                if owner_loc != 0 {
+                    let owner_loc = owner_loc as *const Location<'static>;
+                    panic!("Deadlock detected, previous holder at {:?}",
+                           unsafe { &*owner_loc });
+                } else {
+                    panic!("Deadlock detected, unknown original location");
+                }
             }
 
             if time_threshold > 0 {
@@ -165,7 +178,16 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
                     timeout = rdtsc() + 3_000_000_000;
                 } else {
                     if rdtsc() >= timeout {
-                        panic!("Timed out when attempting to take lock");
+                        let owner_loc = self.owner_location
+                            .load(Ordering::SeqCst);
+                        if owner_loc != 0 {
+                            let owner_loc =
+                                owner_loc as *const Location<'static>;
+                            panic!("Lock timeout, previous holder at {:?}",
+                                   unsafe { &*owner_loc });
+                        } else {
+                            panic!("Lock timeout, unknown original location");
+                        }
                     }
                 }
             }
@@ -175,6 +197,8 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
 
         // Note that this core owns the lock
         self.owner.store(core_id, Ordering::SeqCst);
+        self.owner_location.store(Location::caller() as *const _ as u64,
+            Ordering::SeqCst);
 
         // At this point we have exclusive access
         LockCellGuard {
@@ -199,6 +223,7 @@ pub struct LockCellGuard<'a, T: ?Sized, I: InterruptState> {
 impl<'a, T: ?Sized, I: InterruptState> Drop for LockCellGuard<'a, T, I> {
     fn drop(&mut self) {
         // Set that there is no owner of the lock
+        self.cell.owner_location.store(0, Ordering::SeqCst);
         self.cell.owner.store(!0, Ordering::SeqCst);
 
         // Release the lock

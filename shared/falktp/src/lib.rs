@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use alloc::sync::Arc;
 use alloc::borrow::Cow;
 use alloc::string::String;
@@ -14,6 +15,14 @@ noodle!(serialize, deserialize,
     pub struct CoverageRecord<'a> {
         pub module: Option<Cow<'a, Arc<String>>>,
         pub offset: u64,
+    }
+);
+
+noodle!(serialize, deserialize,
+    #[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
+    pub struct InputRecord<'a> {
+        pub hash:  u128,
+        pub input: Cow<'a, Arc<Vec<u8>>>,
     }
 );
 
@@ -51,8 +60,11 @@ pub enum ServerMessage<'a> {
     /// Log in as a new fuzzer
     Login(u64, u32),
 
-    /// Report new coverage to the server
+    /// Report new coverage
     Coverage(Cow<'a, [CoverageRecord<'a>]>),
+    
+    /// Report new inputs
+    Inputs(Cow<'a, [InputRecord<'a>]>),
 
     /// Report new statistics (always the totals)
     ReportStatistics {
@@ -61,5 +73,9 @@ pub enum ServerMessage<'a> {
         vm_cycles:    u64,
         reset_cycles: u64,
     },
+
+    /// The server has sent any messages related to syncing and the client
+    /// should resume fuzzing.
+    SyncComplete,
 });
 

@@ -336,8 +336,23 @@ impl PhysMem for PhysicalMemory {
                 let state = acpi::core_state(apic_id);
                 if state == ApicState::Online {
                     SHOULD_SHOOTDOWN.store(apic_id, Ordering::SeqCst);
-                    apic.ipi(apic_id, (1 << 14) | (4 << 8));
-                    while SHOULD_SHOOTDOWN.load(Ordering::SeqCst) != !0 {}
+
+                    let mut timeout = 0;
+                    while SHOULD_SHOOTDOWN.load(Ordering::SeqCst) != !0 {
+                        if cpu::rdtsc() >= timeout {
+                            if timeout > 0 {
+                                panic!("Failed to TLB shootdown APIC {:#x} \
+                                       from APIC {:#x}\n",
+                                       apic_id, our_apic_id);
+                            }
+
+                            // Send NMI
+                            apic.ipi(apic_id, (1 << 14) | (4 << 8));
+
+                            // Set a timer until we panic
+                            timeout = crate::time::future(10_000);
+                        }
+                    }
                 }
             }
         }

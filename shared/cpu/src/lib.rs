@@ -350,6 +350,7 @@ pub struct CPUFeatures {
     pub sse4_1: bool,
     pub sse4_2: bool,
     pub x2apic: bool,
+    pub aesni: bool,
     pub xsave: bool,
     pub avx: bool,
     pub apic: bool,
@@ -397,6 +398,7 @@ pub fn get_cpu_features() -> CPUFeatures {
             features.sse4_1  = ((cpuid_1.2 >> 19) & 1) == 1;
             features.sse4_2  = ((cpuid_1.2 >> 20) & 1) == 1;
             features.x2apic  = ((cpuid_1.2 >> 21) & 1) == 1;
+            features.aesni   = ((cpuid_1.2 >> 25) & 1) == 1;
             features.xsave   = ((cpuid_1.2 >> 26) & 1) == 1;
             features.avx     = ((cpuid_1.2 >> 28) & 1) == 1;
         }

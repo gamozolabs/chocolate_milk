@@ -27,6 +27,13 @@ name = "cpu"
 version = "0.1.0"
 
 [[package]]
+name = "falkhash"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+]
+
+[[package]]
 name = "falktp"
 version = "0.1.0"
 dependencies = [
@@ -42,6 +49,7 @@ dependencies = [
  "boot_args",
  "core_reqs",
  "cpu",
+ "falkhash",
  "falktp",
  "lockcell",
  "noodle",

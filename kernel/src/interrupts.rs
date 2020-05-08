@@ -349,8 +349,8 @@ pub unsafe extern fn interrupt_handler(
         // Check if this was a TLB shootdown
         if let Some(apic_id) = core!().apic_id() {
             if shootdown_state().load(Ordering::SeqCst) == apic_id {
-                cpu::write_cr3(cpu::read_cr3());
                 shootdown_state().store(!0, Ordering::SeqCst);
+                cpu::write_cr3(cpu::read_cr3());
                 return;
             }
         }

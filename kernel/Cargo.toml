@@ -18,6 +18,7 @@ noodle = { path = "../shared/noodle" }
 falktp = { path = "../shared/falktp" }
 aht = { path = "../shared/aht" }
 atomicvec = { path = "../shared/atomicvec" }
+falkhash = { path = "../shared/falkhash" }
 
 [profile.release]
 panic = "abort"

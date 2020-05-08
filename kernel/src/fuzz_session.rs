@@ -1,8 +1,10 @@
 //! A fuzz session, a collective session of workers collaborating on fuzzing
 //! a given target
 
+pub mod windows;
+
 use core::mem::size_of;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::alloc::Layout;
@@ -11,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::borrow::Cow;
-use alloc::collections::{BTreeMap};
+use alloc::collections::BTreeMap;
 
 use crate::mm;
 use crate::time;
@@ -25,8 +27,9 @@ use crate::core_locals::LockInterrupts;
 use crate::paging::*;
 
 use aht::Aht;
-use falktp::{CoverageRecord, ServerMessage};
+use falktp::{CoverageRecord, InputRecord, ServerMessage};
 use noodle::*;
+use falkhash::FalkHasher;
 use lockcell::LockCell;
 use atomicvec::AtomicVec;
 use page_table::{PhysAddr, VirtAddr, PhysMem, PageType, Mapping};
@@ -68,6 +71,16 @@ primitive!(i16);
 primitive!(i32);
 primitive!(i64);
 primitive!(i128);
+
+pub trait Enlightenment {
+    /// Request that enlightenment returns the module list for the current
+    /// execution state of the worker
+    ///
+    /// If a module list is parsed, this returns a map of base addresses of
+    /// modules to the (end address (inclusive), module name)
+    fn get_module_list(&mut self, worker: &mut Worker) ->
+        BTreeMap<u64, (u64, Arc<String>)>;
+}
 
 /// Different types of paging modes
 #[derive(Clone, Copy)]
@@ -206,18 +219,18 @@ struct NetBacking<'a> {
 }
 
 /// A VM worker which is likely part of a large fuzzing group
-pub struct Worker<'a, C> {
+pub struct Worker<'a> {
     /// Master worker that we are forked from
     master: Option<Arc<Self>>,
+
+    /// The enlightenment which can be used to resolve OS-specific information
+    enlightenment: Option<Box<dyn Enlightenment>>,
 
     /// Network mapped memory for the VM
     network_mem: Option<Arc<NetBacking<'a>>>,
 
     /// The fuzz session this worker belongs to
-    session: Option<Arc<FuzzSession<'a, C>>>,
-    
-    /// Optional user-controlled global context
-    pub global_context: Option<Arc<C>>,
+    session: Option<Arc<FuzzSession<'a>>>,
 
     /// Raw virtual machine that this worker uses
     pub vm: Vm,
@@ -226,7 +239,7 @@ pub struct Worker<'a, C> {
     pub rng: Rng,
 
     /// Fuzz input for the fuzz case
-    pub fuzz_input: Option<Vec<u8>>,
+    pub fuzz_input: RefCell<Vec<u8>>,
 
     /// Local worker statistics, to be merged into the fuzz session on an
     /// interval
@@ -241,13 +254,16 @@ pub struct Worker<'a, C> {
     /// A connection to the server
     server: Option<BufferedIo<TcpConnection>>,
 
-    /// List of all modules
+    /// A hasher which can be used to generate 128-bit hashes
+    hasher: FalkHasher,
+
+    /// List of all modules for all cr3s
     /// Maps from base address to module, to end of module (inclusive) and the
     /// module name
-    module_list: BTreeMap<u64, (u64, Arc<String>)>,
+    module_list: BTreeMap<u64, BTreeMap<u64, (u64, Arc<String>)>>,
 }
 
-impl<'a, C> Worker<'a, C> {
+impl<'a> Worker<'a> {
     /// Create a new empty VM from network backed memory
     fn from_net(memory: Arc<NetBacking<'a>>) -> Self {
         Worker {
@@ -260,14 +276,15 @@ impl<'a, C> Worker<'a, C> {
             session:        None,
             worker_id:      !0,
             module_list:    BTreeMap::new(),
-            fuzz_input:     None,
+            fuzz_input:     RefCell::new(Vec::new()),
             server:         None,
-            global_context: None,
+            hasher:         FalkHasher::new(),
+            enlightenment:  None,
         }
     }
     
     /// Create a new VM forked from a master
-    fn fork(session: Arc<FuzzSession<'a, C>>,
+    fn fork(session: Arc<FuzzSession<'a>>,
             master: Arc<Self>, worker_id: u64) -> Self {
         // Create a new VM with the masters guest registers as the current
         // register state
@@ -282,13 +299,25 @@ impl<'a, C> Worker<'a, C> {
             rng:            Rng::new(),
             stats:          Statistics::default(),
             sync:           0,
-            global_context: session.global_context.clone(),
             session:        Some(session),
             worker_id:      worker_id,
             module_list:    BTreeMap::new(),
             server:         None,
-            fuzz_input:     Some(Vec::new()),
+            fuzz_input:     RefCell::new(Vec::new()),
+            hasher:         FalkHasher::new(),
+            enlightenment:  None,
         }
+    }
+
+    /// Get the current page table (cr3 with the VPID and friends masked off)
+    #[inline]
+    pub fn page_table(&self) -> u64 {
+        self.vm.reg(Register::Cr3) & 0xffffffffff000
+    }
+
+    /// Set the enlightenment to use for this guest
+    pub fn enlighten(&mut self, enlightenment: Option<Box<dyn Enlightenment>>){
+        self.enlightenment = enlightenment;
     }
 
     /// Get a random existing input
@@ -531,38 +560,48 @@ impl<'a, C> Worker<'a, C> {
                     continue 'vm_loop;
                 }
                 VmExit::Exception(Exception::DebugException) => {
-                    let modoff =
+                    let mut modoff =
                         self.resolve_module(self.vm.reg(Register::Rip));
-                    if session.report_coverage(&CoverageRecord {
-                        module: modoff.0.map(|x| Cow::Borrowed(x)),
-                        offset: modoff.1,
-                    }) {
-                        single_step = 1000;
-                        if let Some(input) = &self.fuzz_input {
-                            if session.input_dedup.entry_or_insert(
-                                    input, 0, || Box::new(())).inserted() {
-                                session.inputs.push(Box::new(input.clone()));
-                            }
+                    if modoff.0.is_none() && self.enlightenment.is_some() {
+                        // Get the current page table
+                        let pt = self.page_table();
+
+                        // Check if we have a module list for this process
+                        if !self.module_list.contains_key(&pt) {
+                            // Oooh, go try to get the module list for this
+                            // process
+
+                            // Request the module list from enlightenment
+                            let mut enl = self.enlightenment.take().unwrap();
+                            let ml = enl.get_module_list(self);
+                            self.enlightenment = Some(enl);
+
+                            // Save the module list for the process
+                            self.module_list.insert(pt, ml);
+
+                            // Re-resolve the module + offset
+                            modoff = self.resolve_module(
+                                self.vm.reg(Register::Rip));
                         }
                     }
+
+                    let input = self.fuzz_input.borrow();
+                    if session.report_coverage(Some((&*input, &self.hasher)),
+                        &CoverageRecord {
+                            module: modoff.0.map(|x| Cow::Owned(x)),
+                            offset: modoff.1,
+                    }) { single_step = 1000 };
                     continue 'vm_loop;
                 }
                 VmExit::PreemptionTimer => {
                     let modoff =
                         self.resolve_module(self.vm.reg(Register::Rip));
-                    if session.report_coverage(&CoverageRecord {
-                        module: modoff.0.map(|x| Cow::Borrowed(x)),
-                        offset: modoff.1,
-                    }) {
-                        single_step = 1000;
-                        if let Some(input) = &self.fuzz_input {
-                            if session.input_dedup.entry_or_insert(
-                                    input, 0, || Box::new(())).inserted() {
-                                session.inputs.push(
-                                    Box::new(input.clone()));
-                            }
-                        }
-                    }
+                    let input = self.fuzz_input.borrow();
+                    if session.report_coverage(Some((&*input, &self.hasher)),
+                        &CoverageRecord {
+                            module: modoff.0.map(|x| Cow::Owned(x)),
+                            offset: modoff.1,
+                    }) { single_step = 1000 };
                     continue 'vm_loop;
                 }
                 _ => {},
@@ -600,76 +639,25 @@ impl<'a, C> Worker<'a, C> {
 
     /// Attempt to resolve the `addr` into a module + offset based on the
     /// current `module_list`
-    pub fn resolve_module(&mut self, addr: u64) -> (Option<&Arc<String>>, u64){
-        if let Some((base, (end, name))) =
-                self.module_list.range(..=addr).next_back() {
-            if addr <= *end {
-                (Some(name), addr - base)
+    pub fn resolve_module(&self, addr: u64) -> (Option<Arc<String>>, u64) {
+        // Get the current page table
+        let pt = self.page_table();
+
+        // Get the module list for the current process
+        if let Some(modlist) = self.module_list.get(&pt) {
+            if let Some((base, (end, name))) =
+                    modlist.range(..=addr).next_back() {
+                if addr <= *end {
+                    (Some(name.clone()), addr - base)
+                } else {
+                    (None, addr)
+                }
             } else {
                 (None, addr)
             }
         } else {
             (None, addr)
         }
-    }
-
-    /// Assuming the current process is a Windows 64-bit userland process,
-    /// extract the module list from it
-    pub fn get_module_list_win64(&mut self) -> Option<()> {
-        // Create a new module list
-        let mut module_list = BTreeMap::new();
-
-        // Get the base of the TEB
-        let gs_base = self.vm.reg(Register::GsBase);
-
-        // Get the address of the `_PEB`
-        let peb = self.read_virt::<u64>(VirtAddr(gs_base + 0x60))?;
-
-        // Get the address of the `_PEB_LDR_DATA`
-        let peb_ldr_data = self.read_virt::<u64>(VirtAddr(peb + 0x18))?;
-
-        // Get the in load order module list links
-        let mut mod_flink =
-            self.read_virt::<u64>(VirtAddr(peb_ldr_data + 0x10))?;
-        let mod_blink = self.read_virt::<u64>(VirtAddr(peb_ldr_data + 0x18))?;
-
-        // Traverse the linked list
-        while mod_flink != 0 {
-            let base = self.read_virt::<u64>(VirtAddr(mod_flink + 0x30))?;
-            let size = self.read_virt::<u32>(VirtAddr(mod_flink + 0x40))?;
-            if size <= 0 {
-                return None;
-            }
-
-            // Get the length of the module name unicode string
-            let name_len = self.read_virt::<u16>(VirtAddr(mod_flink + 0x58))?;
-            let name_ptr = self.read_virt::<u64>(VirtAddr(mod_flink + 0x60))?;
-            if name_ptr == 0 || name_len <= 0 || (name_len % 2) != 0 {
-                return None;
-            }
-
-            let mut name = vec![0u16; name_len as usize / 2];
-            for (ii, wc) in name.iter_mut().enumerate() {
-                *wc = self.read_virt::<u16>(VirtAddr(
-                    name_ptr.checked_add((ii as u64).checked_mul(2)?)?))?;
-            }
-
-            // Convert the module name into a UTF-8 Rust string
-            let name_utf8 = Arc::new(String::from_utf16(&name).ok()?);
-
-            // Save the module information into the module list
-            module_list.insert(base,
-                (base.checked_add(size as u64 - 1)?, name_utf8));
-
-            // Go to the next link in the table
-            if mod_flink == mod_blink { break; }
-            mod_flink = self.read_virt::<u64>(VirtAddr(mod_flink))?;
-        }
-
-        // Establish the new module list
-        self.module_list = module_list;
-
-        Some(())
     }
 
     /// Get the base address for a given segment
@@ -1208,40 +1196,40 @@ impl<'a, C> Worker<'a, C> {
     }
 }
 
-type InjectCallback<'a, C> = fn(&mut Worker<'a, C>);
+type InjectCallback<'a> = fn(&mut Worker<'a>);
 
-type VmExitFilter<'a, C> = fn(&mut Worker<'a, C>, &VmExit) -> bool;
+type VmExitFilter<'a> = fn(&mut Worker<'a>, &VmExit) -> bool;
 
 /// A session for multiple workers to fuzz a shared job
-pub struct FuzzSession<'a, C> {
+pub struct FuzzSession<'a> {
     /// Master VM state
-    master_vm: Arc<Worker<'a, C>>,
-
-    /// Optional user-controlled global context
-    global_context: Option<Arc<C>>,
+    master_vm: Arc<Worker<'a>>,
 
     /// Timeout for each fuzz case
     timeout: Option<u64>,
 
     /// Callback to invoke before every fuzz case, for the fuzzer to inject
     /// information into the VM
-    inject: Option<InjectCallback<'a, C>>,
+    inject: Option<InjectCallback<'a>>,
 
     /// Callback to invoke when VM exits are hit to allow a user to handle VM
     /// exits to re-enter the VM
-    vmexit_filter: Option<VmExitFilter<'a, C>>,
+    vmexit_filter: Option<VmExitFilter<'a>>,
     
     /// All observed coverage information
     coverage: Aht<CoverageRecord<'a>, (), 65536>,
 
     /// Coverage which has yet to be reported to the server
     pending_coverage: LockCell<Vec<CoverageRecord<'a>>, LockInterrupts>,
+    
+    /// Inputs which have yet to be reported to the server
+    pending_inputs: LockCell<Vec<InputRecord<'a>>, LockInterrupts>,
 
-    /// Hash table of inputs
-    input_dedup: Aht<Vec<u8>, (), 65536>,
+    /// Table mapping input hashes to inputs
+    input_dedup: Aht<u128, Arc<Vec<u8>>, 65536>,
 
     /// Inputs which caused coverage
-    inputs: AtomicVec<Vec<u8>, 4096>,
+    inputs: AtomicVec<Arc<Vec<u8>>, 4096>,
 
     /// Global statistics for the fuzz cases
     stats: LockCell<Statistics, LockInterrupts>,
@@ -1256,7 +1244,7 @@ pub struct FuzzSession<'a, C> {
     id: u64,
 }
 
-impl<'a, C> FuzzSession<'a, C> {
+impl<'a> FuzzSession<'a> {
     /// Create a new empty fuzz session
     pub fn from_falkdump<S>(server: &str, name: S) -> Self
             where S: AsRef<str> {
@@ -1477,6 +1465,7 @@ impl<'a, C> FuzzSession<'a, C> {
             master_vm:        Arc::new(master),
             coverage:         Aht::new(),
             pending_coverage: LockCell::new(Vec::new()),
+            pending_inputs:   LockCell::new(Vec::new()),
             stats:            LockCell::new(Statistics::default()),
             timeout:          None,
             inject:           None,
@@ -1486,7 +1475,6 @@ impl<'a, C> FuzzSession<'a, C> {
             workers:          AtomicU64::new(0),
             id:               cpu::rdtsc(),
             server_addr:      server.into(),
-            global_context:   None,
         }
     }
 
@@ -1494,7 +1482,7 @@ impl<'a, C> FuzzSession<'a, C> {
     /// of the snapshot such that they can be mutated to create the basis for
     /// all fuzz cases.
     pub fn init_master_vm<F>(mut self, callback: F) -> Self
-            where F: FnOnce(&mut Worker<C>) {
+            where F: FnOnce(&mut Worker) {
         callback(Arc::get_mut(&mut self.master_vm).unwrap());
         self
     }
@@ -1507,28 +1495,22 @@ impl<'a, C> FuzzSession<'a, C> {
 
     /// Set the injection callback routine. This will be invoked every time
     /// the VM is reset and a new fuzz case is about to begin.
-    pub fn inject(mut self, inject: InjectCallback<'a, C>) -> Self {
+    pub fn inject(mut self, inject: InjectCallback<'a>) -> Self {
         self.inject = Some(inject);
-        self
-    }
-    
-    /// Set the global context for the session
-    pub fn global_context(mut self, context: C) -> Self {
-        self.global_context = Some(Arc::new(context));
         self
     }
     
     /// Set the VM exit filter for the workers. This will be invoked on an
     /// unhandled VM exit and gives an opportunity for the fuzzer to handle
     /// a VM exit to allow re-entry into the VM
-    pub fn vmexit_filter(mut self, vmexit_filter: VmExitFilter<'a, C>)
+    pub fn vmexit_filter(mut self, vmexit_filter: VmExitFilter<'a>)
             -> Self {
         self.vmexit_filter = Some(vmexit_filter);
         self
     }
 
     /// Get a new worker for this fuzz session
-    pub fn worker(session: Arc<Self>) -> Worker<'a, C> {
+    pub fn worker(session: Arc<Self>) -> Worker<'a> {
         // Get a new worker ID
         let worker_id = session.workers.fetch_add(1, Ordering::SeqCst);
 
@@ -1554,16 +1536,18 @@ impl<'a, C> FuzzSession<'a, C> {
     /// Update statistics to the server
     pub fn report_statistics(&self, server: &mut BufferedIo<TcpConnection>) {
         {
-            let stats = self.stats.lock();
-            ServerMessage::ReportStatistics {
-                fuzz_cases:   stats.fuzz_cases,
-                total_cycles: stats.total_cycles,
-                vm_cycles:    stats.vm_cycles,
-                reset_cycles: stats.reset_cycles,
-            }.serialize(server).unwrap();
+            // Report new inputs to the server
+            let mut pending_inputs = self.pending_inputs.lock();
+            if pending_inputs.len() > 0 {
+                ServerMessage::Inputs(
+                    Cow::Borrowed(pending_inputs.as_slice())
+                ).serialize(server).unwrap();
+                pending_inputs.clear();
+            }
         }
-
+        
         {
+            // Report new coverage to the server
             let mut pending_coverage = self.pending_coverage.lock();
             if pending_coverage.len() > 0 {
                 ServerMessage::Coverage(
@@ -1573,8 +1557,61 @@ impl<'a, C> FuzzSession<'a, C> {
             }
         }
 
+        {
+            let stats = self.stats.lock();
+            ServerMessage::ReportStatistics {
+                fuzz_cases:   stats.fuzz_cases,
+                total_cycles: stats.total_cycles,
+                vm_cycles:    stats.vm_cycles,
+                reset_cycles: stats.reset_cycles,
+            }.serialize(server).unwrap();
+        }
+
         // Flush anything we sent to the server
         server.flush().unwrap();
+
+        // Now, the server will respond to our stats with some things to do,
+        // this is where we handle syncing from the server which may be
+        // reporting new inputs and coverage that other machines have found
+        loop {
+            let msg = ServerMessage::deserialize(server).unwrap();
+            match msg {
+                ServerMessage::Coverage(records) => {
+                    for record in records.iter() {
+                        self.report_coverage(None, record);
+                    }
+                }
+                ServerMessage::Inputs(inputs) => {
+                    for input in inputs.iter() {
+                        // Insert the input into the dedup table
+                        let record = self.input_dedup.entry_or_insert(
+                                &input.hash, input.hash as usize,
+                                || Box::new(input.input.clone().into_owned()));
+                        if record.inserted() {
+                            let entry = record.entry();
+
+                            // Input was new, also save it to the input list
+                            self.inputs.push(Box::new(entry.clone()));
+
+                            // Mark these inputs as something we should report
+                            // to the server, so it knows we received and
+                            // processed them
+                            let mut pending_inputs = self.pending_inputs
+                                .lock();
+                            pending_inputs.push(InputRecord {
+                                hash:  input.hash,
+                                input: Cow::Owned(entry.clone()),
+                            });
+                        }
+                    }
+                }
+                ServerMessage::SyncComplete => {
+                    // Server has released us
+                    break;
+                }
+                _ => panic!("Unexpected server message during sync"),
+            }
+        }
     }
 
     /// Log in with the server
@@ -1584,9 +1621,39 @@ impl<'a, C> FuzzSession<'a, C> {
     }
 
     /// Report coverage
-    pub fn report_coverage(&self, cr: &CoverageRecord) -> bool {
+    pub fn report_coverage(&self, input: Option<(&[u8], &FalkHasher)>,
+                           cr: &CoverageRecord) -> bool {
         if self.coverage.entry_or_insert(cr, cr.offset as usize,
                                          || Box::new(())).inserted() {
+            // Save the input which caused this new unique coverage
+            if let Some((input, hasher)) = input {
+                // Hash the input
+                let hash = hasher.hash(input);
+
+                // Check if this input already is in our database
+                let record = self.input_dedup.entry_or_insert(
+                        &hash, hash as usize,
+                        || Box::new(Arc::new(input.to_vec())));
+
+                if record.inserted() {
+                    // Oooh, this is a new input, save it and queue it to send
+                    // to server
+                    
+                    // Get the entry we just inserted
+                    let entry = record.entry();
+
+                    // Save the input to the input vector, so we can
+                    // easily randomly access it
+                    self.inputs.push(Box::new(entry.clone()));
+
+                    let mut pending_inputs = self.pending_inputs.lock();
+                    pending_inputs.push(InputRecord {
+                        hash:  hash,
+                        input: Cow::Owned(entry.clone()),
+                    });
+                }
+            }
+
             // Coverage was new, queue it to be reported to the server
             self.pending_coverage.lock().push(CoverageRecord {
                 module: cr.module.as_ref().map(|x| Cow::Owned((**x).clone())),

@@ -136,19 +136,7 @@ pub fn panic(info: &PanicInfo) -> ! {
 
         let other_info: *const PanicInfo =
             PANIC_PENDING.load(Ordering::SeqCst);
-        
-        let apic = unsafe {
-            // Forcibly get access to the current APIC. This is likely safe in
-            // almost every situation as the APIC is not very stateful.
-            let apic = &mut *core!().apic().shatter();
-            let apic = apic.as_mut().unwrap();
-            
-            // Disable all other cores, waiting for them to check-in notifying
-            // us that they've gone into a permanent halt state.
-            disable_all_cores(apic);
-            apic
-        }; 
-        
+     
         // Create our emergency serial port. We disabled all other cores so
         // we re-initialize the serial port to make sure it's in a sane state.
         let serial = unsafe {
@@ -195,6 +183,18 @@ pub fn panic(info: &PanicInfo) -> ! {
                 let _ = write!(eserial, "{}\n", msg);
             }
         }
+        
+        let apic = unsafe {
+            // Forcibly get access to the current APIC. This is likely safe in
+            // almost every situation as the APIC is not very stateful.
+            let apic = &mut *core!().apic().shatter();
+            let apic = apic.as_mut().unwrap();
+            
+            // Disable all other cores, waiting for them to check-in notifying
+            // us that they've gone into a permanent halt state.
+            disable_all_cores(apic);
+            apic
+        }; 
 
         // Wait for a soft reboot to be requested
         while SOFT_REBOOT_REQUESTED.load(Ordering::SeqCst) != true {

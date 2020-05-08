@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use alloc::boxed::Box;
 
 //use crate::vtx::Register;
 use crate::core_locals::LockInterrupts;
@@ -10,7 +11,7 @@ pub fn fuzz() {
     //if core!().id != 0 { cpu::halt(); }
 
     static SESSION:
-        LockCell<Option<Arc<FuzzSession<()>>>, LockInterrupts> =
+        LockCell<Option<Arc<FuzzSession>>, LockInterrupts> =
         LockCell::new(None);
 
     // Create the master sessionshot, and fork from it for all cores
@@ -32,20 +33,18 @@ pub fn fuzz() {
 
     let mut worker = FuzzSession::worker(session);
     
-    // Parse the module lists for the target
-    worker.get_module_list_win64();
+    // Set that this is a Windows guest
+    worker.enlighten(Some(Box::new(crate::fuzz_session::windows::Enlightenment)));
 
     loop {
         let _vmexit = worker.fuzz_case();
-        /*
-        print!("PC is at {:#x} {:#x}\n", worker.vm.reg(Register::Rip),
-            worker.vm.reg(Register::Rax));
-        print!("{:#x?}\n", _vmexit);
-
-        crate::time::sleep(1_000_000);*/
     }
 }
 
-fn inject(_worker: &mut Worker<()>) {
+fn inject(worker: &mut Worker) {
+    let mut input = worker.fuzz_input.borrow_mut();
+    input.clear();
+    input.push(worker.rng.rand() as u8);
+    input.push(worker.rng.rand() as u8);
 }
 

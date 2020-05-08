@@ -281,7 +281,7 @@ impl TcpConnection {
                             device.as_ref().unwrap().discard(pkt);
                             continue;
                         }
-        
+
                         // Handle the packet we received
                         conn.handle_packet(&tcp, None);
                     } else {
@@ -355,7 +355,7 @@ impl TcpConnection {
         // Get mutable access to the TCP connection
         let mut conn = self.0.lock();
         if conn.state != TcpState::Established { return None; }
-
+        
         {
             // Compute the number of bytes to consume
             let consumeable = core::cmp::min(conn.window.len(), ptr.len());

@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, Duration};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, TcpStream, TcpListener};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::collections::hash_map::DefaultHasher;
 
 use noodle::*;
-use falktp::{CoverageRecord, ServerMessage};
+use falktp::{CoverageRecord, InputRecord, ServerMessage};
 
 /// If `true` prints some extra spew
 const VERBOSE: bool = false;
@@ -46,8 +47,18 @@ struct Session<'a> {
     /// Number of cycles spent inside the VM
     vm_cycles: u64,
 
-    /// Set of coverage for this client
+    /// Number of coverage records reported by this session which were unique
+    /// This allows us to track the unique contribution of workers to coverage
+    unique_coverage: u64,
+
+    /// Number of inputs uniquely reported by this session
+    unique_inputs: u64,
+
+    /// Set of coverage for this session
     coverage: BTreeSet<CoverageRecord<'a>>,
+
+    /// Input stored on this session
+    inputs: BTreeSet<InputRecord<'a>>,
 }
 
 /// A client (a unique IP address), which may be part of a set of IP addresses
@@ -89,11 +100,15 @@ fn stats(context: Arc<Context>) {
             let vm_pct =
                 session.vm_cycles as f64 / session.total_cycles as f64;
 
-            print!("\x1b[34;1m    workers {:3} | cov {:8} | \
+            print!("\x1b[34;1m    workers {:3} | cov {:8} ({:8}) | \
+                        inp {:8} ({:8}) | \
                         cases {:14} [{:12.2} / s] | vm {:8.4} | \
                         reset {:8.4} | {:016x} {}\x1b[0m\n",
                    session.workers.len(),
                    session.coverage.len(),
+                   session.unique_coverage,
+                   session.inputs.len(),
+                   session.unique_inputs,
                    session.fuzz_cases,
                    session.fuzz_cases as f64 / uptime,
                    vm_pct,
@@ -155,13 +170,66 @@ fn handle_client(stream: TcpStream,
         match msg {
             ServerMessage::ReportStatistics { fuzz_cases, total_cycles,
                     vm_cycles, reset_cycles } => {
-                if let Some(client) = client {
-                    let mut session = client.session.write().unwrap();
-                    session.fuzz_cases   = fuzz_cases;
-                    session.total_cycles = total_cycles;
-                    session.vm_cycles    = vm_cycles;
-                    session.reset_cycles = reset_cycles;
+                // Get access to the client and session
+                let client = client.unwrap();
+                let mut session = client.session.write().unwrap();
+
+                // Update the client statistics
+                session.fuzz_cases   = fuzz_cases;
+                session.total_cycles = total_cycles;
+                session.vm_cycles    = vm_cycles;
+                session.reset_cycles = reset_cycles;
+
+                {
+                    // Get access to the global input database
+                    let inputs = context.inputs.read().unwrap();
+
+                    // Check if the session is behind on inputs
+                    if inputs.len() > session.inputs.len() {
+                        // Get a list of everything that we need to inform the
+                        // client of
+                        let delta: Vec<InputRecord> =
+                            inputs.difference(&session.inputs)
+                            .map(|x| InputRecord {
+                                hash:  x.hash,
+                                input: x.input.clone(),
+                            }).collect();
+
+                        // Send the input deltas to the worker
+                        ServerMessage::Inputs(
+                            Cow::Borrowed(delta.as_slice()))
+                            .serialize(&mut stream).unwrap();
+                        stream.flush().unwrap();
+                    }
                 }
+
+                {
+                    // Get access to the global coverage database
+                    let coverage = context.coverage.read().unwrap();
+
+                    // Check if the session is behind on coverage
+                    if coverage.len() > session.coverage.len() {
+                        // Get a list of everything that we need to inform the
+                        // client of
+                        let delta: Vec<CoverageRecord> =
+                            coverage.difference(&session.coverage)
+                            .map(|x| CoverageRecord {
+                                module: x.module.as_ref()
+                                    .map(|x| Cow::Owned((**x).clone())),
+                                offset: x.offset,
+                            }).collect();
+
+                        // Send the coverage deltas to the worker
+                        ServerMessage::Coverage(
+                            Cow::Borrowed(delta.as_slice()))
+                            .serialize(&mut stream).unwrap();
+                        stream.flush().unwrap();
+                    }
+                }
+
+                // Done syncing
+                ServerMessage::SyncComplete.serialize(&mut stream).unwrap();
+                stream.flush().unwrap();
             }
             ServerMessage::Login(session_id, core_id) => {
                 // If there is no existing client or the session ID has changed
@@ -193,15 +261,18 @@ fn handle_client(stream: TcpStream,
                     let session = sessions.entry(session_id)
                             .or_insert_with(|| {
                         Arc::new(RwLock::new(Session {
-                            id:           session_id,
-                            workers:      BTreeSet::new(),
-                            first_packet: Instant::now(),
-                            last_packet:  Instant::now(),
-                            fuzz_cases:   0,
-                            total_cycles: 0,
-                            reset_cycles: 0,
-                            vm_cycles:    0,
-                            coverage:     BTreeSet::new(),
+                            id:              session_id,
+                            workers:         BTreeSet::new(),
+                            first_packet:    Instant::now(),
+                            last_packet:     Instant::now(),
+                            fuzz_cases:      0,
+                            total_cycles:    0,
+                            reset_cycles:    0,
+                            vm_cycles:       0,
+                            unique_coverage: 0,
+                            unique_inputs:   0,
+                            coverage:        BTreeSet::new(),
+                            inputs:          BTreeSet::new(),
                         }))
                     });
 
@@ -223,6 +294,36 @@ fn handle_client(stream: TcpStream,
                 let mut session = client.session.write().unwrap();
                 session.workers.insert(core_id);
             }
+            ServerMessage::Inputs(new_inputs) => {
+                let mut inputs = context.inputs.write().unwrap();
+
+                // Go through each reported input
+                for input in new_inputs.iter() {
+                    // Check if this is a globally unique input
+                    if !inputs.contains(input) {
+                        inputs.insert(input.clone());
+                        
+                        // Update unique inputs stats for this session
+                        let mut session = client.as_ref().unwrap()
+                            .session.write().unwrap();
+                        session.unique_inputs += 1;
+
+                        // Save the input to disk
+                        std::fs::create_dir_all("inputs")?;
+                        std::fs::write(Path::new("inputs")
+                                       .join(format!("{:032x}", input.hash)),
+                                       &**input.input)?;
+                    }
+
+                    // Update the per-client inputs
+                    if let Some(ref mut client) = client {
+                        let mut session = client.session.write().unwrap();
+                        if !session.inputs.contains(input) {
+                            session.inputs.insert(input.clone());
+                        }
+                    }
+                }
+            }
             ServerMessage::Coverage(records) => {
                 let mut coverage = context.coverage.write().unwrap();
                 let mut coverage_file = context.coverage_file.lock().unwrap();
@@ -236,6 +337,11 @@ fn handle_client(stream: TcpStream,
                         }
                         write!(coverage_file, "{:#x}\n", record.offset)?;
                         coverage.insert(record.clone());
+                        
+                        // Update unique coverage stats for this session
+                        let mut session = client.as_ref().unwrap()
+                            .session.write().unwrap();
+                        session.unique_coverage += 1;
                     }
 
                     // Update the per-client coverage records
@@ -313,6 +419,7 @@ fn handle_client(stream: TcpStream,
                     ServerMessage::ReadPageResponse(tmp)
                         .serialize(&mut stream).unwrap();
                     stream.flush().unwrap();
+                } else {
                 }
             },
             _ => panic!("Unhandled packet\n"),
@@ -323,6 +430,7 @@ fn handle_client(stream: TcpStream,
 struct Context<'a> {
     file_db:       RwLock<HashMap<u64, (SystemTime, Vec<u8>)>>,
     coverage:      RwLock<BTreeSet<CoverageRecord<'a>>>,
+    inputs:        RwLock<BTreeSet<InputRecord<'a>>>,
     clients:       RwLock<HashMap<IpAddr, Arc<Client<'a>>>>,
     sessions:      RwLock<HashMap<u64, Arc<RwLock<Session<'a>>>>>,
     coverage_file: Mutex<File>,
@@ -332,6 +440,7 @@ fn main() -> io::Result<()> {
     let context = Arc::new(Context {
         file_db:       Default::default(),
         coverage:      Default::default(),
+        inputs:        Default::default(),
         clients:       Default::default(),
         sessions:      Default::default(),
         coverage_file: Mutex::new(File::create("coverage.txt")?),
