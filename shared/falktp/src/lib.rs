@@ -52,7 +52,7 @@ pub enum ServerMessage<'a> {
     Login(u64, u32),
 
     /// Report new coverage to the server
-    ReportCoverage(Cow<'a, CoverageRecord<'a>>),
+    Coverage(Cow<'a, [CoverageRecord<'a>]>),
 
     /// Report new statistics (always the totals)
     ReportStatistics {

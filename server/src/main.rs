@@ -172,22 +172,26 @@ fn handle_client(stream: TcpStream,
                 // Log the new worker
                 client.unwrap().workers.insert(core_id);
             }
-            ServerMessage::ReportCoverage(record) => {
+            ServerMessage::Coverage(records) => {
                 let mut coverage = context.coverage.lock().unwrap();
                 let mut coverage_file = context.coverage_file.lock().unwrap();
 
-                if !coverage.contains(&record) {
-                    if let Some(module) = &record.module {
-                        write!(coverage_file, "{}+", module)?;
+                // Go through each coverage record that was reported
+                for record in records.iter() {
+                    // Update the global coverage database
+                    if !coverage.contains(&record) {
+                        if let Some(module) = &record.module {
+                            write!(coverage_file, "{}+", module)?;
+                        }
+                        write!(coverage_file, "{:#x}\n", record.offset)?;
+                        coverage.insert(record.clone());
                     }
-                    write!(coverage_file, "{:#x}\n", record.offset)?;
 
-                    coverage.insert(record.clone().into_owned());
-                }
-
-                if let Some(client) = client {
-                    if !client.coverage.contains(&record) {
-                        client.coverage.insert(record.clone().into_owned());
+                    // Update the per-client coverage records
+                    if let Some(ref mut client) = client {
+                        if !client.coverage.contains(&record) {
+                            client.coverage.insert(record.clone());
+                        }
                     }
                 }
             }

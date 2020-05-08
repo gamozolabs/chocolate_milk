@@ -1,4 +1,5 @@
-//! Fuzzable snapshotted application backed by an Intel VT-x VM
+//! A fuzz session, a collective session of workers collaborating on fuzzing
+//! a given target
 
 use core::mem::size_of;
 use core::cell::Cell;
@@ -1550,7 +1551,6 @@ impl<'a, C> FuzzSession<'a, C> {
     pub fn report_statistics(&self, server: &mut BufferedIo<TcpConnection>) {
         {
             let stats = self.stats.lock();
-
             ServerMessage::ReportStatistics {
                 fuzz_cases:   stats.fuzz_cases,
                 total_cycles: stats.total_cycles,
@@ -1558,6 +1558,18 @@ impl<'a, C> FuzzSession<'a, C> {
                 reset_cycles: stats.reset_cycles,
             }.serialize(server).unwrap();
         }
+
+        {
+            let mut pending_coverage = self.pending_coverage.lock();
+            if pending_coverage.len() > 0 {
+                ServerMessage::Coverage(
+                    Cow::Borrowed(pending_coverage.as_slice())
+                ).serialize(server).unwrap();
+                pending_coverage.clear();
+            }
+        }
+
+        // Flush anything we sent to the server
         server.flush().unwrap();
     }
 
@@ -1576,19 +1588,6 @@ impl<'a, C> FuzzSession<'a, C> {
                 module: cr.module.as_ref().map(|x| Cow::Owned((**x).clone())),
                 offset: cr.offset,
             });
-
-            /*
-            // Coverage was new, report it to the server
-            loop {
-                // Report the coverage
-                let mut packet = self.server.device().allocate_packet();
-                {
-                    let mut pkt = packet.create_udp(&self.server_addr);
-                    ServerMessage::ReportCoverage(Cow::Borrowed(cr))
-                        .serialize(&mut pkt).unwrap();
-                }
-                self.server.device().send(packet, true);
-            }*/
 
             true
         } else {
