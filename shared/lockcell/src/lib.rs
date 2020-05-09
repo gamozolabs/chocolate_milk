@@ -146,7 +146,7 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
         let mut time_threshold: u32 = if I::in_exception() {
             10_000
         } else {
-            10_000
+            !0
         };
 
         // Timeout based off of the TSC to determine when to give up on the

@@ -34,7 +34,7 @@ pub fn fuzz() {
     let mut worker = FuzzSession::worker(session);
     
     // Set that this is a Windows guest
-    worker.enlighten(Some(Box::new(crate::fuzz_session::windows::Enlightenment)));
+    worker.enlighten(Some(Box::new(crate::fuzz_session::windows::Enlightenment::default())));
 
     loop {
         let _vmexit = worker.fuzz_case();

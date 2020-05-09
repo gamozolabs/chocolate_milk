@@ -79,7 +79,7 @@ pub trait Enlightenment {
     /// If a module list is parsed, this returns a map of base addresses of
     /// modules to the (end address (inclusive), module name)
     fn get_module_list(&mut self, worker: &mut Worker) ->
-        BTreeMap<u64, (u64, Arc<String>)>;
+        Option<BTreeMap<u64, (u64, Arc<String>)>>;
 }
 
 /// Different types of paging modes
@@ -309,10 +309,22 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Get the current page table (cr3 with the VPID and friends masked off)
+    /// Get the current CPL
     #[inline]
-    pub fn page_table(&self) -> u64 {
-        self.vm.reg(Register::Cr3) & 0xffffffffff000
+    pub fn cpl(&self) -> u8 {
+        (self.vm.reg(Register::Cs) as u8) & 3
+    }
+
+    /// Get a unique context identifier
+    /// The kernel will always resolve to !0, if we're not in kernel mode then
+    /// we will use the current cr3
+    #[inline]
+    pub fn context_id(&self) -> u64 {
+        if self.cpl() == 0 {
+            !0
+        } else {
+            self.vm.reg(Register::Cr3) & 0xffffffffff000
+        }
     }
 
     /// Set the enlightenment to use for this guest
@@ -424,6 +436,42 @@ impl<'a> Worker<'a> {
             let (vmexit, vm_cycles) = self.vm.run();
             self.stats.vmexits += 1;
             self.stats.vm_cycles += vm_cycles;
+
+            // Closure to invoke if we want to report new coverage
+            let mut report_coverage = || {
+                let mut modoff =
+                    self.resolve_module(self.vm.reg(Register::Rip));
+                if modoff.0.is_none() && self.enlightenment.is_some() {
+                    // Get the current context ID
+                    let pt = self.context_id();
+
+                    // Check if we have a module list for this process
+                    if !self.module_list.contains_key(&pt) {
+                        // Oooh, go try to get the module list for this
+                        // process
+
+                        // Request the module list from enlightenment
+                        let mut enl = self.enlightenment.take().unwrap();
+                        if let Some(ml) = enl.get_module_list(self) {
+                            // Save the module list for the process
+                            self.module_list.insert(pt, ml);
+                        
+                            // Re-resolve the module + offset
+                            modoff = self.resolve_module(
+                                self.vm.reg(Register::Rip));
+                        }
+
+                        self.enlightenment = Some(enl);
+                    }
+                }
+
+                let input = self.fuzz_input.borrow();
+                if session.report_coverage(Some((&*input, &self.hasher)),
+                    &CoverageRecord {
+                        module: modoff.0.map(|x| Cow::Owned(x)),
+                        offset: modoff.1,
+                }) { single_step = 1000 };
+            };
 
             match vmexit {
                 VmExit::EptViolation { addr, write, .. } => {
@@ -553,48 +601,11 @@ impl<'a> Worker<'a> {
                     continue 'vm_loop;
                 }
                 VmExit::Exception(Exception::DebugException) => {
-                    let mut modoff =
-                        self.resolve_module(self.vm.reg(Register::Rip));
-                    if modoff.0.is_none() && self.enlightenment.is_some() {
-                        // Get the current page table
-                        let pt = self.page_table();
-
-                        // Check if we have a module list for this process
-                        if !self.module_list.contains_key(&pt) {
-                            // Oooh, go try to get the module list for this
-                            // process
-
-                            // Request the module list from enlightenment
-                            let mut enl = self.enlightenment.take().unwrap();
-                            let ml = enl.get_module_list(self);
-                            self.enlightenment = Some(enl);
-
-                            // Save the module list for the process
-                            self.module_list.insert(pt, ml);
-
-                            // Re-resolve the module + offset
-                            modoff = self.resolve_module(
-                                self.vm.reg(Register::Rip));
-                        }
-                    }
-
-                    let input = self.fuzz_input.borrow();
-                    if session.report_coverage(Some((&*input, &self.hasher)),
-                        &CoverageRecord {
-                            module: modoff.0.map(|x| Cow::Owned(x)),
-                            offset: modoff.1,
-                    }) { single_step = 1000 };
+                    report_coverage();
                     continue 'vm_loop;
                 }
                 VmExit::PreemptionTimer => {
-                    let modoff =
-                        self.resolve_module(self.vm.reg(Register::Rip));
-                    let input = self.fuzz_input.borrow();
-                    if session.report_coverage(Some((&*input, &self.hasher)),
-                        &CoverageRecord {
-                            module: modoff.0.map(|x| Cow::Owned(x)),
-                            offset: modoff.1,
-                    }) { single_step = 1000 };
+                    report_coverage();
                     continue 'vm_loop;
                 }
                 _ => {},
@@ -633,8 +644,8 @@ impl<'a> Worker<'a> {
     /// Attempt to resolve the `addr` into a module + offset based on the
     /// current `module_list`
     pub fn resolve_module(&self, addr: u64) -> (Option<Arc<String>>, u64) {
-        // Get the current page table
-        let pt = self.page_table();
+        // Get the current context id
+        let pt = self.context_id();
 
         // Get the module list for the current process
         if let Some(modlist) = self.module_list.get(&pt) {
@@ -1528,8 +1539,6 @@ impl<'a> FuzzSession<'a> {
 
     /// Update statistics to the server
     pub fn report_statistics(&self, server: &mut BufferedIo<TcpConnection>) {
-        mm::print_alloc_stats();
-
         {
             // Report new inputs to the server
             let mut pending_inputs = self.pending_inputs.lock();
@@ -1559,6 +1568,14 @@ impl<'a> FuzzSession<'a> {
                 total_cycles: stats.total_cycles,
                 vm_cycles:    stats.vm_cycles,
                 reset_cycles: stats.reset_cycles,
+                allocs: crate::mm::GLOBAL_ALLOCATOR
+                    .num_allocs.load(Ordering::Relaxed),
+                frees: crate::mm::GLOBAL_ALLOCATOR
+                    .num_frees.load(Ordering::Relaxed),
+                phys_free: crate::mm::GLOBAL_ALLOCATOR
+                    .free_physical.load(Ordering::Relaxed),
+                phys_total: core!().boot_args
+                    .total_physical_memory.load(Ordering::Relaxed),
             }.serialize(server).unwrap();
         }
 

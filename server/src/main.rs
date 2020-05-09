@@ -47,6 +47,18 @@ struct Session<'a> {
     /// Number of cycles spent inside the VM
     vm_cycles: u64,
 
+    /// Number of allocations on the system
+    allocs: u64,
+
+    /// Number of frees on the system
+    frees: u64,
+
+    /// Number of free bytes in physical memory
+    phys_free: u64,
+
+    /// Total number of physical bytes for the system
+    phys_total: u64,
+
     /// Number of coverage records reported by this session which were unique
     /// This allows us to track the unique contribution of workers to coverage
     unique_coverage: u64,
@@ -116,6 +128,14 @@ fn stats(context: Arc<Context>) {
                    session.id,
                    if unresponsive { "???" } else { "" });
 
+            print!("\x1b[34;1m        Allocs {:10} | Frees {:10} | \
+                   Physical {:10.2} MiB / {:10.2} MiB\x1b[0m\n",
+                   session.allocs,
+                   session.frees,
+                   (session.phys_total - session.phys_free) as f64 /
+                       1024. / 1024.,
+                   session.phys_total as f64 / 1024. / 1024.);
+
             if !unresponsive {
                 total_cases    += session.fuzz_cases;
                 total_workers  += session.workers.len();
@@ -169,7 +189,8 @@ fn handle_client(stream: TcpStream,
 
         match msg {
             ServerMessage::ReportStatistics { fuzz_cases, total_cycles,
-                    vm_cycles, reset_cycles } => {
+                    vm_cycles, reset_cycles, allocs, frees,
+                    phys_free, phys_total } => {
                 // Get access to the client and session
                 let client = client.unwrap();
                 let mut session = client.session.write().unwrap();
@@ -179,6 +200,10 @@ fn handle_client(stream: TcpStream,
                 session.total_cycles = total_cycles;
                 session.vm_cycles    = vm_cycles;
                 session.reset_cycles = reset_cycles;
+                session.allocs       = allocs;
+                session.frees        = frees;
+                session.phys_free    = phys_free;
+                session.phys_total   = phys_total;
 
                 {
                     // Get access to the global input database
@@ -271,6 +296,10 @@ fn handle_client(stream: TcpStream,
                             vm_cycles:       0,
                             unique_coverage: 0,
                             unique_inputs:   0,
+                            allocs:          0,
+                            frees:           0,
+                            phys_free:       0,
+                            phys_total:      0,
                             coverage:        BTreeSet::new(),
                             inputs:          BTreeSet::new(),
                         }))

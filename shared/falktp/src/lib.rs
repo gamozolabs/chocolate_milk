@@ -72,6 +72,12 @@ pub enum ServerMessage<'a> {
         total_cycles: u64,
         vm_cycles:    u64,
         reset_cycles: u64,
+
+        // Memory stats
+        allocs:      u64,
+        frees:       u64,
+        phys_free:   u64,
+        phys_total:  u64,
     },
 
     /// The server has sent any messages related to syncing and the client

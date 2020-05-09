@@ -409,7 +409,7 @@ impl PhysMem for PhysicalMemory {
 /// a backing and does not handle any fancy things like fragmentation. Use this
 /// carefully.
 #[global_allocator]
-static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {
+pub static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {
     num_allocs:    AtomicU64::new(0),
     num_frees:     AtomicU64::new(0),
     free_physical: AtomicU64::new(0),
@@ -419,19 +419,19 @@ static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {
 /// Empty structure that we can implement `GlobalAlloc` for such that we can
 /// use the `#[global_allocator]`
 #[derive(Debug)]
-struct GlobalAllocator {
+pub struct GlobalAllocator {
     /// Number of allocations performed
-    num_allocs: AtomicU64,
+    pub num_allocs: AtomicU64,
 
     /// Number of frees performed
-    num_frees: AtomicU64,
+    pub num_frees: AtomicU64,
 
     /// Current number of free bytes in the physical memory pool, this only
     /// ever decreases since we do not free back to physical memory
-    free_physical: AtomicU64,
+    pub free_physical: AtomicU64,
 
     /// Number of bytes sitting in free lists
-    free_list: AtomicU64,
+    pub free_list: AtomicU64,
 }
 
 /// Print the allocation statistics to the screen
@@ -444,12 +444,14 @@ pub fn print_alloc_stats() {
     let phys_inuse = 
         total_phys - GLOBAL_ALLOCATOR.free_physical.load(Ordering::Relaxed);
 
-    print!("Allocs {:8} | Frees {:8} | Physical {:10.2} MiB / {:10.2} MiB | Free List {:10.2} MiB\n",
+    print!("Allocs {:8} | Frees {:8} | Physical {:10.2} MiB / {:10.2} MiB | \
+                Free List {:10.2} MiB\n",
            GLOBAL_ALLOCATOR.num_allocs.load(Ordering::Relaxed),
            GLOBAL_ALLOCATOR.num_frees.load(Ordering::Relaxed),
            phys_inuse as f64 / 1024. / 1024.,
            total_phys as f64 / 1024. / 1024.,
-           GLOBAL_ALLOCATOR.free_list.load(Ordering::Relaxed) as f64 / 1024. / 1024.);
+           GLOBAL_ALLOCATOR.free_list
+               .load(Ordering::Relaxed) as f64 / 1024. / 1024.);
 }
 
 unsafe impl GlobalAlloc for GlobalAllocator {
