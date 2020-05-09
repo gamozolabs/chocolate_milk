@@ -81,6 +81,11 @@ pub struct BootArgs<I: InterruptState> {
 
     /// The page table used for the kernel
     pub page_table: LockCell<Option<PageTable>, I>,
+
+    /// Total amount of physical memory we compute as free from the E820
+    /// during early boot. Not used for anything but statistics and
+    /// informational messages
+    pub total_physical_memory: AtomicU64,
     
     /// The trampoline page table to be used during the paging transition from
     /// the bootloader to the kernel. This will have [0..bootloader_end] mapped
@@ -129,6 +134,7 @@ impl<I: InterruptState> BootArgs<I> {
             stack_vaddr:           AtomicU64::new(KERNEL_STACKS_BASE),
             print_lock:            LockCell::new_no_preempt(()),
             soft_reboot_addr:      AtomicU64::new(0),
+            total_physical_memory: AtomicU64::new(0),
         }
     }
 

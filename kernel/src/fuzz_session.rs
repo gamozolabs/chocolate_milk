@@ -436,18 +436,11 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 VmExit::Exception(Exception::NMI) => {
-                    // NMIs mean we need to NMI ourself as we might need to
-                    // TLB shootdown or halt ourselves. The system may be going
-                    // down for a soft reboot
                     unsafe {
-                        let mut apic = core!().apic().lock();
-                        let apic = apic.as_mut().unwrap();
-                        apic.ipi(core!().apic_id().unwrap(),
-                            (1 << 14) | (4 << 8));
+                        // NMI ourselves
+                        llvm_asm!("int 2" ::: "memory" : "volatile", "intel");
+                        cpu::halt();
                     }
-
-                    // Handled the NMI, re-enter the VM
-                    continue;
                 }
                 VmExit::ReadMsr { inst_len } => {
                     // Get the MSR ID we're reading
@@ -1535,6 +1528,8 @@ impl<'a> FuzzSession<'a> {
 
     /// Update statistics to the server
     pub fn report_statistics(&self, server: &mut BufferedIo<TcpConnection>) {
+        mm::print_alloc_stats();
+
         {
             // Report new inputs to the server
             let mut pending_inputs = self.pending_inputs.lock();

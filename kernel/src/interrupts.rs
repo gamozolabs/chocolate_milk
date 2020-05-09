@@ -8,7 +8,6 @@ use alloc::boxed::Box;
 use lockcell::LockCell;
 use page_table::VirtAddr;
 
-use crate::mm::shootdown_state;
 use crate::apic::Apic;
 use crate::acpi::{set_core_state, ApicState};
 use crate::panic::panicing;
@@ -346,15 +345,6 @@ pub unsafe extern fn interrupt_handler(
 
     // Handle NMIs specially
     if number == 2 {
-        // Check if this was a TLB shootdown
-        if let Some(apic_id) = core!().apic_id() {
-            if shootdown_state().load(Ordering::SeqCst) == apic_id {
-                shootdown_state().store(!0, Ordering::SeqCst);
-                cpu::write_cr3(cpu::read_cr3());
-                return;
-            }
-        }
-
         // If we're in the process of panicing, get back to panicing, we don't
         // want to re-panic
         if core!().id == 0 && panicing().load(Ordering::SeqCst) {

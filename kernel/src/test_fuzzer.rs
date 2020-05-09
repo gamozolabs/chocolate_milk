@@ -22,7 +22,7 @@ pub fn fuzz() {
                 Arc::new(FuzzSession::from_falkdump(
                         "192.168.101.1:1911", "out.falkdump")
                 .init_master_vm(|_worker| {
-                    //_worker.vm.set_reg(crate::vtx::Register::Cr3, 4853);
+                    //_worker.vm.set_reg(crate::vtx::Register::Cr3, 0x3713371337);
                 })
                 //.timeout(100_000)
                 .inject(inject))

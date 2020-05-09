@@ -1,12 +1,13 @@
 //! Memory management routines for the bootloader allocator
 
-use core::convert::TryInto;
+use core::sync::atomic::Ordering;
 use core::alloc::{GlobalAlloc, Layout};
+use core::convert::TryInto;
 
 use crate::realmode::{RegisterState, invoke_realmode};
 
 use crate::BOOT_ARGS;
-use page_table::{PhysAddr, PhysMem, PageTable};
+use page_table::{PhysAddr, PhysMem};
 use rangeset::{Range, RangeSet};
 
 /// A wrapper on a range set to allow implementing the `PhysMem` trait
@@ -32,20 +33,11 @@ impl<'a> PhysMem for PhysicalMemory<'a> {
         Some(paddr as *mut u8)
     }
 
-    unsafe fn tlb_shootdown(&mut self, _pt: &mut PageTable) {}
-
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
         Some(PhysAddr(
             self.0.allocate(layout.size() as u64, layout.align() as u64)
                 .expect("Failed to allocate physical memory") as u64
         ))
-    }
-
-    fn free_phys(&mut self, addr: PhysAddr, size: u64) {
-        let end = size.checked_sub(1).and_then(|x| x.checked_add(addr.0))
-            .expect("Integer overflow on free");
-
-        self.0.insert(Range { start: addr.0, end: end });
     }
 }
 
@@ -172,6 +164,10 @@ pub fn init() {
         start: 0,
         end:   1024 * 1024 - 1,
     });
+    
+    // Store the original amount of physical memory
+    BOOT_ARGS.total_physical_memory.store(free_memory.sum().unwrap(),
+        Ordering::SeqCst);
 
     // Set up the global physical memory state with the free memory we have
     // tracked.

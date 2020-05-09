@@ -1061,7 +1061,8 @@ impl Vm {
                 // We want pin entries:
                 // External interrupt exiting
                 // NMI existing
-                let pin_on  = (1 << 0) | (1 << 3);
+                // Virtual NMIs
+                let pin_on  = (1 << 0) | (1 << 3) | (1 << 5);
                 let pin_off = 0;
 
                 // On entry we want:

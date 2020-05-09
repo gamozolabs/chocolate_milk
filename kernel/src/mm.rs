@@ -4,32 +4,22 @@ use core::marker::PhantomData;
 use core::mem::{size_of, align_of};
 use core::ops::{Deref, DerefMut};
 use core::alloc::{Layout, GlobalAlloc};
-use core::sync::atomic::{AtomicU64, AtomicU32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 
-use crate::acpi::{self, ApicState, MAX_CORES};
+use crate::acpi::MAX_CORES;
 
 use rangeset::Range;
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::KERNEL_VMEM_BASE;
-use page_table::{PageTable, PhysMem, PhysAddr, PageType, VirtAddr};
+use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
 use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_NX};
-
-/// Cores should check this during an NMI to see if they are being shot down
-/// If it is equal to their APIC ID, they are being shot down
-static SHOULD_SHOOTDOWN: AtomicU32 = AtomicU32::new(!0);
 
 /// Table which is indexed by an APIC identifier to map to a physical range
 /// which is local to it its NUMA node
 static APIC_TO_MEMORY_RANGE: AtomicPtr<[Option<Range>; MAX_CORES]> =
     AtomicPtr::new(core::ptr::null_mut());
-
-/// Gets the current TLB shootdown state
-#[inline]
-pub unsafe fn shootdown_state() -> &'static AtomicU32 {
-    &SHOULD_SHOOTDOWN
-}
 
 /// Get the preferred memory range for the currently running APIC. Returns
 /// `None` if we have no valid APIC ID yet, or we do not have NUMA knowledge
@@ -160,134 +150,201 @@ pub unsafe fn write_phys<T>(paddr: PhysAddr, val: T) {
         (KERNEL_PHYS_WINDOW_BASE + paddr.0) as *mut T, val);
 }
 
-/// The metadata on a freed page present in the free list. We don't just
-/// directly link the pages together, instead we use the entire 4 KiB of the
-/// freed page to hold a list of pages. This _significantly_ reduces the
-/// thrashing of TLBs during page allocations. This was about a 4x speedup
-/// when allocate 16 GiB virtual allocations using 4 KiB pages compared to
-/// using a linked list of free nodes.
+/// Metadata on a freed allocation
+#[repr(C)]
 struct FreeListNode {
-    /// Physical address of the next free `FreeListNode`, could be 0 if the
-    /// list terminates
-    next: PhysAddr,
+    /// Virtual address of the next `FreeListNode`
+    next: *mut FreeListNode,
 
-    /// Number of available slots in `free_pages`. The pages are always
-    /// allocated from offset 509... down to 0. Thus if `free_slots` is 10 that
-    /// means that `free_pages[0..9]` are invalid, and `free_pages[10..]` are
-    /// valid physical addresses of free pages.
+    /// Number of free slots in `free_mem`
     free_slots: usize,
     
-    /// Physical addresses of free pages
-    free_pages: [PhysAddr; 510],
+    /// Virtual addresses of free allocations
+    free_addrs: [*mut u8; 0],
 }
 
-impl FreeListNode {
-    /// Create a mutable reference to a `FreeListNode` from a raw physical
-    /// address.
-    unsafe fn from_raw<'a>(paddr: PhysAddr) -> &'a mut FreeListNode {
-        // Make sure the physical address is inside of our physical memory map
-        let end = paddr.0.checked_add(4096 - 1).unwrap();
-        assert!(end < KERNEL_PHYS_WINDOW_SIZE,
-                "Physical address outside of window");
-
-        &mut *((KERNEL_PHYS_WINDOW_BASE + paddr.0) as *mut FreeListNode)
-    }
+/// A free list which holds free entries of `size` bytes in a semi-linked list
+/// table thingy.
+pub struct FreeList {
+    /// Pointer to the first entry in the free list
+    head: *mut FreeListNode,
+    
+    /// Size of allocations (in bytes) for this free list
+    size: usize,
 }
 
-/// A free list structure for holding all of the freed physical 4 KiB in size,
-/// 4 KiB aligned pages on the system
-pub struct PageFreeList {
-    /// Physical address of the first entry in the free list
-    head: PhysAddr,
-}
-
-impl PageFreeList {
-    /// Create a new, empty free list
-    pub fn new() -> Self {
-        assert!(size_of::<FreeListNode>() == 4096);
-        PageFreeList { head: PhysAddr(0) }
+impl FreeList {
+    /// Create a new, empty free list containing addresses to `size` byte
+    /// allocations
+    pub fn new(size: usize) -> Self {
+        // Ensure some properties of the free list size
+        assert!(size.count_ones() == 1,
+            "Free list size must be a power of two");
+        assert!(size >= size_of::<usize>(),
+            "Free list size must be at least pointer width");
+        FreeList { head: core::ptr::null_mut(), size }
     }
 
-    /// Get a page from the free list
-    unsafe fn pop(&mut self) -> PhysAddr {
+    /// Get a address from the free list
+    pub unsafe fn pop(&mut self) -> *mut u8 {
         // If the free list is empty
-        if self.head == PhysAddr(0) {
-            const FREE_LIST_BATCH: u64 = 1024 * 1024;
-
-            // Make sure the free list batch is sane
-            assert!(FREE_LIST_BATCH > 0 && FREE_LIST_BATCH % 4096 == 0);
-
-            // Get some bulk memory
-            let alc = {
+        if self.head.is_null() {
+            if self.size <= 4096 {
+                // Special case, if the allocation fits within a page, we can
+                // directly return virtual addresses to our physical memory
+                // map. This is significantly better for TLBs and caches than
+                // to create new page tables for allocating a new virtual
+                // address. Especially since we use large pages (if possible)
+                // to map in the physical map
+            
                 // Get access to physical memory
-                let mut phys_mem = core!().boot_args.free_memory_ref().lock();
-                let phys_mem     = phys_mem.as_mut().unwrap();
+                let alc = {
+                    let mut phys_mem =
+                        core!().boot_args.free_memory_ref().lock();
+                    let phys_mem = phys_mem.as_mut().unwrap();
 
-                // Bulk allocate some memory to populate the empty free list
-                phys_mem.allocate_prefer(FREE_LIST_BATCH, 4096,
-                                         memory_range())
-                    .expect("Failed to allocate physical memory") as u64
-            };
+                    // Allocate 4096 bytes of page aligned physical memory, we
+                    // do bulk allocations here to improve performance and to
+                    // decrease the amount of physical memory lost due to
+                    // carving off alignment bytes
+                    let alc = phys_mem.allocate_prefer(4096, 4096,
+                                                       memory_range())
+                        .expect("Failed to allocate physical memory") as u64;
 
-            // Populate the free list
-            for paddr in (alc..alc + FREE_LIST_BATCH).step_by(4096) {
-                self.push(PhysAddr(paddr));
+                    // Update stats
+                    GLOBAL_ALLOCATOR.free_physical.store(
+                        phys_mem.sum().unwrap(),
+                        Ordering::Relaxed);
+
+                    alc
+                };
+
+                // Split up this allocation and free the segments
+                for offset in (0..4096).step_by(self.size) {
+                    // Get the virtual address for this physical address
+                    let vaddr = slice_phys_mut(
+                        PhysAddr(alc + offset), self.size as u64).as_mut_ptr();
+
+                    // Add this to the free list
+                    self.push(vaddr);
+                }
+            } else {
+                // Allocation size exceeds a page, we must allocate new virtual
+                // memory to satisfy the allocation
+
+                // Allocate a virtual address to hold this allocation
+                let vaddr = alloc_virt_addr_4k(self.size as u64);
+        
+                // Get access to physical memory
+                let mut pmem = PhysicalMemory;
+
+                // Get access to virtual memory
+                let mut page_table = core!().boot_args.page_table.lock();
+                let page_table = page_table.as_mut().unwrap();
+
+                // Map in the memory as RW
+                page_table.map(&mut pmem, vaddr, PageType::Page4K,
+                               self.size as u64, true, true, false, false)
+                    .expect("Failed to map RW memory");
+
+                // Return out the allocation
+                return vaddr.0 as *mut u8;
             }
         }
 
-        // At this point the free list has been populated
-        let node = FreeListNode::from_raw(self.head);
+        // We're about to pop from the free list, adjust the stats
+        GLOBAL_ALLOCATOR.free_list.fetch_sub(self.size as u64,
+                                             Ordering::SeqCst);
 
-        if node.free_slots < node.free_pages.len() {
-            // Just grab an entry off the `free_pages`
-            let free = node.free_pages[node.free_slots];
+        if self.size <= core::mem::size_of::<usize>() * 2 {
+            // Basic linked list for super small allocations which can't hold
+            // our stack-based free list metadata
 
-            // Note that we used this entry
-            node.free_slots += 1;
+            // Save the current head (our new allocation)
+            let alc = self.head;
 
-            free
+            // Set the head to the next node
+            self.head = (*alc).next;
+
+            alc as *mut u8
         } else {
-            // The `free_pages` for this level is empty, thus, pop the entire
-            // node and use it as the free page
+            // Get access to the free list stack
+            let fl = &mut *self.head;
 
-            // Save off the address of this node
-            let old = self.head;
+            // Check if there are any addresses on the stack
+            if fl.free_slots <
+                    ((self.size / core::mem::size_of::<usize>()) - 2) {
+                // Just grab the free entry
+                let alc =
+                    *fl.free_addrs.as_mut_ptr().offset(fl.free_slots as isize);
 
-            // Point the head to the next node
-            self.head = node.next;
+                // Update number of free slots
+                fl.free_slots += 1;
 
-            old
+                // Return the allocation
+                alc
+            } else {
+                // The free page stack is empty at this level, take the entire
+                // node and use it as the allocation
+
+                // Get the old head, will be our allocation
+                let alc = self.head;
+
+                // Update the head to point to the next entry
+                self.head = fl.next;
+
+                // Return out the allocation
+                alc as *mut u8
+            }
         }
     }
 
-    /// Put a page back onto the free list. It's up to the caller to make sure
-    /// the page is 4 KiB in size and 4 KiB aligned.
-    unsafe fn push(&mut self, page: PhysAddr) {
-        // If there is no existing free list or the current one is out of slots
-        // to hold pages, then we need to turn this freed page into a new
-        // `FreeListNode`
-        if self.head == PhysAddr(0) ||
-                FreeListNode::from_raw(self.head).free_slots == 0 {
-            // We need to start a new free list node
-            let node = FreeListNode::from_raw(page);
+    /// Put an allocation back onto the free list
+    pub unsafe fn push(&mut self, vaddr: *mut u8) {
+        // We're about to push to the free list, adjust the stats
+        GLOBAL_ALLOCATOR.free_list.fetch_add(self.size as u64,
+                                             Ordering::SeqCst);
 
-            // Mark that all slots are free
-            node.free_slots = node.free_pages.len();
+        if self.size <= core::mem::size_of::<usize>() * 2 {
+            // If the free list is too small to contain our stack free list,
+            // then just directly use a linked list
+            
+            // Write the old head into the newly freed `vaddr`
+            let vaddr = vaddr as *mut FreeListNode;
+            (*vaddr).next = self.head;
 
-            // Set the next pointer to the old head
-            node.next = self.head;
-
-            // Head of the free list now points to this node
-            self.head = page;
+            // Update the head
+            self.head = vaddr;
         } else {
-            // There is an active free list with room
-            let node = FreeListNode::from_raw(self.head);
+            // Check if there is room for this allocation in the free stack,
+            // or if we need to create a new stack
+            if self.head.is_null() || (*self.head).free_slots == 0 {
+                // No free slots, create a new stack out of the freed vaddr
+                let vaddr = &mut *(vaddr as *mut FreeListNode);
 
-            // Decrement number of available slots
-            node.free_slots -= 1;
+                // Set the number of free slots to the maximum size, as all
+                // entries are free in the stack
+                // This is the size of the allocation, minus the 2 `usize`
+                // header (in entries)
+                vaddr.free_slots =
+                    (self.size / core::mem::size_of::<usize>()) - 2;
 
-            // Put our page into this entry
-            node.free_pages[node.free_slots] = page;
+                // Update the next to point to the old head
+                vaddr.next = self.head;
+
+                // Establish this as the new free list head
+                self.head = vaddr;
+            } else {
+                // There's room in the current stack, just throw us in there
+                let fl = &mut *self.head;
+
+                // Decrement the number of free slots
+                fl.free_slots -= 1;
+
+                // Store our newly freed virtual address into this slot
+                *fl.free_addrs.as_mut_ptr().offset(fl.free_slots as isize) =
+                    vaddr;
+            }
         }
     }
 }
@@ -317,50 +374,15 @@ impl PhysMem for PhysicalMemory {
         Some((paddr.0 + KERNEL_PHYS_WINDOW_BASE) as *mut u8)
     }
 
-    /// Perform a TLB shootdown
-    /// Since this takes a mutable reference to the page table, it ensures
-    /// the page table lock is currently held.
-    unsafe fn tlb_shootdown(&mut self, _pt: &mut PageTable) {
-        // Only do this if we have a valid APIC initialized
-        if let Some(our_apic_id) = core!().apic_id() {
-            // Forcibly get access to the current APIC. This is likely safe in
-            // almost every situation as the APIC is not very stateful.
-            let apic = &mut *core!().apic().shatter();
-            let apic = apic.as_mut().unwrap();
-
-            // Send an NMI to all cores, waiting for it to respond
-            for apic_id in 0..acpi::MAX_CORES as u32 {
-                // Don't NMI ourself
-                if apic_id == our_apic_id { continue; }
-
-                let state = acpi::core_state(apic_id);
-                if state == ApicState::Online {
-                    SHOULD_SHOOTDOWN.store(apic_id, Ordering::SeqCst);
-
-                    let mut timeout = 0;
-                    while SHOULD_SHOOTDOWN.load(Ordering::SeqCst) != !0 {
-                        if cpu::rdtsc() >= timeout {
-                            if timeout > 0 {
-                                panic!("Failed to TLB shootdown APIC {:#x} \
-                                       from APIC {:#x}\n",
-                                       apic_id, our_apic_id);
-                            }
-
-                            // Send NMI
-                            apic.ipi(apic_id, (1 << 14) | (4 << 8));
-
-                            // Set a timer until we panic
-                            timeout = crate::time::future(10_000);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr> {
-        let ret = if layout.size() == 4096 && layout.align() >= 4096 {
-            Some(unsafe { core!().free_list().lock().pop() })
+        if layout.size() <= 4096 && layout.align() <= layout.size() {
+            // Special case, just allocate directly from our free lists. Our
+            // free lists for allocations <= 4096 bytes directly map to the
+            // physical memory map, and are naturally aligned
+            unsafe {
+                let ptr = core!().free_list(layout).lock().pop();
+                Some(PhysAddr(ptr as u64 - KERNEL_PHYS_WINDOW_BASE))
+            }
         } else {
             // Get access to physical memory
             let mut phys_mem = unsafe {
@@ -373,27 +395,12 @@ impl PhysMem for PhysicalMemory {
             let alc = phys_mem.allocate_prefer(layout.size() as u64,
                                                layout.align() as u64,
                                                memory_range())?;
+
+            // Update stats
+            GLOBAL_ALLOCATOR.free_physical
+                .store(phys_mem.sum().unwrap(), Ordering::Relaxed);
+        
             Some(PhysAddr(alc as u64))
-        };
-        ret
-    }
-
-    fn free_phys(&mut self, phys: PhysAddr, size: u64) {
-        if (phys.0 & 0xfff) == 0 && size == 4096 {
-            // Get access to the free list
-            unsafe { core!().free_list().lock().push(phys); }
-        } else {
-            // Compute the end address
-            let end = size.checked_sub(1).and_then(|x| {
-                x.checked_add(phys.0)
-            }).unwrap();
-
-            // Get access to physical memory
-            let mut phys_mem = unsafe {
-                core!().boot_args.free_memory_ref().lock()
-            };
-            let phys_mem = phys_mem.as_mut().unwrap();
-            phys_mem.insert(Range { start: phys.0, end: end });
         }
     }
 }
@@ -402,63 +409,66 @@ impl PhysMem for PhysicalMemory {
 /// a backing and does not handle any fancy things like fragmentation. Use this
 /// carefully.
 #[global_allocator]
-static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator;
+static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {
+    num_allocs:    AtomicU64::new(0),
+    num_frees:     AtomicU64::new(0),
+    free_physical: AtomicU64::new(0),
+    free_list:     AtomicU64::new(0),
+};
 
 /// Empty structure that we can implement `GlobalAlloc` for such that we can
 /// use the `#[global_allocator]`
-struct GlobalAllocator;
+#[derive(Debug)]
+struct GlobalAllocator {
+    /// Number of allocations performed
+    num_allocs: AtomicU64,
 
-impl GlobalAllocator {
-    /// Virtual memory allocation implementation
-    ///
-    /// Performs a virtual memory allocation using a new virtual address and
-    /// constructed with new pages.
-    ///
-    /// Returns `None` if the allocation failed, otherwise it returns a pointer
-    /// to the base of the allocation.
-    unsafe fn opt_alloc(&self, layout: Layout) -> Option<*mut u8> {
-        // 4-KiB align up the allocation size
-        let alignsize = (layout.size().checked_add(0xfff)? & !0xfff) as u64;
+    /// Number of frees performed
+    num_frees: AtomicU64,
 
-        // Get a unique virtual address for this allocation
-        let vaddr = alloc_virt_addr_4k(alignsize);
-        
-        // Get access to physical memory
-        let mut pmem = PhysicalMemory;
+    /// Current number of free bytes in the physical memory pool, this only
+    /// ever decreases since we do not free back to physical memory
+    free_physical: AtomicU64,
 
-        // Get access to virtual memory
-        let mut page_table = core!().boot_args.page_table.lock();
-        let page_table = page_table.as_mut()?;
+    /// Number of bytes sitting in free lists
+    free_list: AtomicU64,
+}
 
-        // Map in the memory as RW
-        page_table.map(&mut pmem, vaddr, PageType::Page4K,
-            alignsize, true, true, false, false)?;
+/// Print the allocation statistics to the screen
+pub fn print_alloc_stats() {
+    // Get total amount of physical memory
+    let total_phys = core!().boot_args
+        .total_physical_memory.load(Ordering::Relaxed);
 
-        // Allocation success, `vaddr` now is valid as read-write for
-        // `alignsize` bytes!
-        Some(vaddr.0 as *mut u8)
-    }
+    // Get physical memory in use
+    let phys_inuse = 
+        total_phys - GLOBAL_ALLOCATOR.free_physical.load(Ordering::Relaxed);
+
+    print!("Allocs {:8} | Frees {:8} | Physical {:10.2} MiB / {:10.2} MiB | Free List {:10.2} MiB\n",
+           GLOBAL_ALLOCATOR.num_allocs.load(Ordering::Relaxed),
+           GLOBAL_ALLOCATOR.num_frees.load(Ordering::Relaxed),
+           phys_inuse as f64 / 1024. / 1024.,
+           total_phys as f64 / 1024. / 1024.,
+           GLOBAL_ALLOCATOR.free_list.load(Ordering::Relaxed) as f64 / 1024. / 1024.);
 }
 
 unsafe impl GlobalAlloc for GlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.opt_alloc(layout).unwrap_or(core::ptr::null_mut())
+        // Allocate memory from our free lists
+        let ptr = core!().free_list(layout).lock().pop();
+
+        // Update stats
+        self.num_allocs.fetch_add(1, Ordering::Relaxed);
+
+        ptr
     }
     
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // Get access to physical memory
-        let mut pmem = PhysicalMemory;
-
-        // 4-KiB align up the allocation size
-        let alignsize =
-            (layout.size().checked_add(0xfff).unwrap() & !0xfff) as u64;
-
-        // Get access to virtual memory
-        let mut page_table = core!().boot_args.page_table.lock();
-        let page_table = page_table.as_mut().unwrap();
-
         // Free the memory
-        page_table.free(&mut pmem, VirtAddr(ptr as u64), alignsize);
+        core!().free_list(layout).lock().push(ptr);
+
+        // Update stats
+        self.num_frees.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -536,25 +546,7 @@ impl<T> PhysContig<T> {
 
 impl<T> Drop for PhysContig<T> {
     fn drop(&mut self) {
-        unsafe {
-            // Drop the contents of the allocation
-            core::ptr::drop_in_place(self.vaddr.0 as *mut T);
-
-            // Get access to physical memory
-            let mut pmem = PhysicalMemory;
-        
-            // 4-KiB align up the allocation size
-            let alignsize =
-                (size_of::<T>().checked_add(0xfff).unwrap() & !0xfff) as u64;
-
-            // Get access to virtual memory
-            let mut page_table = core!().boot_args.page_table.lock();
-            let page_table = page_table.as_mut().unwrap();
-
-            // Free the memory and page tables used to map it
-            page_table.free(&mut pmem,
-                            VirtAddr(self.vaddr.0 as u64), alignsize);
-        }
+        unimplemented!("PhysContig drop");
     }
 }
 

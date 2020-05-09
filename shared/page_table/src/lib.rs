@@ -123,15 +123,9 @@ pub trait PhysMem {
     /// memory at `paddr` for `size` bytes
     unsafe fn translate_mut(&mut self, paddr: PhysAddr, size: usize)
         -> Option<*mut u8>;
-
-    /// Initiate a TLB shootdown on all cores
-    unsafe fn tlb_shootdown(&mut self, pt: &mut PageTable);
    
     /// Allocate physical memory with a requested layout
     fn alloc_phys(&mut self, layout: Layout) -> Option<PhysAddr>;
-
-    /// Free physical memory
-    fn free_phys(&mut self, paddr: PhysAddr, size: u64);
 
     /// Same as `alloc_phys` but the memory will be zeroed
     fn alloc_phys_zeroed(&mut self, layout: Layout) -> Option<PhysAddr> {
@@ -269,14 +263,8 @@ impl PageTable {
             unsafe {
                 if self.map_raw(phys_mem, VirtAddr(vaddr),
                         page_type, ent).is_none() {
-                    // Failed to map, undo everything we have done so far
-                    let mapped = vaddr - orig_vaddr.0;
-
-                    if mapped > 0 {
-                        // Free everything that we mapped up until the failure
-                        self.free(phys_mem, orig_vaddr, mapped);
-                    }
-
+                    // Failed to map, anything we already did just will be
+                    // leaked
                     return None;
                 }
             }
@@ -285,6 +273,7 @@ impl PageTable {
         Some(())
     }
 
+    /* Disabled as we're going a different way to avoid all TLB shootdowns
     /// Free the virtual memory region indicated by `vaddr` and `size`. All
     /// pages used to back the allocation will be freed, and any intermediate
     /// page tables which no longer contain any mappings will be unlinked from
@@ -456,7 +445,7 @@ impl PageTable {
         }
 
         Some(())
-    }
+    }*/
 
     /// Translate a virtual address in the `self` page table into its
     /// components. This will include entries for every level in the table as
