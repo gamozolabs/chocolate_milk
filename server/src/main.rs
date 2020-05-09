@@ -128,7 +128,7 @@ fn stats(context: Arc<Context>) {
                    session.id,
                    if unresponsive { "???" } else { "" });
 
-            print!("\x1b[34;1m        Allocs {:10} | Frees {:10} | \
+            print!("\x1b[34;1m    >>> Allocs {:10} | Frees {:10} | \
                    Physical {:10.2} MiB / {:10.2} MiB\x1b[0m\n",
                    session.allocs,
                    session.frees,
