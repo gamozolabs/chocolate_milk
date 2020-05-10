@@ -14,19 +14,28 @@ use crate::ept::Ept;
 use crate::interrupts::Tss;
 
 /// Selectors for use during a syscall
-const IA32_STAR: u32 = 0xc0000081;
+pub const IA32_STAR: u32 = 0xc0000081;
 
 /// Syscall 64-bit entry point
-const IA32_LSTAR: u32 = 0xc0000082;
+pub const IA32_LSTAR: u32 = 0xc0000082;
 
 /// Syscall 32-bit entry point
-const IA32_CSTAR: u32 = 0xc0000083;
+pub const IA32_CSTAR: u32 = 0xc0000083;
 
 /// Syscall rflags mask
-const IA32_FMASK: u32 = 0xc0000084;
+pub const IA32_FMASK: u32 = 0xc0000084;
+
+/// FS base MSR
+pub const IA32_FS_BASE: u32 = 0xc000_0100;
+
+/// GS base MSR
+pub const IA32_GS_BASE: u32 = 0xc000_0101;
 
 /// Kernel GS base MSR
-const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
+pub const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
+
+/// EPT capabilities MSR
+pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x48c;
 
 /// VMX enable bit in CR4
 const CR4_VMXE: u64 = 1 << 13;
@@ -370,11 +379,17 @@ enum Vmcs {
 
     /// Length of the instruction which caused the VM exit
     VmExitInstructionLength = 0x440c,
+
+    /// Page modification logging physical address (4 KiB page)
+    PmlAddress = 0x200e,
+
+    /// PML index, points to the index of the next free entry in the PML
+    PmlIndex = 0x812,
 }
 
 /// Floating point state from an `fxsave` instruction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C, align(1024))]
+#[repr(C, align(512))]
 pub struct FxSave {
     // Floating point state information like the FXCS, MXCSR, etc
     fcw:        u16,
@@ -513,6 +528,9 @@ pub enum Register {
     InterruptabilityState,
     ActivityState,
     PendingDebug,
+    
+    PmlAddress,
+    PmlIndex,
 
     NumRegisters,
 }
@@ -615,16 +633,170 @@ const REG_TYPES: &[(Register, RegType)] = &[
         RegType::Vmcs(Vmcs::GuestInterruptabilityState)),
     (Register::ActivityState, RegType::Vmcs(Vmcs::GuestActivityState)),
     (Register::PendingDebug, RegType::Vmcs(Vmcs::GuestPendingDebugExceptions)),
+    (Register::PmlAddress, RegType::Vmcs(Vmcs::PmlAddress)),
+    (Register::PmlIndex, RegType::Vmcs(Vmcs::PmlIndex)),
 ];
 
 /// General purpose register state
 #[derive(Clone)]
-#[repr(C, align(16))]
+#[repr(C)]
 pub struct RegisterState {
     registers: [Cell<u64>; Register::NumRegisters as usize],
-    fxsave: FxSave,
-    
+    fxsave:    FxSave,
+
+    /// Bitmap tracking if registers are cached, if they are cached, they can
+    /// be pulled directly from `registers`, otherwise they must be fetched
+    /// directly from the source
     cached: [Cell<u8>; (Register::NumRegisters as usize + 7) / 8],
+
+    /// Bitmap tracking if registers are dirtied, this indicates that the
+    /// value in a `registers` field is different from what is commit to the
+    /// VM state and must be flushed before the next VM entry
+    dirtied: [Cell<u8>; (Register::NumRegisters as usize + 7) / 8],
+}
+
+impl RegisterState {
+    /// Copy a register state from another one
+    pub fn copy_from(&mut self, other: &RegisterState) {
+        for &(reg, _) in REG_TYPES.iter() {
+            let idx = reg as usize / 8;
+            let bit = reg as usize % 8;
+
+            // Only restore registers which were cached in `other`, we cannot
+            // pull in from their context if they're not cached
+            if (other.cached[idx].get() & (1 << bit)) != 0 {
+                // Only update if the register changed
+                if self.reg(reg) != other.reg(reg) {
+                    // Update the register
+                    self.set_reg(reg, other.reg(reg));
+                }
+            } else {
+                // Register is not cached in `other`, zero it out
+                if self.reg(reg) != 0 {
+                    self.set_reg(reg, 0);
+                }
+            }
+        }
+
+        // Copy the fxsave unconditionally
+        self.fxsave = other.fxsave;
+    }
+
+    /// Get a register
+    #[inline]
+    pub fn reg(&self, reg: Register) -> u64 {
+        let idx = reg as usize / 8;
+        let bit = reg as usize % 8;
+
+        if (self.cached[idx].get() & (1 << bit)) == 0 {
+            // Register is not cached, we must get it from the guest state
+            let (_, rt) = REG_TYPES[reg as usize];
+            match rt {
+                RegType::Gpr => {
+                    // These are always unconditionally cached
+                }
+                RegType::Vmcs(vmcs) => {
+                    // Get the register from the VMCS
+                    self.registers[reg as usize].set(unsafe {
+                        vmread(vmcs)
+                    });
+                    self.cached[idx].set(
+                        self.cached[idx].get() | (1 << bit));
+                }
+                RegType::Cr2 => {
+                    // Due to the nature of CR2 being overwritten on the host,
+                    // this register is always cached
+                }
+                RegType::Cr8 => {
+                    // Get the CR8 from the host CR8
+                    self.registers[reg as usize].set(
+                        cpu::read_cr8());
+                    self.cached[idx].set(
+                        self.cached[idx].get() | (1 << bit));
+                }
+                RegType::Msr(msr) => {
+                    // Get the MSR from the real MSR state
+                    self.registers[reg as usize].set(unsafe {
+                        cpu::rdmsr(msr)
+                    });
+                    self.cached[idx].set(
+                        self.cached[idx].get() | (1 << bit));
+                }
+            }
+        }
+
+        // Register is actively cached in the current register state
+        self.registers[reg as usize].get()
+    }
+
+    /// Set a register to the internal cache
+    #[inline]
+    pub fn set_reg(&self, reg: Register, val: u64) {
+        let idx = reg as usize / 8;
+        let bit = reg as usize % 8;
+        self.registers[reg as usize].set(val);
+        self.cached[idx].set(
+            self.cached[idx].get() | (1 << bit));
+        self.dirtied[idx].set(
+            self.dirtied[idx].get() | (1 << bit));
+    }
+
+    /// Set the fxsave state for the VM
+    #[inline]
+    pub fn set_fxsave(&mut self, fxsave: FxSave) {
+        self.fxsave = fxsave;
+    }
+
+    /// Flush a register from the internal cache to the correct location
+    #[inline]
+    fn flush_reg(&self, reg: usize) {
+        let idx = reg as usize / 8;
+        let bit = reg as usize % 8;
+
+        if (self.dirtied[idx].get() & (1 << bit)) != 0 {
+            // Clear the dirtied bit
+            self.dirtied[idx].set(
+                self.dirtied[idx].get() & !(1 << bit));
+
+            // Register is not dirtied, we must get it from the guest state
+            let (_, rt) = REG_TYPES[reg as usize];
+            match rt {
+                RegType::Gpr => {
+                    // Automatically synced during vmentry, nothing to do
+                }
+                RegType::Vmcs(vmcs) => {
+                    // Set the register in the VMCS
+                    unsafe {
+                        vmwrite(vmcs,
+                                self.registers[reg as usize].get());
+                    }
+                }
+                RegType::Cr2 => {
+                    // Sync only if different
+                    let val = self.registers[reg as usize].get();
+                    if cpu::read_cr2() != val {
+                        unsafe { cpu::write_cr2(val); }
+                    }
+                }
+                RegType::Cr8 => {
+                    // Sync only if different
+                    let val = self.registers[reg as usize].get();
+                    if cpu::read_cr8() != val {
+                        unsafe { cpu::write_cr8(val); }
+                    }
+                }
+                RegType::Msr(msr) => {
+                    // Sync only if different
+                    let val = self.registers[reg as usize].get();
+                    unsafe {
+                        if cpu::rdmsr(msr) != val {
+                            cpu::wrmsr(msr, val);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Default for RegisterState {
@@ -633,6 +805,7 @@ impl Default for RegisterState {
             registers: unsafe { core::mem::zeroed() },
             fxsave:    FxSave::default(),
             cached:    unsafe { core::mem::zeroed() },
+            dirtied:   unsafe { core::mem::zeroed() },
         }
     }
 }
@@ -725,6 +898,7 @@ pub enum VmExit {
     Exception(Exception),
     ExternalInterrupt,
     PreemptionTimer,
+    Rdtsc { inst_len: u64 },
     Timeout,
     ReadMsr { inst_len: u64 },
     WriteMsr { inst_len: u64 },
@@ -748,12 +922,16 @@ pub enum VmExit {
         /// Length of the instruction
         inst_len: u64,
     },
+    PmlFull,
 }
 
 /// A virtual machine using Intel VT-x extensions
 pub struct Vm {
     /// The VMCS for this VM
     vmcs: PhysContig<[u8; 4096]>,
+    
+    /// Page modification log
+    pml: PhysContig<[u64; 512]>,
 
     /// Tracks if the VM controls and unchanging host and guest state has been
     /// initialized
@@ -763,7 +941,11 @@ pub struct Vm {
     host_regs: RegisterState,
        
     /// Guest physical to host physical translations
-    pub ept: Ept,
+    ept: Ept,
+
+    /// Tracks if the EPT has been borrowed as mutable at some point, this
+    /// lets us know that we should invalidate EPT entries
+    pub ept_dirty: bool,
 
     /// Guest registers
     pub guest_regs: RegisterState,
@@ -812,6 +994,20 @@ impl Vm {
                            IA32_FEATURE_CONTROL_VMX_IN_SMX      |
                            IA32_FEATURE_CONTROL_LOCK);
             }
+        }
+
+        unsafe {
+            // Get the EPT feature set
+            let ept_features = cpu::rdmsr(IA32_VMX_EPT_VPID_CAP);
+
+            /// Expected EPT values
+            /// - Execute-only memory supported
+            /// - 4-level paging
+            /// - Write-back EPT memory
+            const EPT_EXPECTED: u64 = (1 << 0) | (1 << 6) | (1 << 14);
+
+            assert!(ept_features & EPT_EXPECTED == EPT_EXPECTED,
+                "EPT does not support all requested features");
         }
 
         unsafe {
@@ -866,6 +1062,8 @@ impl Vm {
             vmcs: vmcs,
             init: false,
             ept:  Ept::new().expect("Failed to create EPT table"),
+            ept_dirty: false,
+            pml:  PhysContig::new([0; 512]),
             host_regs:  RegisterState::default(),
             guest_regs: RegisterState::default(),
             launched:   false,
@@ -873,137 +1071,56 @@ impl Vm {
             pinbased_controls: 0,
         }
     }
-
+    
+    /// Get access to the EPT
+    pub fn ept(&self) -> &Ept {
+        &self.ept
+    }
+    
+    /// Get mutable access to the EPT
+    pub fn ept_mut(&mut self) -> &mut Ept {
+        &mut self.ept
+    }
+    
     /// Get a register
     #[inline]
     pub fn reg(&self, reg: Register) -> u64 {
-        let idx = reg as usize / 8;
-        let bit = reg as usize % 8;
-
-        if (self.guest_regs.cached[idx].get() & (1 << bit)) == 0 {
-            // Register is not cached, we must get it from the guest state
-            let (_, rt) = REG_TYPES[reg as usize];
-            match rt {
-                RegType::Gpr => {
-                    // These are always unconditionally cached
-                }
-                RegType::Vmcs(vmcs) => {
-                    // Get the register from the VMCS
-                    self.guest_regs.registers[reg as usize].set(unsafe {
-                        vmread(vmcs)
-                    });
-                    self.guest_regs.cached[idx].set(
-                        self.guest_regs.cached[idx].get() | (1 << bit));
-                }
-                RegType::Cr2 => {
-                    // Due to the nature of CR2 being overwritten on the host,
-                    // this register is always cached
-                    unreachable!();
-                }
-                RegType::Cr8 => {
-                    // Get the CR8 from the host CR8
-                    self.guest_regs.registers[reg as usize].set(
-                        cpu::read_cr8());
-                    self.guest_regs.cached[idx].set(
-                        self.guest_regs.cached[idx].get() | (1 << bit));
-                }
-                RegType::Msr(msr) => {
-                    // Get the MSR from the real MSR state
-                    self.guest_regs.registers[reg as usize].set(unsafe {
-                        cpu::rdmsr(msr)
-                    });
-                    self.guest_regs.cached[idx].set(
-                        self.guest_regs.cached[idx].get() | (1 << bit));
-                }
-            }
-        }
-
-        // Register is actively cached in the current register state
-        self.guest_regs.registers[reg as usize].get()
+        self.guest_regs.reg(reg)
     }
 
     /// Set a register to the internal cache
     #[inline]
     pub fn set_reg(&self, reg: Register, val: u64) {
-        let idx = reg as usize / 8;
-        let bit = reg as usize % 8;
-        self.guest_regs.registers[reg as usize].set(val);
-        self.guest_regs.cached[idx].set(
-            self.guest_regs.cached[idx].get() | (1 << bit));
+        self.guest_regs.set_reg(reg, val);
     }
 
     /// Set the fxsave state for the VM
     #[inline]
     pub fn set_fxsave(&mut self, fxsave: FxSave) {
-        self.guest_regs.fxsave = fxsave;
+        self.guest_regs.set_fxsave(fxsave);
     }
 
-    /// Flush a register from the internal cache to the correct location
+    /// Get access to the page modification log
     #[inline]
-    fn flush_reg(&self, reg: usize) {
-        let idx = reg as usize / 8;
-        let bit = reg as usize % 8;
-
-        if (self.guest_regs.cached[idx].get() & (1 << bit)) != 0 {
-            // Clear the cached bit
-            self.guest_regs.cached[idx].set(
-                self.guest_regs.cached[idx].get() & !(1 << bit));
-
-            // Register is not cached, we must get it from the guest state
-            let (_, rt) = REG_TYPES[reg as usize];
-            match rt {
-                RegType::Gpr => {
-                    // Automatically synced during vmentry, nothing to do
-                }
-                RegType::Vmcs(vmcs) => {
-                    // Set the register in the VMCS
-                    unsafe {
-                        vmwrite(vmcs,
-                                self.guest_regs.registers[reg as usize].get());
-                    }
-                }
-                RegType::Cr2 => {
-                    // Sync only if different
-                    let val = self.guest_regs.registers[reg as usize].get();
-                    if cpu::read_cr2() != val {
-                        unsafe { cpu::write_cr2(val); }
-                    }
-                }
-                RegType::Cr8 => {
-                    // Sync only if different
-                    let val = self.guest_regs.registers[reg as usize].get();
-                    if cpu::read_cr8() != val {
-                        unsafe { cpu::write_cr8(val); }
-                    }
-                }
-                RegType::Msr(msr) => {
-                    // Sync only if different
-                    let val = self.guest_regs.registers[reg as usize].get();
-                    unsafe {
-                        if cpu::rdmsr(msr) != val {
-                            cpu::wrmsr(msr, val);
-                        }
-                    }
-                }
-            }
-        }
+    pub fn pml(&mut self) -> &mut [u64; 512] {
+        &mut *self.pml
     }
 
     /// Reset the VMCS to the original VMCS state
     pub fn reset(&mut self) {
         unsafe {
-            // Set up guest state
-            vmwrite(Vmcs::GuestVmcsLinkPtr, !0);
-            vmwrite(Vmcs::GuestSMBase, 0);
+            // Initialize the PML base address
+            self.set_reg(Register::PmlAddress, self.pml.phys_addr().0);
+            
+            // Reset the PML index
+            self.set_reg(Register::PmlIndex, 511);
 
-            // Invalidate the EPT
-            invalidate_ept(
-                (self.ept.table().0 | (3 << 3) | (1 << 6) | 6) as u128);
-        }
-
-        // Mark everything as cached so it gets flushed on the next vm entry
-        for cs in self.guest_regs.cached.iter() {
-            cs.set(!0);
+            if self.ept_dirty {
+                // Invalidate the EPT
+                invalidate_ept(
+                    (self.ept.table().0 | (3 << 3) | (1 << 6) | 6) as u128);
+                self.ept_dirty = false;
+            }
         }
     }
 
@@ -1106,21 +1223,29 @@ impl Vm {
                 //   CR3 store exiting
                 //   MOV DR exiting
                 //   Unconditional I/O exiting
+                //   RDPMC exiting
+                //   RDTSC exiting
                 // Off:
                 //   Use MSR bitmaps
                 //   Use I/O bitmaps
                 //   TPR shadow
                 let proc_on  = (1 << 31) | (1 << 7) | (1 << 11) | (1 << 15) |
-                    (1 << 16) | (1 << 23) | (1 << 24);
+                    (1 << 16) | (1 << 23) | (1 << 24) | (1 << 11) | (1 << 12);
                 let proc_off = (1 << 28) | (1 << 25) | (1 << 21);
                 
                 // Processor controls 2:
                 // On:
                 //     Enable EPT
                 //     Enable VPID
+                //     Enable PML
+                //     RDRAND exiting
+                //     RDSEED exiting
                 // Off:
-                let proc2_on  = (1 << 1) | (1 << 5);
-                let proc2_off = 0;
+                //     Disable RDTSCP
+                //     Disable XSAVES/XRSTORS
+                let proc2_on  = (1 << 1) | (1 << 5) | (1 << 17) | (1 << 11) |
+                    (1 << 16);
+                let proc2_off = (1 << 3) | (1 << 20);
 
                 // Validate that desired bits can be what was desired
                 {
@@ -1209,9 +1334,12 @@ impl Vm {
 
                 // Set the VPID for the guest
                 vmwrite(Vmcs::Vpid, core!().id as u64 + 1);
+            
+                // Set up guest state
+                vmwrite(Vmcs::GuestVmcsLinkPtr, !0);
+                vmwrite(Vmcs::GuestSMBase, 0);
             }
 
-            // Reset guest state to a known good state
             self.reset();
  
             // We have initialized the VM
@@ -1242,22 +1370,23 @@ impl Vm {
                     vmwrite(Vmcs::PinBasedControls, self.pinbased_controls);
                 }
             }
-
+            
             // Flush any registers which may have changed during execution
-            for (byte, status) in self.guest_regs.cached.iter().enumerate() {
+            for (byte, status) in self.guest_regs.dirtied.iter().enumerate() {
                 let st = status.get();
                 if st == 0 { continue; }
                 for bit in 0..8 {
                     if (st & (1 << bit)) != 0 {
                         let idx = byte * 8 + bit;
                         if idx < Register::NumRegisters as usize {
-                            self.flush_reg(idx);
+                            self.guest_regs.flush_reg(idx);
                         }
                     }
                 }
             }
-
+            
             let it = cpu::rdtsc();
+
             llvm_asm!(r#"
 
                 // Save host state
@@ -1386,6 +1515,10 @@ impl Vm {
             "{edi}"(self.launched as u32) :
             "memory", "rax", "rbx", "cc" : "intel", "volatile");
 
+            // Mark that nothing is cached anymore (dirtied is already clear
+            // from the prior flushes)
+            self.guest_regs.cached.iter_mut().for_each(|x| x.set(0));
+
             // Record the time spent in the VM
             vm_cycles = cpu::rdtsc() - it;
 
@@ -1445,6 +1578,12 @@ impl Vm {
                 VmExit::Exception(exception)
             }
             1 => VmExit::ExternalInterrupt,
+            16 => {
+                let inst_len = unsafe {
+                    vmread(Vmcs::VmExitInstructionLength)
+                };
+                VmExit::Rdtsc { inst_len }
+            }
             28 => {
                 // Control register access
 
@@ -1485,6 +1624,8 @@ impl Vm {
                 VmExit::WriteMsr { inst_len }
             }
             48 => {
+                // EPT violation
+                
                 // Get the exit qualification
                 let exit_qual = unsafe { vmread(Vmcs::ExitQualification) };
 
@@ -1503,6 +1644,7 @@ impl Vm {
                 }
             }
             52 => VmExit::PreemptionTimer,
+            62 => VmExit::PmlFull,
             x @ _ => unimplemented!("Unhandled VM exit code {} @ {:#x}\n",
                                     x, self.reg(Register::Rip)),
         };

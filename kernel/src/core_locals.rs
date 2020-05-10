@@ -253,6 +253,7 @@ impl CoreLocals {
     /// increment the number of disable requests, and thus interrupts will not
     /// be re-enabled until an identical number of `enable_interrupts` are
     /// called.
+    #[inline]
     pub unsafe fn disable_interrupts(&self) {
         let os =
             self.interrupt_disable_outstanding.fetch_add(1, Ordering::SeqCst);

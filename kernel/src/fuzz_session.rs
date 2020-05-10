@@ -17,11 +17,11 @@ use alloc::collections::BTreeMap;
 
 use crate::mm;
 use crate::time;
-use crate::ept::{EPT_READ, EPT_WRITE, EPT_EXEC, EPT_USER_EXEC};
-use crate::ept::EPT_MEMTYPE_WB;
+use crate::ept::{EPT_READ, EPT_WRITE, EPT_EXEC, EPT_DIRTY, EPT_USER_EXEC};
+use crate::ept::{EPT_ACCESSED, EPT_MEMTYPE_WB};
 use crate::net::NetDevice;
 use crate::net::tcp::TcpConnection;
-use crate::vtx::{Vm, VmExit, Register, Exception, FxSave};
+use crate::vtx::*;
 use crate::net::netmapping::NetMapping;
 use crate::core_locals::LockInterrupts;
 use crate::paging::*;
@@ -189,7 +189,7 @@ pub struct Statistics {
     vm_cycles: u64,
 
     /// Number of VM exits
-    vmexits: u64,
+    vm_exits: u64,
 }
 
 impl Statistics {
@@ -201,7 +201,7 @@ impl Statistics {
         master.reset_cycles += self.reset_cycles;
         master.vm_cycles += self.vm_cycles;
         master.total_cycles += self.total_cycles;
-        master.vmexits += self.vmexits;
+        master.vm_exits += self.vm_exits;
 
         // Reset our statistics
         *self = Default::default();
@@ -212,7 +212,7 @@ impl Statistics {
 struct NetBacking<'a> {
     /// Raw guest physical memory backing the snasphot
     memory: NetMapping<'a>,
-
+    
     /// Mapping of physical region base to offset into `memory` and the end
     /// (inclusive) of the region
     phys_ranges: BTreeMap<u64, (usize, u64)>,
@@ -261,6 +261,9 @@ pub struct Worker<'a> {
     /// Maps from base address to module, to end of module (inclusive) and the
     /// module name
     module_list: BTreeMap<u64, BTreeMap<u64, (u64, Arc<String>)>>,
+
+    /// Page modification log of dirtied physical memory pages
+    pml: Vec<u64>,
 }
 
 impl<'a> Worker<'a> {
@@ -280,6 +283,7 @@ impl<'a> Worker<'a> {
             server:         None,
             hasher:         FalkHasher::new(),
             enlightenment:  None,
+            pml:            Vec::new(),
         }
     }
     
@@ -289,7 +293,7 @@ impl<'a> Worker<'a> {
         // Create a new VM with the masters guest registers as the current
         // register state
         let mut vm = Vm::new();
-        vm.guest_regs.clone_from(&master.vm.guest_regs);
+        vm.guest_regs.copy_from(&master.vm.guest_regs);
 
         // Create the new VM referencing the master
         Worker {
@@ -306,6 +310,7 @@ impl<'a> Worker<'a> {
             fuzz_input:     RefCell::new(Vec::new()),
             hasher:         FalkHasher::new(),
             enlightenment:  None,
+            pml:            Vec::new(),
         }
     }
 
@@ -362,18 +367,26 @@ impl<'a> Worker<'a> {
         // Get access to the master
         let master = self.master.as_ref().expect("Cannot fuzz without master");
 
-        // Load the original snapshot registers
-        self.vm.guest_regs.clone_from(&master.vm.guest_regs);
-
         // Reset memory to its original state
-        unsafe {
-            self.vm.ept.for_each_dirty_page(|addr, page| {
-                let orig_page = master.get_page(addr)
-                    .expect("Dirtied page without master!?");
+        for &paddr in self.pml.iter() {
+            let paddr = PhysAddr(paddr);
 
-                // Get mutable access to the underlying page
-                let psl = mm::slice_phys_mut(page, 4096);
+            // Get the original page from the master
+            let orig_page = master.get_page(paddr)
+                .expect("Dirtied page without master!?");
+            
+            // Get our page and clear dirty bits in the page table
+            let page = self.vm.ept_mut().translate_int(paddr, false, true);
+            let page = page.unwrap().page.unwrap().0;
 
+            // Convert this physical address into a virtual address
+            let page = unsafe { mm::slice_phys_mut(page, 4096) };
+
+            // Set that the EPT TLB must be invalidated (since we changed dirty
+            // bit states)
+            self.vm.ept_dirty = true;
+
+            unsafe {
                 // Copy the original page into the modified copy of the page
                 llvm_asm!(r#"
                   
@@ -381,12 +394,18 @@ impl<'a> Worker<'a> {
                     rep movsq
 
                 "# ::
-                "{rdi}"(psl.as_ptr()),
+                "{rdi}"(page.as_mut_ptr()),
                 "{rsi}"(orig_page.0) :
                 "memory", "rcx", "rdi", "rsi", "cc" : 
                 "intel", "volatile");
-            });
+            }
         }
+
+        // Clear the PML as everything has been cleaned
+        self.pml.clear();
+       
+        // Load the original snapshot registers
+        self.vm.guest_regs.copy_from(&master.vm.guest_regs);
 
         // Reset the VMCS state, this also invalidates the TLB entries since
         // we have now changed the paging structures with EPT above
@@ -399,9 +418,6 @@ impl<'a> Worker<'a> {
             inject(self);
         }
 
-        // Counter of number of single steps we should perform
-        let mut single_step = 0;
-
         // Compute the timeout
         let timeout = session.timeout.map(|x| time::future(x));
 
@@ -410,37 +426,20 @@ impl<'a> Worker<'a> {
                 break 'vm_loop VmExit::Timeout;
             }
 
-            // Check if single stepping is requested
-            // We cannot enable single stepping if STI blocking, MOV SS
-            // blocking, or the CPU activity is not "active" (eg. not halted)
-            if single_step > 0 &&
-                    (self.vm.reg(Register::InterruptabilityState) & 3) == 0 &&
-                    self.vm.reg(Register::ActivityState) == 0 {
-                // Enable single stepping
-                self.vm.set_reg(Register::Rflags,
-                    self.vm.reg(Register::Rflags) | (1 << 8));
-
-                // Decrement number of single steps requested
-                single_step -= 1;
-            } else {
-                // Disable single stepping
-                self.vm.set_reg(Register::Rflags,
-                    self.vm.reg(Register::Rflags) & !(1 << 8));
-            }
-
             // Set the pre-emption timer for randomly breaking into the VM
-            // to record coverage information
-            self.vm.preemption_timer = Some((self.rng.rand() & 0xfff) as u32);
+            // to enforce timeouts
+            self.vm.preemption_timer = None; //Some(3);
 
             // Run the VM until a VM exit
             let (vmexit, vm_cycles) = self.vm.run();
-            self.stats.vmexits += 1;
+            self.stats.vm_exits += 1;
             self.stats.vm_cycles += vm_cycles;
 
             // Closure to invoke if we want to report new coverage
             let mut report_coverage = || {
                 let mut modoff =
                     self.resolve_module(self.vm.reg(Register::Rip));
+
                 if modoff.0.is_none() && self.enlightenment.is_some() {
                     // Get the current context ID
                     let pt = self.context_id();
@@ -466,22 +465,38 @@ impl<'a> Worker<'a> {
                 }
 
                 let input = self.fuzz_input.borrow();
-                if session.report_coverage(Some((&*input, &self.hasher)),
+                session.report_coverage(Some((&*input, &self.hasher)),
                     &CoverageRecord {
                         module: modoff.0.map(|x| Cow::Owned(x)),
                         offset: modoff.1,
-                }) { single_step = 1000 };
+                });
             };
 
             match vmexit {
-                VmExit::EptViolation { addr, write, .. } => {
-                    if self.translate(addr, write).is_some() {
-                        continue;
+                VmExit::Rdtsc { inst_len } => {
+                    self.vm.set_reg(Register::Rax, 0);
+                    self.vm.set_reg(Register::Rdx, 0);
+
+                    self.vm.set_reg(Register::Rip,
+                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    continue 'vm_loop;
+                }
+                VmExit::EptViolation { addr, read, write, exec } => {
+                    if self.translate(addr, read, write, exec).is_some() {
+                        continue 'vm_loop;
                     }
+                }
+                VmExit::PmlFull => {
+                    // Log the PML buffer to our growable buffer
+                    self.pml.extend_from_slice(self.vm.pml());
+
+                    // Reset the PML to empty
+                    self.vm.set_reg(Register::PmlIndex, 511);
+                    continue 'vm_loop;
                 }
                 VmExit::ExternalInterrupt => {
                     // Host interrupt happened, ignore it
-                    continue;
+                    continue 'vm_loop;
                 }
                 VmExit::Exception(Exception::NMI) => {
                     unsafe {
@@ -495,8 +510,12 @@ impl<'a> Worker<'a> {
                     let msr = self.vm.reg(Register::Rcx);
 
                     // Get the MSR value
-                    let val = match msr {
-                        0xc000_0102 => self.vm.reg(Register::KernelGsBase),
+                    let val = match msr as u32 {
+                        IA32_FS_BASE => self.vm.reg(Register::FsBase),
+                        IA32_GS_BASE => self.vm.reg(Register::GsBase),
+                        IA32_KERNEL_GS_BASE => {
+                            self.vm.reg(Register::KernelGsBase)
+                        }
                         _ => panic!("Unexpected MSR read {:#x} @ {:#x}\n",
                                     msr, self.vm.reg(Register::Rip)),
                     };
@@ -518,8 +537,14 @@ impl<'a> Worker<'a> {
                         self.vm.reg(Register::Rax);
 
                     // Get the MSR value
-                    match msr {
-                        0xc000_0102 => {
+                    match msr as u32 {
+                        IA32_FS_BASE => {
+                            self.vm.set_reg(Register::FsBase, val);
+                        }
+                        IA32_GS_BASE => {
+                            self.vm.set_reg(Register::GsBase, val);
+                        }
+                        IA32_KERNEL_GS_BASE => {
                             self.vm.set_reg(Register::KernelGsBase, val);
                         }
                         _ => panic!("Unexpected MSR write {:#x} @ {:#x}\n",
@@ -600,10 +625,6 @@ impl<'a> Worker<'a> {
                         self.vm.reg(Register::Rip).wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
-                VmExit::Exception(Exception::DebugException) => {
-                    report_coverage();
-                    continue 'vm_loop;
-                }
                 VmExit::PreemptionTimer => {
                     report_coverage();
                     continue 'vm_loop;
@@ -621,6 +642,17 @@ impl<'a> Worker<'a> {
             // Unhandled VM exit, break
             break 'vm_loop vmexit;
         };
+
+        // Get the remainder in the PML. Since the PML index is 511 when the
+        // list is empty, we should add 1 so it becomes 512. This would cause
+        // the slice to be [512..512], and thus empty, when the list is
+        // empty. This also handles the situation where the PML index
+        // decrements to 0xffff (as mentioned in the manual), as the index will
+        // become zero, causing us to extend the _entire_ size of thet PML,
+        // which is the correct behavior
+        let pml_index =
+            (self.vm.reg(Register::PmlIndex) as u16).wrapping_add(1);
+        self.pml.extend_from_slice(&self.vm.pml()[pml_index as usize..]);
 
         // Update number of fuzz cases
         self.stats.fuzz_cases += 1;
@@ -732,7 +764,7 @@ impl<'a> Worker<'a> {
             };
 
             // Get the host physical address for this page
-            let paddr = self.translate(PhysAddr(gpaddr), false)?;
+            let paddr = self.translate(PhysAddr(gpaddr), true, false, false)?;
 
             // Compute the remaining number of bytes on the page
             let page_remain = 0x1000 - (paddr.0 & 0xfff);
@@ -808,7 +840,7 @@ impl<'a> Worker<'a> {
             };
 
             // Get the host physical address for this page
-            let paddr = self.translate(PhysAddr(gpaddr), true)?;
+            let paddr = self.translate(PhysAddr(gpaddr), false, true, false)?;
 
             // Compute the remaining number of bytes on the page
             let page_remain = 0x1000 - (paddr.0 & 0xfff);
@@ -937,7 +969,7 @@ impl<'a> Worker<'a> {
         while buf.len() > 0 {
             if (paddr.0 & 0xfff) == 0 {
                 // Crossed into a new page, translate
-                paddr = self.translate(gpaddr, false)?;
+                paddr = self.translate(gpaddr, true, false, false)?;
             }
 
             // Compute the remaining number of bytes on the page
@@ -981,7 +1013,7 @@ impl<'a> Worker<'a> {
         while buf.len() > 0 {
             if (paddr.0 & 0xfff) == 0 {
                 // Crossed into a new page, translate
-                paddr = self.translate(gpaddr, true)?;
+                paddr = self.translate(gpaddr, false, true, false)?;
             }
 
             // Compute the remaining number of bytes on the page
@@ -1014,7 +1046,7 @@ impl<'a> Worker<'a> {
         // Attempt to translate the page, it is possible it has not yet been
         // mapped and we need to page it in from the network mapped storage in
         // the `FuzzTarget`
-        let translation = self.vm.ept.translate(gpaddr);
+        let translation = self.vm.ept().translate(gpaddr);
         if let Some(Mapping { page: Some(orig_page), .. }) = translation {
             Some(VirtAddr(unsafe {
                 mm::slice_phys_mut(orig_page.0, 4096).as_ptr() as u64
@@ -1060,22 +1092,28 @@ impl<'a> Worker<'a> {
     /// The returned physical address will have the offset from the physical
     /// address applied. Such that a request for physical address `0x13371337`
     /// would return a physical address ending in `0x337`
-    fn translate(&mut self, gpaddr: PhysAddr, write: bool) -> Option<PhysAddr> {
+    fn translate(&mut self, gpaddr: PhysAddr, _read: bool, write: bool,
+                 _exec: bool) -> Option<PhysAddr> {
         // Get access to physical memory
         let mut pmem = mm::PhysicalMemory;
         
         // Align the guest physical address
         let align_gpaddr = PhysAddr(gpaddr.0 & !0xfff);
-
+        
         // Attempt to translate the page, it is possible it has not yet been
         // mapped and we need to page it in from the network mapped storage in
         // the `FuzzTarget`
-        let translation = self.vm.ept.translate_dirty(align_gpaddr, write);
+        let translation = if !write {
+            self.vm.ept().translate(align_gpaddr)
+        } else {
+            self.vm.ept_mut().translate_int(align_gpaddr, write, false)
+        };
         
         // First, determine if we need to perform a CoW or make a mapping for
         // an unmapped page
         if let Some(Mapping {
-                pte: Some(pte), page: Some(orig_page), .. }) = translation {
+                pte: Some(pte), page: Some((orig_page, _, ent)), .. }) =
+                    translation {
             // Page is mapped, it is possible it needs to be promoted to
             // writable
             let page_writable =
@@ -1085,7 +1123,19 @@ impl<'a> Worker<'a> {
             // operation is not a write, then the existing allocation can
             // satisfy the translation request.
             if (write && page_writable) || !write {
-                return Some(PhysAddr((orig_page.0).0 + (gpaddr.0 & 0xfff)));
+                if write {
+                    // Check if the dirty bit was previously clear
+                    if (ent & EPT_DIRTY) == 0 {
+                        // Log that this page has been dirtied to the PML
+                        self.pml.push(align_gpaddr.0);
+                        
+                        // Set that the TLB should be flushed on next VM entry
+                        // as we changed dirty bits
+                        self.vm.ept_dirty = true;
+                    }
+                }
+
+                return Some(PhysAddr(orig_page.0 + (gpaddr.0 & 0xfff)));
             }
         }
 
@@ -1117,7 +1167,7 @@ impl<'a> Worker<'a> {
             // address
             //
             // This will always succeed as we touched the memory above
-            let (page, offset) =
+            let (page, offset, _) =
                 page_table.translate(&mut pmem, orig_page_gpaddr)
                     .map(|x| x.page).flatten()
                     .expect("Whoa, memory page not mapped?!");
@@ -1145,7 +1195,15 @@ impl<'a> Worker<'a> {
             // Promote the page via CoW
             unsafe {
                 mm::write_phys(pte, 
-                    page.0 | EPT_WRITE | EPT_READ | EPT_EXEC | EPT_USER_EXEC);
+                    page.0 | EPT_WRITE | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
+                    EPT_DIRTY | EPT_ACCESSED);
+
+                // Log that this page has been dirtied to the PML
+                self.pml.push(align_gpaddr.0);
+
+                // Mapping changed, we must invalidate the TLB on next VM
+                // entry
+                self.vm.ept_dirty = true;
             }
 
             page
@@ -1166,12 +1224,17 @@ impl<'a> Worker<'a> {
                 psl.copy_from_slice(&ro_page);
 
                 unsafe {
-                    // Map in the page as RW
-                    self.vm.ept.map_raw(align_gpaddr,
+                    // Map in the page as RWX, WB, and already dirtied and
+                    // accessed (since we're getting write access to it)
+                    self.vm.ept_mut().map_raw(align_gpaddr,
                         PageType::Page4K,
                         page.0 | EPT_READ | EPT_WRITE | EPT_EXEC |
-                        EPT_USER_EXEC | EPT_MEMTYPE_WB)
+                        EPT_USER_EXEC | EPT_MEMTYPE_WB | EPT_DIRTY |
+                        EPT_ACCESSED)
                         .unwrap();
+               
+                    // Memory was dirtied
+                    self.pml.push(align_gpaddr.0);
                 }
 
                 // Return the physical address of the new page
@@ -1183,7 +1246,7 @@ impl<'a> Worker<'a> {
                 
                 unsafe {
                     // Map in the page as read-only into the guest page table
-                    self.vm.ept.map_raw(align_gpaddr, PageType::Page4K,
+                    self.vm.ept_mut().map_raw(align_gpaddr, PageType::Page4K,
                         orig_page.0 | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
                         EPT_MEMTYPE_WB)
                         .unwrap();
@@ -1221,7 +1284,7 @@ pub struct FuzzSession<'a> {
     vmexit_filter: Option<VmExitFilter<'a>>,
     
     /// All observed coverage information
-    coverage: Aht<CoverageRecord<'a>, (), 65536>,
+    coverage: Aht<CoverageRecord<'a>, (), 1048576>,
 
     /// Coverage which has yet to be reported to the server
     pending_coverage: LockCell<Vec<CoverageRecord<'a>>, LockInterrupts>,
@@ -1230,10 +1293,10 @@ pub struct FuzzSession<'a> {
     pending_inputs: LockCell<Vec<InputRecord<'a>>, LockInterrupts>,
 
     /// Table mapping input hashes to inputs
-    input_dedup: Aht<u128, Arc<Vec<u8>>, 65536>,
+    input_dedup: Aht<u128, Arc<Vec<u8>>, 1048576>,
 
     /// Inputs which caused coverage
-    inputs: AtomicVec<Arc<Vec<u8>>, 4096>,
+    inputs: AtomicVec<Arc<Vec<u8>>, 65536>,
 
     /// Global statistics for the fuzz cases
     stats: LockCell<Statistics, LockInterrupts>,
@@ -1568,6 +1631,7 @@ impl<'a> FuzzSession<'a> {
                 total_cycles: stats.total_cycles,
                 vm_cycles:    stats.vm_cycles,
                 reset_cycles: stats.reset_cycles,
+                vm_exits:     stats.vm_exits,
                 allocs: crate::mm::GLOBAL_ALLOCATOR
                     .num_allocs.load(Ordering::Relaxed),
                 frees: crate::mm::GLOBAL_ALLOCATOR

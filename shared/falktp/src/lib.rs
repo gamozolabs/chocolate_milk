@@ -72,6 +72,7 @@ pub enum ServerMessage<'a> {
         total_cycles: u64,
         vm_cycles:    u64,
         reset_cycles: u64,
+        vm_exits:     u64,
 
         // Memory stats
         allocs:      u64,

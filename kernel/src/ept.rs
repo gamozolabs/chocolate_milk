@@ -2,11 +2,10 @@
 
 use core::mem::size_of;
 use core::alloc::Layout;
-use alloc::boxed::Box;
 
 use crate::mm;
 
-use page_table::{PhysMem, VirtAddr, PhysAddr, Mapping, PageType};
+use page_table::{PhysMem, PhysAddr, Mapping, PageType};
 
 /// Write back memory type for EPT pages
 pub const EPT_MEMTYPE_WB: u64 = 6 << 3;
@@ -40,10 +39,6 @@ pub const EPT_PRESENT: u64 = EPT_READ | EPT_WRITE | EPT_EXEC | EPT_USER_EXEC;
 pub struct Ept {
     /// Physical address of the root level of the page table
     table: PhysAddr,
-
-    /// Tracks which tables and pages can be written to
-    /// Type for the `VirtAddr` is `Box<[u64; 512 / 64 + 512]>`
-    tracking: VirtAddr,
 }
 
 impl Ept {
@@ -57,8 +52,6 @@ impl Ept {
 
         Some(Ept {
             table,
-            tracking: VirtAddr(
-                Box::into_raw(Box::new([0; 512 / 64 + 512])) as u64),
         })
     }
     
@@ -68,119 +61,13 @@ impl Ept {
         self.table
     }
 
-    /// Create a page table entry at `gpaddr` for `size` bytes in length,
-    /// `page_type` as the page size. `read`, `write`, and `exec` will be used
-    /// as the permission bits.
-    pub fn map(&mut self, gpaddr: PhysAddr, page_type: PageType,
-            size: u64, read: bool, write: bool, exec: bool, exec_user: bool)
-                -> Option<()> {
-        self.map_init(gpaddr, page_type, size, read, write, exec, exec_user,
-            None::<fn(u64) -> u8>)
-    }
-
-    /// Create a page table entry at `gpaddr` for `size` bytes in length,
-    /// `page_type` as the page size. `read`, `write`, and `exec` will be used
-    /// as the permission bits.
-    ///
-    /// If the guest physical memory is already mapped this will return `None`
-    /// and the page table will not be modified.
-    ///
-    /// If `init` is `Some`, it will be invoked with the current offset into
-    /// the mapping, and the return value from the closure will be used to
-    /// initialize that byte.
-    pub fn map_init<F>(
-                &mut self, gpaddr: PhysAddr, page_type: PageType,
-                size: u64, read: bool, write: bool, exec: bool,
-                exec_user: bool, init: Option<F>) -> Option<()>
-            where F: Fn(u64) -> u8 {
-        // Make sure some permission is set
-        assert!(read || write || exec || exec_user,
-                "No permissions set for EPT mapping");
-
-        // Get access to physical memory
-        let mut phys_mem = mm::PhysicalMemory;
-
-        // Get the raw page size in bytes and the mask
-        let page_size = page_type as u64;
-        let page_mask = page_size - 1;
-
-        // Save off the original guest physical address
-        let orig_gpaddr = gpaddr;
-
-        // Make sure that the guest physical address is aligned to the page
-        // size request
-        if size <= 0 || (gpaddr.0 & page_mask) != 0 {
-            return None;
-        }
-
-        // Compute the end guest physical address of this mapping
-        let end_gpaddr = gpaddr.0.checked_add(size - 1)?;
-
-        // Go through each page in this mapping
-        for gpaddr in (gpaddr.0..=end_gpaddr).step_by(page_size as usize) {
-            // Allocate the page
-            let page = phys_mem.alloc_phys(
-                Layout::from_size_align(page_size as usize,
-                                        page_size as usize).unwrap())?;
-
-            // Create the page table entry for this page
-            let ent = page.0 | EPT_MEMTYPE_WB |
-                if read       { EPT_READ      } else { 0 } |
-                if write      { EPT_WRITE     } else { 0 } |
-                if exec       { EPT_EXEC      } else { 0 } |
-                if exec_user  { EPT_USER_EXEC } else { 0 } |
-                if page_type != PageType::Page4K { EPT_PAGE_SIZE } else { 0 };
-
-            if let Some(init) = &init {
-                // Translate the page
-                let sliced = unsafe {
-                    let bytes = phys_mem.translate_mut(
-                        page, page_size as usize)?;
-
-                    // Get access to the memory we just allocated
-                    core::slice::from_raw_parts_mut(
-                        bytes, page_size as usize)
-                };
-
-                for (off, byte) in sliced.iter_mut().enumerate() {
-                    *byte = init(gpaddr - orig_gpaddr.0 + off as u64);
-                }
-            }
-
-            // Add this mapping to the page table
-            unsafe {
-                if self.map_raw(PhysAddr(gpaddr),
-                        page_type, ent).is_none() {
-                    // Failed to map, undo everything we have done so far
-                    let mapped = gpaddr - orig_gpaddr.0;
-
-                    if mapped > 0 {
-                        // Free everything that we mapped up until the failure
-                        self.free(orig_gpaddr, mapped);
-                    }
-
-                    return None;
-                }
-            }
-        }
-
-        Some(())
-    }
-
-    /// Free the guest physical memory region indicated by `gpaddr` and `size`.
-    /// All pages used to back the allocation will be freed, and any
-    /// intermediate page tables which no longer contain any mappings will be
-    /// unlinked from the table and also freed.
-    pub unsafe fn free(&mut self, _gpaddr: PhysAddr, _size: u64) {
-        unimplemented!();
-    }
-
     /// Translate a guest physical address in the `self` page table into its
     /// components. This will include entries for every level in the table as
     /// well as the final page result if the page is mapped and present.
     pub fn translate(&self, gpaddr: PhysAddr) -> Option<Mapping> {
         unsafe {
-            (*(self as *const Self as *mut Self)).translate_int(gpaddr, false)
+            (*(self as *const Self as *mut Self))
+                .translate_int(gpaddr, false, false)
         }
     }
     
@@ -190,21 +77,14 @@ impl Ept {
     ///
     /// If `dirty` is set to `true`, then the accessed and dirty bits will be
     /// set during the page table walk.
-    pub fn translate_dirty(&mut self, gpaddr: PhysAddr, dirty: bool)
+    
+    /// If `clear` is set to `true`, then the accessed and dirty bits will be
+    /// cleared during the page table walk.
+    pub fn translate_int(&mut self, gpaddr: PhysAddr, dirty: bool, clear: bool)
             -> Option<Mapping> {
-        unsafe {
-            self.translate_int(gpaddr, dirty)
-        }
-    }
+        assert!(!dirty || (dirty != clear),
+            "Cannot both clear and dirty EPT at the same time");
 
-    /// Translate a guest physical address in the `self` page table into its
-    /// components. This will include entries for every level in the table as
-    /// well as the final page result if the page is mapped and present.
-    ///
-    /// If `dirty` is set to `true`, then the accessed and dirty bits will be
-    /// set during the page table walk.
-    pub unsafe fn translate_int(&mut self, gpaddr: PhysAddr, dirty: bool)
-            -> Option<Mapping> {
         // Get access to physical memory
         let mut phys_mem = mm::PhysicalMemory;
 
@@ -242,8 +122,10 @@ impl Ept {
             }
 
             // Get a mapped virtual address for this entry
-            let vad = phys_mem.translate_mut(ptp, size_of::<u64>())?;
-            let ent = core::ptr::read(vad as *const u64);
+            let vad = unsafe {
+                phys_mem.translate_mut(ptp, size_of::<u64>())?
+            };
+            let ent = unsafe { core::ptr::read(vad as *const u64) };
 
             // Check if this page is present
             if (ent & EPT_PRESENT) == 0 {
@@ -253,8 +135,15 @@ impl Ept {
 
             // Update dirty bits if requested
             if dirty {
-                core::ptr::write_volatile(vad as *mut u64,
-                    ent | EPT_DIRTY | EPT_ACCESSED);
+                unsafe {
+                    core::ptr::write_volatile(vad as *mut u64,
+                        ent | EPT_DIRTY | EPT_ACCESSED);
+                }
+            } else if clear {
+                unsafe {
+                    core::ptr::write_volatile(vad as *mut u64,
+                        ent & !(EPT_DIRTY | EPT_ACCESSED));
+                }
             }
 
             // Update the table to point to the next level
@@ -282,7 +171,7 @@ impl Ept {
                 let page_off = gpaddr.0 & page_mask;
 
                 // Store the page and offset
-                ret.page = Some((PhysAddr(page_paddr), page_off));
+                ret.page = Some((PhysAddr(page_paddr), page_off, ent));
 
                 // Translation done
                 break;
@@ -364,9 +253,6 @@ impl Ept {
             (gpaddr.0 >> 12) & 0x1ff,
         ];
 
-        // Track the level into the tracking table
-        let mut tracking = self.tracking;
-
         // Create page tables as needed while walking to the final page
         for ii in 1..depth {
             // Check if there is a table along the path
@@ -398,23 +284,6 @@ impl Ept {
                     core::ptr::write(ptr as *mut u64, nent);
                 }
 
-                {
-                    // Convert the tracking table into it's underlying type
-                    let ttbl =
-                        &mut *(tracking.0 as *mut [u64; 512 / 64 + 512]);
-
-                    let bit = indicies[ii - 1] % 64;
-                    let idx = indicies[ii - 1] / 64;
-                    
-                    // Set that there is a table at this index
-                    ttbl[idx as usize] |= 1 << bit;
-
-                    // Create a new bit index table
-                    let nxt =
-                        Box::into_raw(Box::new([0u64; 512 / 64 + 512])) as u64;
-                    ttbl[512 / 64 + indicies[ii - 1] as usize] = nxt;
-                }
-
                 // Insert the new table at the entry in the table above us
                 core::ptr::write(ptr as *mut u64,
                     table.0 | EPT_PRESENT);
@@ -423,15 +292,6 @@ impl Ept {
                 entries[ii] = Some(PhysAddr(
                     table.0 + indicies[ii] * core::mem::size_of::<u64>() as u64
                 ));
-            }
-
-            // Traverse the tracking table regardless of if we created a new
-            // page or not.
-            {
-                // Convert the tracking table into it's underlying type
-                let ttbl = &mut *(tracking.0 as *mut [u64; 512 / 64 + 512]);
-                let nxt = ttbl[512 / 64 + indicies[ii - 1] as usize];
-                tracking = VirtAddr(nxt);
             }
         }
         
@@ -453,17 +313,6 @@ impl Ept {
             core::ptr::write(ptr as *mut u64, nent);
         }
 
-        {
-            // Convert the tracking table into it's underlying type
-            let ttbl = &mut *(tracking.0 as *mut [u64; 512 / 64 + 512]);
-
-            let bit = indicies[depth - 1] % 64;
-            let idx = indicies[depth - 1] / 64;
-            
-            // Set that there is a table at this index
-            ttbl[idx as usize] |= 1 << bit;
-        }
-
         // At this point, the tables have been created, and the page doesn't
         // already exist. Thus, we can write in the mapping!
         let ptr = phys_mem.translate_mut(entries[depth - 1].unwrap(),
@@ -473,6 +322,7 @@ impl Ept {
         Some(())
     }
     
+    /*
     /// Invoke a closure on every dirtied page
     /// Closure arguments are (guest physical, host physical)
     pub unsafe fn for_each_dirty_page<F>(&mut self, mut callback: F)
@@ -545,6 +395,6 @@ impl Ept {
         }
         
         tracking!(0, self.table(), tracking, 0, 0, 0, 0, 0);
-    }
+    }*/
 }
 

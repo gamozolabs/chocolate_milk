@@ -8,7 +8,7 @@ use crate::fuzz_session::{Worker, FuzzSession};
 use lockcell::LockCell;
 
 pub fn fuzz() {
-    //if core!().id != 0 { cpu::halt(); }
+    if core!().id != 0 { cpu::halt(); }
 
     static SESSION:
         LockCell<Option<Arc<FuzzSession>>, LockInterrupts> =
@@ -22,7 +22,8 @@ pub fn fuzz() {
                 Arc::new(FuzzSession::from_falkdump(
                         "192.168.101.1:1911", "out.falkdump")
                 .init_master_vm(|_worker| {
-                    //_worker.vm.set_reg(crate::vtx::Register::Cr3, 0x3713371337);
+                    //_worker.vm.set_reg(crate::vtx::Register::Rsp, 0x13371337);
+                    _worker.vm.set_reg(crate::vtx::Register::Cr3, 0x3713371337);
                 })
                 //.timeout(100_000)
                 .inject(inject))
@@ -38,6 +39,8 @@ pub fn fuzz() {
 
     loop {
         let _vmexit = worker.fuzz_case();
+        /*print!("{:#x?}\n", _vmexit);
+        crate::time::sleep(1_000_000);*/
     }
 }
 

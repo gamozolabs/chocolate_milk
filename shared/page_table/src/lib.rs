@@ -53,8 +53,9 @@ pub struct Mapping {
     /// `None` if there is no table present at this level
     pub pte: Option<PhysAddr>,
 
-    /// Actual address of the base of the page and the offset into it
-    pub page: Option<(PhysAddr, u64)>,
+    /// Actual address of the base of the page, offset into the page, and the
+    /// original raw page table entry (prior to dirty bit updates)
+    pub page: Option<(PhysAddr, u64, u64)>,
 }
 
 impl Mapping {
@@ -565,7 +566,7 @@ impl PageTable {
                 let page_off = vaddr.0 & page_mask;
 
                 // Store the page and offset
-                ret.page = Some((PhysAddr(page_paddr), page_off));
+                ret.page = Some((PhysAddr(page_paddr), page_off, ent));
 
                 // Translation done
                 break;

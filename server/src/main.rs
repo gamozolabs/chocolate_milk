@@ -47,6 +47,9 @@ struct Session<'a> {
     /// Number of cycles spent inside the VM
     vm_cycles: u64,
 
+    /// Number of VM exits
+    vm_exits: u64,
+
     /// Number of allocations on the system
     allocs: u64,
 
@@ -129,12 +132,14 @@ fn stats(context: Arc<Context>) {
                    if unresponsive { "???" } else { "" });
 
             print!("\x1b[34;1m    >>> Allocs {:10} | Frees {:10} | \
-                   Physical {:10.2} MiB / {:10.2} MiB\x1b[0m\n",
+                   Physical {:10.2} MiB / {:10.2} MiB | \
+                   VME/fc {:12.3}\x1b[0m\n",
                    session.allocs,
                    session.frees,
                    (session.phys_total - session.phys_free) as f64 /
                        1024. / 1024.,
-                   session.phys_total as f64 / 1024. / 1024.);
+                   session.phys_total as f64 / 1024. / 1024.,
+                   session.vm_exits as f64 / session.fuzz_cases as f64);
 
             if !unresponsive {
                 total_cases    += session.fuzz_cases;
@@ -190,7 +195,7 @@ fn handle_client(stream: TcpStream,
         match msg {
             ServerMessage::ReportStatistics { fuzz_cases, total_cycles,
                     vm_cycles, reset_cycles, allocs, frees,
-                    phys_free, phys_total } => {
+                    phys_free, phys_total, vm_exits } => {
                 // Get access to the client and session
                 let client = client.unwrap();
                 let mut session = client.session.write().unwrap();
@@ -200,6 +205,7 @@ fn handle_client(stream: TcpStream,
                 session.total_cycles = total_cycles;
                 session.vm_cycles    = vm_cycles;
                 session.reset_cycles = reset_cycles;
+                session.vm_exits     = vm_exits;
                 session.allocs       = allocs;
                 session.frees        = frees;
                 session.phys_free    = phys_free;
@@ -294,6 +300,7 @@ fn handle_client(stream: TcpStream,
                             total_cycles:    0,
                             reset_cycles:    0,
                             vm_cycles:       0,
+                            vm_exits:        0,
                             unique_coverage: 0,
                             unique_inputs:   0,
                             allocs:          0,
