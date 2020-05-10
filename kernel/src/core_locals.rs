@@ -307,7 +307,7 @@ pub fn get_core_locals() -> &'static CoreLocals {
 /// Initialize the locals for this core
 pub fn init(boot_args: PhysAddr, core_id: u32) {
     unsafe {
-        // Temporaraly set GS base to the core ID for early locks
+        // Temporarily set GS base to the core ID for early locks
         cpu::set_gs_base(core_id as u64);
     }
 
