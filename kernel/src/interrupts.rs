@@ -34,6 +34,8 @@ static PAGE_FAULT_HANDLERS:
 /// Allows the fault handler to be removed when the `FaultReg` goes is
 /// `Drop`ped
 pub struct FaultReg(*const dyn PageFaultHandler);
+unsafe impl Send for FaultReg {}
+unsafe impl Sync for FaultReg {}
 
 impl Drop for FaultReg {
     fn drop(&mut self) {
@@ -59,7 +61,7 @@ pub fn register_fault_handler(handler: Box<dyn PageFaultHandler>) -> FaultReg {
 /// Implemented for structures which may be registered as page fault handlers.
 /// These handlers can be used to hook page faults and potentially lazily map
 /// in pages when needed.
-pub trait PageFaultHandler {
+pub trait PageFaultHandler: Send + Sync {
     /// Invoked when a page fault occurs with the contents for `cr2`, the
     /// faulting address. If the fault was handled this should return `true`
     /// and thus execution will return back to where the exception originally

@@ -275,7 +275,7 @@ impl Device for NetDevice {
 }
 
 /// Driver-implemented trait to get generic access to network card RX and TX
-pub trait NetDriver {
+pub trait NetDriver: Send + Sync {
     /// Forceably reset the NIC, this is to disable it fully before we soft
     /// reboot
     unsafe fn reset(&self);

@@ -33,7 +33,7 @@ impl<T: Device + 'static> AsAny for T {
 
 /// An driver for a device. There are multiple instances of a driver for each
 /// device the driver handled during the probe process.
-pub trait Device: AsAny {
+pub trait Device: Send + Sync + AsAny {
     /// Invoked on a device when we're doing a soft reboot. This may be called
     /// from an exceptionally hostile environment (eg. inside of a panic inside
     /// of an NMI exception). The goal of this function for a driver is to

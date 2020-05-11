@@ -2,6 +2,7 @@
 
 use core::ops::Range;
 use core::mem::size_of;
+use core::convert::TryInto;
 use page_table::{VirtAddr, PhysAddr, PAGE_PRESENT, PAGE_SIZE};
 
 /// A page table entry describing the shapes, masks, and large paging support
@@ -22,7 +23,7 @@ struct PageTableEntry {
 
 /// Creates a page table walker for a given page table shape
 macro_rules! define_walker {
-    ($fname:ident, $ety:ty, $cr3_mask:expr, $tbl:expr) => {
+    ($fname:ident, $metadata:ident, $ety:ty, $cr3_mask:expr, $tbl:expr) => {
     pub fn $fname<'a, F>(cr3: u64, vaddr: VirtAddr, mut translate: F)
         -> Option<(PhysAddr, u64, u64)>
             where F: FnMut(PhysAddr) -> Option<$ety> {
@@ -92,17 +93,72 @@ macro_rules! define_walker {
         // We cannot get here
         unreachable!();
     }
+
+    pub fn $metadata<'a, F, C>(table: u64, depth: u8, get_page: F,
+                               callback: &mut C)
+            where F: Fn(PhysAddr) -> Option<&'a [u8]> + Copy,
+                  C: FnMut(PhysAddr) {
+        // Stop traversal before the final PTE, we don't actually want to
+        // walk the pages in the system, only the page _tables_ so we stop
+        // before the final leaf
+        if depth.wrapping_add(2) as usize == $tbl.len() {
+            return;
+        }
+
+        // Mask the entry to get the page table
+        let table = if depth == !0 {
+            table & $cr3_mask
+        } else {
+            table & $tbl[depth as usize].page_mask
+        };
+
+        // Get the information about this page table level
+        let level = &$tbl[depth.wrapping_add(1) as usize];
+
+        // Determine the number of entries at this level
+        let entries = 1 << (level.bits.end - level.bits.start);
+
+        // Get access to the page table entries for this level
+        let page = get_page(PhysAddr(table));
+        if page.is_none() { return; }
+        let page = page.unwrap();
+
+        // Go through each entry at this level
+        for ent in 0..entries {
+            // Read the page table entry, depending on the page table type
+            let ent = <$ety>::from_le_bytes(
+                page[ent * size_of::<$ety>()..(ent + 1) * size_of::<$ety>()]
+                .try_into().unwrap()) as u64;
+
+            // Skip non-present pages
+            if ent & PAGE_PRESENT == 0 { continue; }
+
+            // Skip large pages as that's the end of the structure
+            if level.large_page.is_some() && (ent & PAGE_SIZE) != 0 {
+                // Entry was a large page, we don't have to recurse
+                continue;
+            }
+
+            // Invoke the callback with the metadata information
+            callback(PhysAddr(ent & level.page_mask));
+
+            // Recurse into this table
+            $metadata(ent & level.page_mask, depth.wrapping_add(1),
+                get_page, callback);
+        }
+    }
     }
 }
 
-define_walker!(translate_32_no_pae, u32, 0xfffff000, &[
+define_walker!(translate_32_no_pae, translate_32_no_pae_metadata, u32,
+               0xfffff000, &[
     PageTableEntry { bits: 22..32, page_mask: 0xfffff000,
         large_page: Some((0, 4 * 1024 * 1024)) },
 
     PageTableEntry { bits: 12..22, page_mask: 0xfffff000, large_page: None },
 ]);
 
-define_walker!(translate_32_pae, u32, 0xfffff000, &[
+define_walker!(translate_32_pae, translate_32_pae_metadata, u32, 0xfffff000, &[
     PageTableEntry { bits: 30..32, page_mask: 0xffffffffff000,
         large_page: None },
 
@@ -113,7 +169,8 @@ define_walker!(translate_32_pae, u32, 0xfffff000, &[
         large_page: None },
 ]);
 
-define_walker!(translate_64_4_level, u64, 0xffffffffff000, &[
+define_walker!(translate_64_4_level, translate_64_4_level_metadata,
+               u64, 0xffffffffff000, &[
     PageTableEntry { bits: 39..48, page_mask: 0xffffffffff000,
         large_page: None },
 

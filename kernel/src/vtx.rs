@@ -5,9 +5,8 @@
 //! modprobe -r kvm_intel
 //! modprobe kvm_intel nested=1
 
-use core::cell::Cell;
 use core::mem::size_of;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::Ordering::SeqCst;
 use page_table::{PhysAddr, VirtAddr};
 use crate::mm::PhysContig;
 use crate::ept::Ept;
@@ -638,37 +637,31 @@ const REG_TYPES: &[(Register, RegType)] = &[
 ];
 
 /// General purpose register state
-#[derive(Clone)]
 #[repr(C)]
 pub struct RegisterState {
-    registers: [Cell<u64>; Register::NumRegisters as usize],
+    registers: [u64; Register::NumRegisters as usize],
     fxsave:    FxSave,
 
     /// Bitmap tracking if registers are cached, if they are cached, they can
     /// be pulled directly from `registers`, otherwise they must be fetched
     /// directly from the source
-    cached: [Cell<u8>; (Register::NumRegisters as usize + 7) / 8],
+    cached: [u8; (Register::NumRegisters as usize + 7) / 8],
 
     /// Bitmap tracking if registers are dirtied, this indicates that the
     /// value in a `registers` field is different from what is commit to the
     /// VM state and must be flushed before the next VM entry
-    dirtied: [Cell<u8>; (Register::NumRegisters as usize + 7) / 8],
+    dirtied: [u8; (Register::NumRegisters as usize + 7) / 8],
 }
 
 impl RegisterState {
     /// Copy a register state from another one
     pub fn copy_from(&mut self, other: &RegisterState) {
         for &(reg, _) in REG_TYPES.iter() {
-            let idx = reg as usize / 8;
-            let bit = reg as usize % 8;
-
-            // Only restore registers which were cached in `other`, we cannot
-            // pull in from their context if they're not cached
-            if (other.cached[idx].get() & (1 << bit)) != 0 {
-                // Only update if the register changed
-                if self.reg(reg) != other.reg(reg) {
+            if let Some(other_reg) = other.reg_cached(reg) {
+                // Only update the register if it has changed
+                if self.reg(reg) != other_reg {
                     // Update the register
-                    self.set_reg(reg, other.reg(reg));
+                    self.set_reg(reg, other_reg);
                 }
             } else {
                 // Register is not cached in `other`, zero it out
@@ -682,13 +675,28 @@ impl RegisterState {
         self.fxsave = other.fxsave;
     }
 
-    /// Get a register
+    /// Get the value of a register, if and only if it is cached. This doesn't
+    /// require a `mut` reference to `self` since we never have to update the
+    /// caching/dirty states
     #[inline]
-    pub fn reg(&self, reg: Register) -> u64 {
+    pub fn reg_cached(&self, reg: Register) -> Option<u64> {
         let idx = reg as usize / 8;
         let bit = reg as usize % 8;
 
-        if (self.cached[idx].get() & (1 << bit)) == 0 {
+        if (self.cached[idx] & (1 << bit)) != 0 {
+            Some(self.registers[reg as usize])
+        } else {
+            None
+        }
+    }
+
+    /// Get a register
+    #[inline]
+    pub fn reg(&mut self, reg: Register) -> u64 {
+        let idx = reg as usize / 8;
+        let bit = reg as usize % 8;
+
+        if (self.cached[idx] & (1 << bit)) == 0 {
             // Register is not cached, we must get it from the guest state
             let (_, rt) = REG_TYPES[reg as usize];
             match rt {
@@ -697,11 +705,10 @@ impl RegisterState {
                 }
                 RegType::Vmcs(vmcs) => {
                     // Get the register from the VMCS
-                    self.registers[reg as usize].set(unsafe {
+                    self.registers[reg as usize] = unsafe {
                         vmread(vmcs)
-                    });
-                    self.cached[idx].set(
-                        self.cached[idx].get() | (1 << bit));
+                    };
+                    self.cached[idx] |= 1 << bit;
                 }
                 RegType::Cr2 => {
                     // Due to the nature of CR2 being overwritten on the host,
@@ -709,36 +716,31 @@ impl RegisterState {
                 }
                 RegType::Cr8 => {
                     // Get the CR8 from the host CR8
-                    self.registers[reg as usize].set(
-                        cpu::read_cr8());
-                    self.cached[idx].set(
-                        self.cached[idx].get() | (1 << bit));
+                    self.registers[reg as usize] = cpu::read_cr8();
+                    self.cached[idx] |= 1 << bit;
                 }
                 RegType::Msr(msr) => {
                     // Get the MSR from the real MSR state
-                    self.registers[reg as usize].set(unsafe {
+                    self.registers[reg as usize] = unsafe {
                         cpu::rdmsr(msr)
-                    });
-                    self.cached[idx].set(
-                        self.cached[idx].get() | (1 << bit));
+                    };
+                    self.cached[idx] |= 1 << bit;
                 }
             }
         }
 
         // Register is actively cached in the current register state
-        self.registers[reg as usize].get()
+        self.registers[reg as usize]
     }
 
     /// Set a register to the internal cache
     #[inline]
-    pub fn set_reg(&self, reg: Register, val: u64) {
+    pub fn set_reg(&mut self, reg: Register, val: u64) {
         let idx = reg as usize / 8;
         let bit = reg as usize % 8;
-        self.registers[reg as usize].set(val);
-        self.cached[idx].set(
-            self.cached[idx].get() | (1 << bit));
-        self.dirtied[idx].set(
-            self.dirtied[idx].get() | (1 << bit));
+        self.registers[reg as usize] = val;
+        self.cached[idx]  |= 1 << bit;
+        self.dirtied[idx] |= 1 << bit;
     }
 
     /// Set the fxsave state for the VM
@@ -749,14 +751,13 @@ impl RegisterState {
 
     /// Flush a register from the internal cache to the correct location
     #[inline]
-    fn flush_reg(&self, reg: usize) {
+    fn flush_reg(&mut self, reg: usize) {
         let idx = reg as usize / 8;
         let bit = reg as usize % 8;
 
-        if (self.dirtied[idx].get() & (1 << bit)) != 0 {
+        if (self.dirtied[idx] & (1 << bit)) != 0 {
             // Clear the dirtied bit
-            self.dirtied[idx].set(
-                self.dirtied[idx].get() & !(1 << bit));
+            self.dirtied[idx] &= !(1 << bit);
 
             // Register is not dirtied, we must get it from the guest state
             let (_, rt) = REG_TYPES[reg as usize];
@@ -768,26 +769,26 @@ impl RegisterState {
                     // Set the register in the VMCS
                     unsafe {
                         vmwrite(vmcs,
-                                self.registers[reg as usize].get());
+                                self.registers[reg as usize]);
                     }
                 }
                 RegType::Cr2 => {
                     // Sync only if different
-                    let val = self.registers[reg as usize].get();
+                    let val = self.registers[reg as usize];
                     if cpu::read_cr2() != val {
                         unsafe { cpu::write_cr2(val); }
                     }
                 }
                 RegType::Cr8 => {
                     // Sync only if different
-                    let val = self.registers[reg as usize].get();
+                    let val = self.registers[reg as usize];
                     if cpu::read_cr8() != val {
                         unsafe { cpu::write_cr8(val); }
                     }
                 }
                 RegType::Msr(msr) => {
                     // Sync only if different
-                    let val = self.registers[reg as usize].get();
+                    let val = self.registers[reg as usize];
                     unsafe {
                         if cpu::rdmsr(msr) != val {
                             cpu::wrmsr(msr, val);
@@ -1084,13 +1085,13 @@ impl Vm {
     
     /// Get a register
     #[inline]
-    pub fn reg(&self, reg: Register) -> u64 {
+    pub fn reg(&mut self, reg: Register) -> u64 {
         self.guest_regs.reg(reg)
     }
 
     /// Set a register to the internal cache
     #[inline]
-    pub fn set_reg(&self, reg: Register, val: u64) {
+    pub fn set_reg(&mut self, reg: Register, val: u64) {
         self.guest_regs.set_reg(reg, val);
     }
 
@@ -1128,13 +1129,13 @@ impl Vm {
     pub fn run(&mut self) -> (VmExit, u64) {
         unsafe {
             // Check if we need to switch to a different active VM 
-            if core!().current_vm_ptr().load(Ordering::SeqCst) !=
+            if core!().current_vm_ptr().load(SeqCst) !=
                     self.vmcs.phys_addr().0 {
                 // Set the current VM as the active VM
                 llvm_asm!("vmptrld ($0)" :: "r"(&self.vmcs.phys_addr()) :
                           "memory" : "volatile");
                 core!().current_vm_ptr().store(self.vmcs.phys_addr().0,
-                                               Ordering::SeqCst);
+                                               SeqCst);
             }
         }
 
@@ -1372,8 +1373,8 @@ impl Vm {
             }
             
             // Flush any registers which may have changed during execution
-            for (byte, status) in self.guest_regs.dirtied.iter().enumerate() {
-                let st = status.get();
+            let dirtied = self.guest_regs.dirtied;
+            for (byte, &st) in dirtied.iter().enumerate() {
                 if st == 0 { continue; }
                 for bit in 0..8 {
                     if (st & (1 << bit)) != 0 {
@@ -1517,7 +1518,7 @@ impl Vm {
 
             // Mark that nothing is cached anymore (dirtied is already clear
             // from the prior flushes)
-            self.guest_regs.cached.iter_mut().for_each(|x| x.set(0));
+            self.guest_regs.cached.iter_mut().for_each(|x| *x = 0);
 
             // Record the time spent in the VM
             vm_cycles = cpu::rdtsc() - it;

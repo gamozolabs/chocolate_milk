@@ -77,7 +77,8 @@ pub struct LockCell<T: ?Sized, I: InterruptState> {
     /// Value which is guarded by locks
     val: UnsafeCell<T>,
 }
-unsafe impl<T: ?Sized, I: InterruptState> Sync for LockCell<T, I> {}
+unsafe impl<T: ?Sized + Send, I: InterruptState> Send for LockCell<T, I> {}
+unsafe impl<T: ?Sized + Send, I: InterruptState> Sync for LockCell<T, I> {}
 
 impl<T, I: InterruptState> LockCell<T, I> {
     /// Move a `val` into a `LockCell`, a type which allows inner mutability

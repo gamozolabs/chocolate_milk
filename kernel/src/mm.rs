@@ -1,7 +1,7 @@
 //! The virtual and physical memory manager for the kernel
 
 use core::marker::PhantomData;
-use core::mem::{size_of, align_of};
+use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
 use core::alloc::{Layout, GlobalAlloc};
 use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
@@ -14,7 +14,6 @@ use rangeset::Range;
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::KERNEL_VMEM_BASE;
 use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
-use page_table::{PAGE_PRESENT, PAGE_WRITE, PAGE_NX};
 
 /// Table which is indexed by an APIC identifier to map to a physical range
 /// which is local to it its NUMA node
@@ -154,7 +153,7 @@ pub unsafe fn write_phys<T>(paddr: PhysAddr, val: T) {
 #[repr(C)]
 struct FreeListNode {
     /// Virtual address of the next `FreeListNode`
-    next: *mut FreeListNode,
+    next: usize,
 
     /// Number of free slots in `free_mem`
     free_slots: usize,
@@ -167,7 +166,7 @@ struct FreeListNode {
 /// table thingy.
 pub struct FreeList {
     /// Pointer to the first entry in the free list
-    head: *mut FreeListNode,
+    head: usize,
     
     /// Size of allocations (in bytes) for this free list
     size: usize,
@@ -182,13 +181,13 @@ impl FreeList {
             "Free list size must be a power of two");
         assert!(size >= size_of::<usize>(),
             "Free list size must be at least pointer width");
-        FreeList { head: core::ptr::null_mut(), size }
+        FreeList { head: 0, size }
     }
 
     /// Get a address from the free list
     pub unsafe fn pop(&mut self) -> *mut u8 {
         // If the free list is empty
-        if self.head.is_null() {
+        if self.head == 0 {
             if self.size <= 4096 {
                 // Special case, if the allocation fits within a page, we can
                 // directly return virtual addresses to our physical memory
@@ -261,7 +260,7 @@ impl FreeList {
             // our stack-based free list metadata
 
             // Save the current head (our new allocation)
-            let alc = self.head;
+            let alc = self.head as *mut FreeListNode;
 
             // Set the head to the next node
             self.head = (*alc).next;
@@ -269,7 +268,7 @@ impl FreeList {
             alc as *mut u8
         } else {
             // Get access to the free list stack
-            let fl = &mut *self.head;
+            let fl = &mut *(self.head as *mut FreeListNode);
 
             // Check if there are any addresses on the stack
             if fl.free_slots <
@@ -314,11 +313,12 @@ impl FreeList {
             (*vaddr).next = self.head;
 
             // Update the head
-            self.head = vaddr;
+            self.head = vaddr as usize;
         } else {
             // Check if there is room for this allocation in the free stack,
             // or if we need to create a new stack
-            if self.head.is_null() || (*self.head).free_slots == 0 {
+            if self.head == 0 ||
+                    (*(self.head as *const FreeListNode)).free_slots == 0 {
                 // No free slots, create a new stack out of the freed vaddr
                 let vaddr = &mut *(vaddr as *mut FreeListNode);
 
@@ -333,10 +333,10 @@ impl FreeList {
                 vaddr.next = self.head;
 
                 // Establish this as the new free list head
-                self.head = vaddr;
+                self.head = vaddr as *mut FreeListNode as usize;
             } else {
                 // There's room in the current stack, just throw us in there
-                let fl = &mut *self.head;
+                let fl = &mut *(self.head as *mut FreeListNode);
 
                 // Decrement the number of free slots
                 fl.free_slots -= 1;
@@ -491,52 +491,25 @@ impl<T> PhysContig<T> {
     /// move `val` into it
     pub fn new(val: T) -> PhysContig<T> {
         assert!(size_of::<T>() > 0, "Cannot use ZST for PhysContig");
+        assert!(size_of::<T>() <= 4096, "Size too large for PhysContig");
 
-        // If the allocation is smaller than 4 KiB, then round it up to 4 KiB.
-        // This allows us to take advantage of our page free lists, and
-        // relieves some pressure on the physical memory allocator as the free
-        // lists are per-core and do not require a global lock.
-        let alc_size = core::cmp::max(4096, size_of::<T>());
-
-        // Get access to physical memory allocations
-        let mut pmem = PhysicalMemory;
-
-        // Allocate physical memory for this allocation which is minimum
-        // 4 KiB aligned
-        let paddr = pmem.alloc_phys(Layout::from_size_align(
-            alc_size, core::cmp::max(4096, align_of::<T>())).unwrap())
-            .unwrap();
-        
-        // Allocate a virtual address for this mapping
-        let vaddr = alloc_virt_addr_4k(alc_size as u64);
-        
-        // Get access to the current page table
-        let mut page_table = core!().boot_args.page_table.lock();
-        let page_table = page_table.as_mut().unwrap();
-
-        // Map in each page from the allocation
-        for offset in (0..alc_size as u64).step_by(4096) {
-            unsafe {
-                // Map the memory as RW
-                page_table.map_raw(&mut pmem, VirtAddr(vaddr.0 + offset),
-                                   PageType::Page4K,
-                                   (paddr.0 + offset) | PAGE_NX | PAGE_WRITE | 
-                                   PAGE_PRESENT)
-                    .expect("Failed to map PhysContig memory");
-
-            }
-        }
-        
         unsafe {
-            // Initialize the memory
-            core::ptr::write(vaddr.0 as *mut T, val);
-        }
+            // Allocate a 4 KiB page
+            let alloc = GLOBAL_ALLOCATOR.alloc(
+                Layout::from_size_align(4096, 4096).unwrap());
 
-        // Create the `PhysContig` structure
-        PhysContig {
-            vaddr,
-            paddr,
-            _phantom: PhantomData,
+            // Compute the physical address of this allocation
+            let paddr = PhysAddr(alloc as u64 - KERNEL_PHYS_WINDOW_BASE);
+
+            // Initialize the memory to `val`
+            core::ptr::write(alloc as *mut T, val);
+
+            // Create the `PhysContig` structure
+            PhysContig {
+                vaddr:    VirtAddr(alloc as u64),
+                paddr:    paddr,
+                _phantom: PhantomData,
+            }
         }
     }
 
@@ -548,7 +521,10 @@ impl<T> PhysContig<T> {
 
 impl<T> Drop for PhysContig<T> {
     fn drop(&mut self) {
-        unimplemented!("PhysContig drop");
+        unsafe {
+            GLOBAL_ALLOCATOR.dealloc(self.vaddr.0 as *mut u8,
+                Layout::from_size_align(4096, 4096).unwrap());
+        }
     }
 }
 

@@ -72,7 +72,7 @@ primitive!(i32);
 primitive!(i64);
 primitive!(i128);
 
-pub trait Enlightenment {
+pub trait Enlightenment: Send + Sync {
     /// Request that enlightenment returns the module list for the current
     /// execution state of the worker
     ///
@@ -218,22 +218,74 @@ struct NetBacking<'a> {
     phys_ranges: BTreeMap<u64, (usize, u64)>,
 }
 
-/// A VM worker which is likely part of a large fuzzing group
-pub struct Worker<'a> {
-    /// Master worker that we are forked from
-    master: Option<Arc<Self>>,
-
-    /// The enlightenment which can be used to resolve OS-specific information
-    enlightenment: Option<Box<dyn Enlightenment>>,
+struct Backing<'a> {
+    /// A master to this backing
+    master: Option<Arc<Backing<'a>>>,
 
     /// Network mapped memory for the VM
     network_mem: Option<Arc<NetBacking<'a>>>,
+    
+    /// Raw virtual machine that this worker uses
+    pub vm: Vm,
+}
+
+impl<'a> Backing<'a> {
+    /// Attempts to get a slice to the page backing `gpaddr` in host
+    /// addressable memory
+    fn get_page(&self, gpaddr: PhysAddr) -> Option<VirtAddr> {
+        // Validate alignment
+        assert!(gpaddr.0 & 0xfff == 0,
+                "get_page() requires an aligned guest physical address");
+
+        // Attempt to translate the page, it is possible it has not yet been
+        // mapped and we need to page it in from the network mapped storage in
+        // the `FuzzTarget`
+        let translation = self.vm.ept().translate(gpaddr);
+        if let Some(Mapping { page: Some(orig_page), .. }) = translation {
+            Some(VirtAddr(unsafe {
+                mm::slice_phys_mut(orig_page.0, 4096).as_ptr() as u64
+            }))
+        } else {
+            if let Some(master) = &self.master {
+                master.get_page(gpaddr)
+            } else if let Some(netmem) = &self.network_mem {
+                // Find the region which may contain our address
+                let (phys_base, (offset, end)) = netmem.phys_ranges
+                    .range(..=gpaddr.0).next_back()?;
+
+                // Make sure our address falls in the region
+                if gpaddr.0 < *phys_base || gpaddr.0 > *end {
+                    return None;
+                }
+
+                // Compute the offset into the memory based on our offset into
+                // the region
+                let offset = offset
+                    .checked_add((gpaddr.0 - phys_base) as usize)?;
+                assert!(offset & 0xfff == 0, "Whoa, page offset not aligned");
+
+                // Get a slice to the memory backing this requested region
+                let data = netmem.memory.get(offset..offset + 4096)?;
+                Some(VirtAddr(data.as_ptr() as u64))
+            } else {
+                // Nobody can provide the memory for us, it's not present
+                None
+            }
+        }
+    }
+}
+
+/// A VM worker which is likely part of a large fuzzing group
+pub struct Worker<'a> {
+    /// The enlightenment which can be used to resolve OS-specific information
+    enlightenment: Option<Box<dyn Enlightenment>>,
+
+    /// The backing of the VM, this has the registers and memory for the
+    /// worker
+    backing: Backing<'a>,
 
     /// The fuzz session this worker belongs to
     session: Option<Arc<FuzzSession<'a>>>,
-
-    /// Raw virtual machine that this worker uses
-    pub vm: Vm,
     
     /// Random number generator seed
     pub rng: Rng,
@@ -264,15 +316,24 @@ pub struct Worker<'a> {
 
     /// Page modification log of dirtied physical memory pages
     pml: Vec<u64>,
+
+    /// Guest physical addresses of memory which is used for page table
+    /// metadata. This allows us to make sure we never map it as writable so
+    /// we can hook all page table changes
+    /// Addresses reference their refcounts, which tracks the number of uses
+    /// of that page as metadata
+    page_metadata: RefCell<BTreeMap<PhysAddr, usize>>,
 }
 
 impl<'a> Worker<'a> {
     /// Create a new empty VM from network backed memory
     fn from_net(memory: Arc<NetBacking<'a>>) -> Self {
         Worker {
-            master:         None,
-            network_mem:    Some(memory),
-            vm:             Vm::new(),
+            backing: Backing {
+                master:      None,
+                network_mem: Some(memory),
+                vm:          Vm::new(),
+            },
             rng:            Rng::new(),
             stats:          Statistics::default(),
             sync:           0,
@@ -284,12 +345,13 @@ impl<'a> Worker<'a> {
             hasher:         FalkHasher::new(),
             enlightenment:  None,
             pml:            Vec::new(),
+            page_metadata:  Default::default(),
         }
     }
     
     /// Create a new VM forked from a master
     fn fork(session: Arc<FuzzSession<'a>>,
-            master: Arc<Self>, worker_id: u64) -> Self {
+            master: Arc<Backing<'a>>, worker_id: u64) -> Self {
         // Create a new VM with the masters guest registers as the current
         // register state
         let mut vm = Vm::new();
@@ -297,9 +359,11 @@ impl<'a> Worker<'a> {
 
         // Create the new VM referencing the master
         Worker {
-            master:         Some(master),
-            network_mem:    None,
-            vm:             vm,
+            backing: Backing {
+                master:      Some(master),
+                network_mem: None,
+                vm:          Vm::new(),
+            },
             rng:            Rng::new(),
             stats:          Statistics::default(),
             sync:           0,
@@ -311,24 +375,37 @@ impl<'a> Worker<'a> {
             hasher:         FalkHasher::new(),
             enlightenment:  None,
             pml:            Vec::new(),
+            page_metadata:  Default::default(),
         }
+    }
+    
+    /// Get a register from the guest VM context
+    #[inline]
+    pub fn reg(&mut self, reg: Register) -> u64 {
+        self.backing.vm.reg(reg)
+    }
+    
+    /// Set a register in the guest VM context
+    #[inline]
+    pub fn set_reg(&mut self, reg: Register, val: u64) {
+        self.backing.vm.set_reg(reg, val)
     }
 
     /// Get the current CPL
     #[inline]
-    pub fn cpl(&self) -> u8 {
-        (self.vm.reg(Register::Cs) as u8) & 3
+    pub fn cpl(&mut self) -> u8 {
+        (self.reg(Register::Cs) as u8) & 3
     }
 
     /// Get a unique context identifier
     /// The kernel will always resolve to !0, if we're not in kernel mode then
     /// we will use the current cr3
     #[inline]
-    pub fn context_id(&self) -> u64 {
+    pub fn context_id(&mut self) -> u64 {
         if self.cpl() == 0 {
             !0
         } else {
-            self.vm.reg(Register::Cr3) & 0xffffffffff000
+            self.reg(Register::Cr3) & 0xffffffffff000
         }
     }
 
@@ -365,7 +442,8 @@ impl<'a> Worker<'a> {
         let session = self.session.as_ref().unwrap().clone();
 
         // Get access to the master
-        let master = self.master.as_ref().expect("Cannot fuzz without master");
+        let master =
+            self.backing.master.as_ref().expect("Cannot fuzz without master");
 
         // Reset memory to its original state
         for &paddr in self.pml.iter() {
@@ -376,7 +454,8 @@ impl<'a> Worker<'a> {
                 .expect("Dirtied page without master!?");
             
             // Get our page and clear dirty bits in the page table
-            let page = self.vm.ept_mut().translate_int(paddr, false, true);
+            let page = self.backing.vm.ept_mut()
+                .translate_int(paddr, false, true);
             let page = page.unwrap().page.unwrap().0;
 
             // Convert this physical address into a virtual address
@@ -384,7 +463,7 @@ impl<'a> Worker<'a> {
 
             // Set that the EPT TLB must be invalidated (since we changed dirty
             // bit states)
-            self.vm.ept_dirty = true;
+            self.backing.vm.ept_dirty = true;
 
             unsafe {
                 // Copy the original page into the modified copy of the page
@@ -405,11 +484,27 @@ impl<'a> Worker<'a> {
         self.pml.clear();
        
         // Load the original snapshot registers
-        self.vm.guest_regs.copy_from(&master.vm.guest_regs);
+        self.backing.vm.guest_regs.copy_from(&master.vm.guest_regs);
 
         // Reset the VMCS state, this also invalidates the TLB entries since
         // we have now changed the paging structures with EPT above
-        self.vm.reset();
+        self.backing.vm.reset();
+
+        // Clear metadata
+        self.page_metadata.borrow_mut().clear();
+
+        /*
+        translate_64_4_level_metadata(self.reg(Register::Cr3), !0, |paddr| {
+            unsafe {
+                Some(core::slice::from_raw_parts(
+                        self.backing.get_page(paddr)?.0 as *const u8,
+                        4096))
+            }
+        }, &mut |metadata| {
+            // Update the reference count for this metadata page
+            *self.page_metadata.borrow_mut().entry(metadata).or_insert(0) += 1;
+        });
+        panic!("DONE {}", self.page_metadata.borrow().len());*/
 
         self.stats.reset_cycles += cpu::rdtsc() - it;
 
@@ -428,17 +523,17 @@ impl<'a> Worker<'a> {
 
             // Set the pre-emption timer for randomly breaking into the VM
             // to enforce timeouts
-            self.vm.preemption_timer = None; //Some(3);
+            self.backing.vm.preemption_timer = None; //Some(3);
 
             // Run the VM until a VM exit
-            let (vmexit, vm_cycles) = self.vm.run();
+            let (vmexit, vm_cycles) = self.backing.vm.run();
             self.stats.vm_exits += 1;
             self.stats.vm_cycles += vm_cycles;
 
             // Closure to invoke if we want to report new coverage
             let mut report_coverage = || {
-                let mut modoff =
-                    self.resolve_module(self.vm.reg(Register::Rip));
+                let rip = self.reg(Register::Rip);
+                let mut modoff = self.resolve_module(rip);
 
                 if modoff.0.is_none() && self.enlightenment.is_some() {
                     // Get the current context ID
@@ -456,8 +551,7 @@ impl<'a> Worker<'a> {
                             self.module_list.insert(pt, ml);
                         
                             // Re-resolve the module + offset
-                            modoff = self.resolve_module(
-                                self.vm.reg(Register::Rip));
+                            modoff = self.resolve_module(rip);
                         }
 
                         self.enlightenment = Some(enl);
@@ -474,11 +568,11 @@ impl<'a> Worker<'a> {
 
             match vmexit {
                 VmExit::Rdtsc { inst_len } => {
-                    self.vm.set_reg(Register::Rax, 0);
-                    self.vm.set_reg(Register::Rdx, 0);
+                    self.set_reg(Register::Rax, 0);
+                    self.set_reg(Register::Rdx, 0);
 
-                    self.vm.set_reg(Register::Rip,
-                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    let rip = self.reg(Register::Rip);
+                    self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
                 VmExit::EptViolation { addr, read, write, exec } => {
@@ -488,10 +582,10 @@ impl<'a> Worker<'a> {
                 }
                 VmExit::PmlFull => {
                     // Log the PML buffer to our growable buffer
-                    self.pml.extend_from_slice(self.vm.pml());
+                    self.pml.extend_from_slice(self.backing.vm.pml());
 
                     // Reset the PML to empty
-                    self.vm.set_reg(Register::PmlIndex, 511);
+                    self.set_reg(Register::PmlIndex, 511);
                     continue 'vm_loop;
                 }
                 VmExit::ExternalInterrupt => {
@@ -507,122 +601,122 @@ impl<'a> Worker<'a> {
                 }
                 VmExit::ReadMsr { inst_len } => {
                     // Get the MSR ID we're reading
-                    let msr = self.vm.reg(Register::Rcx);
+                    let msr = self.reg(Register::Rcx);
 
                     // Get the MSR value
                     let val = match msr as u32 {
-                        IA32_FS_BASE => self.vm.reg(Register::FsBase),
-                        IA32_GS_BASE => self.vm.reg(Register::GsBase),
+                        IA32_FS_BASE => self.reg(Register::FsBase),
+                        IA32_GS_BASE => self.reg(Register::GsBase),
                         IA32_KERNEL_GS_BASE => {
-                            self.vm.reg(Register::KernelGsBase)
+                            self.reg(Register::KernelGsBase)
                         }
                         _ => panic!("Unexpected MSR read {:#x} @ {:#x}\n",
-                                    msr, self.vm.reg(Register::Rip)),
+                                    msr, self.reg(Register::Rip)),
                     };
 
                     // Set the low and high parts of the result
-                    self.vm.set_reg(Register::Rax, (val >>  0) as u32 as u64);
-                    self.vm.set_reg(Register::Rdx, (val >> 32) as u32 as u64);
+                    self.set_reg(Register::Rax, (val >>  0) as u32 as u64);
+                    self.set_reg(Register::Rdx, (val >> 32) as u32 as u64);
 
-                    self.vm.set_reg(Register::Rip,
-                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    let rip = self.reg(Register::Rip);
+                    self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
                 VmExit::WriteMsr { inst_len } => {
                     // Get the MSR ID we're writing
-                    let msr = self.vm.reg(Register::Rcx);
+                    let msr = self.reg(Register::Rcx);
 
                     // Get the value we're writing
-                    let val = (self.vm.reg(Register::Rdx) << 32) |
-                        self.vm.reg(Register::Rax);
+                    let val = (self.reg(Register::Rdx) << 32) |
+                        self.reg(Register::Rax);
 
                     // Get the MSR value
                     match msr as u32 {
                         IA32_FS_BASE => {
-                            self.vm.set_reg(Register::FsBase, val);
+                            self.set_reg(Register::FsBase, val);
                         }
                         IA32_GS_BASE => {
-                            self.vm.set_reg(Register::GsBase, val);
+                            self.set_reg(Register::GsBase, val);
                         }
                         IA32_KERNEL_GS_BASE => {
-                            self.vm.set_reg(Register::KernelGsBase, val);
+                            self.set_reg(Register::KernelGsBase, val);
                         }
                         _ => panic!("Unexpected MSR write {:#x} @ {:#x}\n",
-                                    msr, self.vm.reg(Register::Rip)),
+                                    msr, self.reg(Register::Rip)),
                     }
 
                     // Advance PC
-                    self.vm.set_reg(Register::Rip,
-                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    let rip = self.reg(Register::Rip);
+                    self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
                 VmExit::WriteCr { cr, gpr, inst_len } => {
                     // Get the GPR source for the write
                     let gpr = match gpr {
-                         0 => self.vm.reg(Register::Rax),
-                         1 => self.vm.reg(Register::Rcx),
-                         2 => self.vm.reg(Register::Rdx),
-                         3 => self.vm.reg(Register::Rbx),
-                         4 => self.vm.reg(Register::Rsp),
-                         5 => self.vm.reg(Register::Rbp),
-                         6 => self.vm.reg(Register::Rsi),
-                         7 => self.vm.reg(Register::Rdi),
-                         8 => self.vm.reg(Register::R8),
-                         9 => self.vm.reg(Register::R9),
-                        10 => self.vm.reg(Register::R10),
-                        11 => self.vm.reg(Register::R11),
-                        12 => self.vm.reg(Register::R12),
-                        13 => self.vm.reg(Register::R13),
-                        14 => self.vm.reg(Register::R14),
-                        15 => self.vm.reg(Register::R15),
+                         0 => self.reg(Register::Rax),
+                         1 => self.reg(Register::Rcx),
+                         2 => self.reg(Register::Rdx),
+                         3 => self.reg(Register::Rbx),
+                         4 => self.reg(Register::Rsp),
+                         5 => self.reg(Register::Rbp),
+                         6 => self.reg(Register::Rsi),
+                         7 => self.reg(Register::Rdi),
+                         8 => self.reg(Register::R8),
+                         9 => self.reg(Register::R9),
+                        10 => self.reg(Register::R10),
+                        11 => self.reg(Register::R11),
+                        12 => self.reg(Register::R12),
+                        13 => self.reg(Register::R13),
+                        14 => self.reg(Register::R14),
+                        15 => self.reg(Register::R15),
                         _ => panic!("Invalid GPR for write CR"),
                     };
 
                     // Update the CR
                     match cr {
-                        0 => self.vm.set_reg(Register::Cr0, gpr),
-                        3 => self.vm.set_reg(Register::Cr3, gpr),
-                        4 => self.vm.set_reg(Register::Cr4, gpr),
+                        0 => self.set_reg(Register::Cr0, gpr),
+                        3 => self.set_reg(Register::Cr3, gpr),
+                        4 => self.set_reg(Register::Cr4, gpr),
                         _ => panic!("Invalid CR register for write CR"),
                     }
                     
                     // Advance RIP to the next instruction
-                    self.vm.set_reg(Register::Rip,
-                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    let rip = self.reg(Register::Rip);
+                    self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
                 VmExit::ReadCr { cr, gpr, inst_len } => {
                     // Get the CR that should be read
                     let cr = match cr {
-                        0 => self.vm.reg(Register::Cr0),
-                        3 => self.vm.reg(Register::Cr3),
-                        4 => self.vm.reg(Register::Cr4),
+                        0 => self.reg(Register::Cr0),
+                        3 => self.reg(Register::Cr3),
+                        4 => self.reg(Register::Cr4),
                         _ => panic!("Invalid CR register for read CR"),
                     };
 
                     match gpr {
-                         0 => self.vm.set_reg(Register::Rax, cr),
-                         1 => self.vm.set_reg(Register::Rcx, cr),
-                         2 => self.vm.set_reg(Register::Rdx, cr),
-                         3 => self.vm.set_reg(Register::Rbx, cr),
-                         4 => self.vm.set_reg(Register::Rsp, cr),
-                         5 => self.vm.set_reg(Register::Rbp, cr),
-                         6 => self.vm.set_reg(Register::Rsi, cr),
-                         7 => self.vm.set_reg(Register::Rdi, cr),
-                         8 => self.vm.set_reg(Register::R8,  cr),
-                         9 => self.vm.set_reg(Register::R9,  cr),
-                        10 => self.vm.set_reg(Register::R10, cr),
-                        11 => self.vm.set_reg(Register::R11, cr),
-                        12 => self.vm.set_reg(Register::R12, cr),
-                        13 => self.vm.set_reg(Register::R13, cr),
-                        14 => self.vm.set_reg(Register::R14, cr),
-                        15 => self.vm.set_reg(Register::R15, cr),
+                         0 => self.set_reg(Register::Rax, cr),
+                         1 => self.set_reg(Register::Rcx, cr),
+                         2 => self.set_reg(Register::Rdx, cr),
+                         3 => self.set_reg(Register::Rbx, cr),
+                         4 => self.set_reg(Register::Rsp, cr),
+                         5 => self.set_reg(Register::Rbp, cr),
+                         6 => self.set_reg(Register::Rsi, cr),
+                         7 => self.set_reg(Register::Rdi, cr),
+                         8 => self.set_reg(Register::R8,  cr),
+                         9 => self.set_reg(Register::R9,  cr),
+                        10 => self.set_reg(Register::R10, cr),
+                        11 => self.set_reg(Register::R11, cr),
+                        12 => self.set_reg(Register::R12, cr),
+                        13 => self.set_reg(Register::R13, cr),
+                        14 => self.set_reg(Register::R14, cr),
+                        15 => self.set_reg(Register::R15, cr),
                         _ => panic!("Invalid GPR for read CR"),
                     }
 
                     // Advance RIP to the next instruction
-                    self.vm.set_reg(Register::Rip,
-                        self.vm.reg(Register::Rip).wrapping_add(inst_len));
+                    let rip = self.reg(Register::Rip);
+                    self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
                 VmExit::PreemptionTimer => {
@@ -651,8 +745,9 @@ impl<'a> Worker<'a> {
         // become zero, causing us to extend the _entire_ size of thet PML,
         // which is the correct behavior
         let pml_index =
-            (self.vm.reg(Register::PmlIndex) as u16).wrapping_add(1);
-        self.pml.extend_from_slice(&self.vm.pml()[pml_index as usize..]);
+            (self.reg(Register::PmlIndex) as u16).wrapping_add(1);
+        self.pml.extend_from_slice(
+            &self.backing.vm.pml()[pml_index as usize..]);
 
         // Update number of fuzz cases
         self.stats.fuzz_cases += 1;
@@ -675,7 +770,7 @@ impl<'a> Worker<'a> {
 
     /// Attempt to resolve the `addr` into a module + offset based on the
     /// current `module_list`
-    pub fn resolve_module(&self, addr: u64) -> (Option<Arc<String>>, u64) {
+    pub fn resolve_module(&mut self, addr: u64) -> (Option<Arc<String>>, u64) {
         // Get the current context id
         let pt = self.context_id();
 
@@ -697,14 +792,14 @@ impl<'a> Worker<'a> {
     }
 
     /// Get the base address for a given segment
-    pub fn seg_base(&self, segment: Segment) -> u64 {
+    pub fn seg_base(&mut self, segment: Segment) -> u64 {
         match segment {
-            Segment::Es => self.vm.reg(Register::EsBase),
-            Segment::Ds => self.vm.reg(Register::DsBase),
-            Segment::Fs => self.vm.reg(Register::FsBase),
-            Segment::Gs => self.vm.reg(Register::GsBase),
-            Segment::Ss => self.vm.reg(Register::SsBase),
-            Segment::Cs => self.vm.reg(Register::CsBase),
+            Segment::Es => self.reg(Register::EsBase),
+            Segment::Ds => self.reg(Register::DsBase),
+            Segment::Fs => self.reg(Register::FsBase),
+            Segment::Gs => self.reg(Register::GsBase),
+            Segment::Ss => self.reg(Register::SsBase),
+            Segment::Cs => self.reg(Register::CsBase),
         }
     }
 
@@ -861,10 +956,10 @@ impl<'a> Worker<'a> {
     }
 
     /// Gets the current paging mode of the system
-    pub fn paging_mode(&self) -> Option<PagingMode> {
-        let cr0  = self.vm.reg(Register::Cr0);
-        let cr4  = self.vm.reg(Register::Cr4);
-        let efer = self.vm.reg(Register::Efer);
+    pub fn paging_mode(&mut self) -> Option<PagingMode> {
+        let cr0  = self.reg(Register::Cr0);
+        let cr4  = self.reg(Register::Cr4);
+        let efer = self.reg(Register::Efer);
 
         if cr0 & (1 << 31) == 0 {
             // Paging disabled
@@ -896,7 +991,8 @@ impl<'a> Worker<'a> {
     /// Reads the contents at `vaddr` into a `T` which implements `Primitive`
     /// using the current active page table
     pub fn read_virt<T: Primitive>(&mut self, vaddr: VirtAddr) -> Option<T> {
-        self.read_virt_cr3(vaddr, self.vm.reg(Register::Cr3))
+        let cr3 = self.reg(Register::Cr3);
+        self.read_virt_cr3(vaddr, cr3)
     }
     
     /// Reads the contents at `vaddr` into a `T` which implements `Primitive`
@@ -915,7 +1011,8 @@ impl<'a> Worker<'a> {
     /// that some reading did occur, but is partial.
     pub fn read_virt_into(&mut self, vaddr: VirtAddr,
                           buf: &mut [u8]) -> Option<()> {
-        self.read_virt_cr3_into(vaddr, buf, self.vm.reg(Register::Cr3))
+        let cr3 = self.reg(Register::Cr3);
+        self.read_virt_cr3_into(vaddr, buf, cr3)
     }
     
     /// Read the contents of the guest virtual memory at `vaddr` into the
@@ -925,9 +1022,10 @@ impl<'a> Worker<'a> {
     /// that some reading did occur, but is partial.
     pub fn read_virt_cr3_into(&mut self, vaddr: VirtAddr,
                               buf: &mut [u8], cr3: u64) -> Option<()> {
+        let mode = self.paging_mode()?;
         self.read_addr(Address::Linear {
             addr: vaddr.0,
-            mode: self.paging_mode()?,
+            mode: mode,
             cr3:  cr3,
         }, buf)
     }
@@ -939,9 +1037,10 @@ impl<'a> Worker<'a> {
     /// that some reading did occur, but is partial.
     pub fn write_virt_cr3_from(&mut self, vaddr: VirtAddr,
                                buf: &[u8], cr3: u64) -> Option<()> {
+        let mode = self.paging_mode()?;
         self.write_addr(Address::Linear {
             addr: vaddr.0,
-            mode: self.paging_mode()?,
+            mode: mode,
             cr3:  cr3,
         }, buf)
     }
@@ -1036,50 +1135,6 @@ impl<'a> Worker<'a> {
         Some(())
     }
 
-    /// Attempts to get a slice to the page backing `gpaddr` in host
-    /// addressable memory
-    fn get_page(&self, gpaddr: PhysAddr) -> Option<VirtAddr> {
-        // Validate alignment
-        assert!(gpaddr.0 & 0xfff == 0,
-                "get_page() requires an aligned guest physical address");
-
-        // Attempt to translate the page, it is possible it has not yet been
-        // mapped and we need to page it in from the network mapped storage in
-        // the `FuzzTarget`
-        let translation = self.vm.ept().translate(gpaddr);
-        if let Some(Mapping { page: Some(orig_page), .. }) = translation {
-            Some(VirtAddr(unsafe {
-                mm::slice_phys_mut(orig_page.0, 4096).as_ptr() as u64
-            }))
-        } else {
-            if let Some(master) = &self.master {
-                master.get_page(gpaddr)
-            } else if let Some(netmem) = &self.network_mem {
-                // Find the region which may contain our address
-                let (phys_base, (offset, end)) = netmem.phys_ranges
-                    .range(..=gpaddr.0).next_back()?;
-
-                // Make sure our address falls in the region
-                if gpaddr.0 < *phys_base || gpaddr.0 > *end {
-                    return None;
-                }
-
-                // Compute the offset into the memory based on our offset into
-                // the region
-                let offset = offset
-                    .checked_add((gpaddr.0 - phys_base) as usize)?;
-                assert!(offset & 0xfff == 0, "Whoa, page offset not aligned");
-
-                // Get a slice to the memory backing this requested region
-                let data = netmem.memory.get(offset..offset + 4096)?;
-                Some(VirtAddr(data.as_ptr() as u64))
-            } else {
-                // Nobody can provide the memory for us, it's not present
-                None
-            }
-        }
-    }
-
     /// Translate a physical address for the guest into a physical address on
     /// the host. If `write` is set, the translation will occur for a write
     /// access, and thus the copy-on-write will be performed on the page if
@@ -1104,9 +1159,9 @@ impl<'a> Worker<'a> {
         // mapped and we need to page it in from the network mapped storage in
         // the `FuzzTarget`
         let translation = if !write {
-            self.vm.ept().translate(align_gpaddr)
+            self.backing.vm.ept().translate(align_gpaddr)
         } else {
-            self.vm.ept_mut().translate_int(align_gpaddr, write, false)
+            self.backing.vm.ept_mut().translate_int(align_gpaddr, write, false)
         };
         
         // First, determine if we need to perform a CoW or make a mapping for
@@ -1131,7 +1186,7 @@ impl<'a> Worker<'a> {
                         
                         // Set that the TLB should be flushed on next VM entry
                         // as we changed dirty bits
-                        self.vm.ept_dirty = true;
+                        self.backing.vm.ept_dirty = true;
                     }
                 }
 
@@ -1142,11 +1197,11 @@ impl<'a> Worker<'a> {
         // At this stage, we either must perform a CoW or map an unmapped page
 
         // Get the original contents of the page
-        let orig_page_gpaddr = if let Some(master) = &self.master {
+        let orig_page_gpaddr = if let Some(master) = &self.backing.master {
             // Get the page from the master
             master.get_page(align_gpaddr)?
-        } else if let Some(_) = &self.network_mem {
-            self.get_page(align_gpaddr)?
+        } else if let Some(_) = &self.backing.network_mem {
+            self.backing.get_page(align_gpaddr)?
         } else {
             // Page is not present, and cannot be filled from the master or
             // network memory
@@ -1203,7 +1258,7 @@ impl<'a> Worker<'a> {
 
                 // Mapping changed, we must invalidate the TLB on next VM
                 // entry
-                self.vm.ept_dirty = true;
+                self.backing.vm.ept_dirty = true;
             }
 
             page
@@ -1226,7 +1281,7 @@ impl<'a> Worker<'a> {
                 unsafe {
                     // Map in the page as RWX, WB, and already dirtied and
                     // accessed (since we're getting write access to it)
-                    self.vm.ept_mut().map_raw(align_gpaddr,
+                    self.backing.vm.ept_mut().map_raw(align_gpaddr,
                         PageType::Page4K,
                         page.0 | EPT_READ | EPT_WRITE | EPT_EXEC |
                         EPT_USER_EXEC | EPT_MEMTYPE_WB | EPT_DIRTY |
@@ -1246,7 +1301,8 @@ impl<'a> Worker<'a> {
                 
                 unsafe {
                     // Map in the page as read-only into the guest page table
-                    self.vm.ept_mut().map_raw(align_gpaddr, PageType::Page4K,
+                    self.backing.vm.ept_mut().map_raw(align_gpaddr,
+                        PageType::Page4K,
                         orig_page.0 | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
                         EPT_MEMTYPE_WB)
                         .unwrap();
@@ -1270,7 +1326,7 @@ type VmExitFilter<'a> = fn(&mut Worker<'a>, &VmExit) -> bool;
 /// A session for multiple workers to fuzz a shared job
 pub struct FuzzSession<'a> {
     /// Master VM state
-    master_vm: Arc<Worker<'a>>,
+    master_vm: Arc<Backing<'a>>,
 
     /// Timeout for each fuzz case
     timeout: Option<u64>,
@@ -1313,8 +1369,9 @@ pub struct FuzzSession<'a> {
 
 impl<'a> FuzzSession<'a> {
     /// Create a new empty fuzz session
-    pub fn from_falkdump<S>(server: &str, name: S) -> Self
-            where S: AsRef<str> {
+    pub fn from_falkdump<S, F>(server: &str, name: S, init_master: F) -> Self
+            where F: FnOnce(&mut Worker),
+                  S: AsRef<str> {
         macro_rules! consume {
             ($ptr:expr, $ty:ty) => {{
                 let ret = <$ty>::from_le_bytes(
@@ -1365,113 +1422,113 @@ impl<'a> FuzzSession<'a> {
         let mut ptr = &netbacking.memory[16..16 + regs_size as usize];
         let _version = consume!(ptr, u32);
         let _size    = consume!(ptr, u32);
-        master.vm.set_reg(Register::Rax, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rbx, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rcx, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rdx, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rsi, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rdi, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rsp, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rbp, consume!(ptr, u64));
-        master.vm.set_reg(Register::R8 , consume!(ptr, u64));
-        master.vm.set_reg(Register::R9 , consume!(ptr, u64));
-        master.vm.set_reg(Register::R10, consume!(ptr, u64));
-        master.vm.set_reg(Register::R11, consume!(ptr, u64));
-        master.vm.set_reg(Register::R12, consume!(ptr, u64));
-        master.vm.set_reg(Register::R13, consume!(ptr, u64));
-        master.vm.set_reg(Register::R14, consume!(ptr, u64));
-        master.vm.set_reg(Register::R15, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rip, consume!(ptr, u64));
-        master.vm.set_reg(Register::Rflags, consume!(ptr, u64));
+        master.set_reg(Register::Rax, consume!(ptr, u64));
+        master.set_reg(Register::Rbx, consume!(ptr, u64));
+        master.set_reg(Register::Rcx, consume!(ptr, u64));
+        master.set_reg(Register::Rdx, consume!(ptr, u64));
+        master.set_reg(Register::Rsi, consume!(ptr, u64));
+        master.set_reg(Register::Rdi, consume!(ptr, u64));
+        master.set_reg(Register::Rsp, consume!(ptr, u64));
+        master.set_reg(Register::Rbp, consume!(ptr, u64));
+        master.set_reg(Register::R8 , consume!(ptr, u64));
+        master.set_reg(Register::R9 , consume!(ptr, u64));
+        master.set_reg(Register::R10, consume!(ptr, u64));
+        master.set_reg(Register::R11, consume!(ptr, u64));
+        master.set_reg(Register::R12, consume!(ptr, u64));
+        master.set_reg(Register::R13, consume!(ptr, u64));
+        master.set_reg(Register::R14, consume!(ptr, u64));
+        master.set_reg(Register::R15, consume!(ptr, u64));
+        master.set_reg(Register::Rip, consume!(ptr, u64));
+        master.set_reg(Register::Rflags, consume!(ptr, u64));
 
-        master.vm.set_reg(Register::Cs,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::CsLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::CsAccessRights,
+        master.set_reg(Register::Cs,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::CsLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::CsAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::CsBase, consume!(ptr, u64));
+        master.set_reg(Register::CsBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Ds,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::DsLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::DsAccessRights,
+        master.set_reg(Register::Ds,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::DsLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::DsAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::DsBase, consume!(ptr, u64));
+        master.set_reg(Register::DsBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Es,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::EsLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::EsAccessRights,
+        master.set_reg(Register::Es,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::EsLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::EsAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::EsBase, consume!(ptr, u64));
+        master.set_reg(Register::EsBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Fs,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::FsLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::FsAccessRights,
+        master.set_reg(Register::Fs,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::FsLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::FsAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::FsBase, consume!(ptr, u64));
+        master.set_reg(Register::FsBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Gs,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::GsLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::GsAccessRights,
+        master.set_reg(Register::Gs,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::GsLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::GsAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::GsBase, consume!(ptr, u64));
+        master.set_reg(Register::GsBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Ss,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::SsLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::SsAccessRights,
+        master.set_reg(Register::Ss,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::SsLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::SsAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::SsBase, consume!(ptr, u64));
+        master.set_reg(Register::SsBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Ldtr,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::LdtrLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::LdtrAccessRights,
+        master.set_reg(Register::Ldtr,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::LdtrLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::LdtrAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::LdtrBase, consume!(ptr, u64));
+        master.set_reg(Register::LdtrBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Tr,      consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::TrLimit, consume!(ptr, u32) as u64);
-        master.vm.set_reg(Register::TrAccessRights,
+        master.set_reg(Register::Tr,      consume!(ptr, u32) as u64);
+        master.set_reg(Register::TrLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::TrAccessRights,
                           (consume!(ptr, u32) as u64) >> 8);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::TrBase, consume!(ptr, u64));
+        master.set_reg(Register::TrBase, consume!(ptr, u64));
         
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::GdtrLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::GdtrLimit, consume!(ptr, u32) as u64);
         let _ = consume!(ptr, u32);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::GdtrBase, consume!(ptr, u64));
+        master.set_reg(Register::GdtrBase, consume!(ptr, u64));
         
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::IdtrLimit, consume!(ptr, u32) as u64);
+        master.set_reg(Register::IdtrLimit, consume!(ptr, u32) as u64);
         let _ = consume!(ptr, u32);
         let _ = consume!(ptr, u32);
-        master.vm.set_reg(Register::IdtrBase, consume!(ptr, u64));
+        master.set_reg(Register::IdtrBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Cr0, consume!(ptr, u64));
+        master.set_reg(Register::Cr0, consume!(ptr, u64));
         let _ = consume!(ptr, u64);
-        master.vm.set_reg(Register::Cr2, consume!(ptr, u64));
-        master.vm.set_reg(Register::Cr3, consume!(ptr, u64));
-        master.vm.set_reg(Register::Cr4, consume!(ptr, u64) | (1 << 13));
+        master.set_reg(Register::Cr2, consume!(ptr, u64));
+        master.set_reg(Register::Cr3, consume!(ptr, u64));
+        master.set_reg(Register::Cr4, consume!(ptr, u64) | (1 << 13));
         
-        master.vm.set_reg(Register::KernelGsBase, consume!(ptr, u64));
+        master.set_reg(Register::KernelGsBase, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Cr8, consume!(ptr, u64));
+        master.set_reg(Register::Cr8, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::CStar, consume!(ptr, u64));
-        master.vm.set_reg(Register::LStar, consume!(ptr, u64));
-        master.vm.set_reg(Register::FMask, consume!(ptr, u64));
-        master.vm.set_reg(Register::Star,  consume!(ptr, u64));
+        master.set_reg(Register::CStar, consume!(ptr, u64));
+        master.set_reg(Register::LStar, consume!(ptr, u64));
+        master.set_reg(Register::FMask, consume!(ptr, u64));
+        master.set_reg(Register::Star,  consume!(ptr, u64));
 
-        master.vm.set_reg(Register::SysenterCs,  consume!(ptr, u64));
-        master.vm.set_reg(Register::SysenterEsp, consume!(ptr, u64));
-        master.vm.set_reg(Register::SysenterEip, consume!(ptr, u64));
+        master.set_reg(Register::SysenterCs,  consume!(ptr, u64));
+        master.set_reg(Register::SysenterEsp, consume!(ptr, u64));
+        master.set_reg(Register::SysenterEip, consume!(ptr, u64));
         
-        master.vm.set_reg(Register::Efer, consume!(ptr, u64));
+        master.set_reg(Register::Efer, consume!(ptr, u64));
 
         let _ = consume!(ptr, u64);
         let _ = consume!(ptr, u64);
@@ -1480,26 +1537,26 @@ impl<'a> FuzzSession<'a> {
         let _ = consume!(ptr, u64);
         let _ = consume!(ptr, u64);
         let _ = consume!(ptr, u64);
-        master.vm.set_reg(Register::Dr7, consume!(ptr, u64));
+        master.set_reg(Register::Dr7, consume!(ptr, u64));
 
         unsafe {
             // Remainder should be fxsave area
             assert!(ptr.len() == 512);
 
-            master.vm.set_fxsave(
+            master.backing.vm.set_fxsave(
                 core::ptr::read_unaligned(
                     ptr[..512].as_ptr() as *const FxSave));
         }
         
-        let efer = master.vm.reg(Register::Efer);
+        let efer = master.reg(Register::Efer);
         if efer & (1 << 8) != 0 {
             // Long mode, QEMU gives some non-zero limits, zero them out
-            master.vm.set_reg(Register::EsLimit, 0);
-            master.vm.set_reg(Register::CsLimit, 0);
-            master.vm.set_reg(Register::SsLimit, 0);
-            master.vm.set_reg(Register::DsLimit, 0);
-            master.vm.set_reg(Register::FsLimit, 0);
-            master.vm.set_reg(Register::GsLimit, 0);
+            master.set_reg(Register::EsLimit, 0);
+            master.set_reg(Register::CsLimit, 0);
+            master.set_reg(Register::SsLimit, 0);
+            master.set_reg(Register::DsLimit, 0);
+            master.set_reg(Register::FsLimit, 0);
+            master.set_reg(Register::GsLimit, 0);
         }
 
         /// Perform some filtering of the access rights as QEMU and VT-x have
@@ -1507,14 +1564,15 @@ impl<'a> FuzzSession<'a> {
         macro_rules! filter_ars {
             ($ar:expr, $lim:expr) => {
                 // Mark any non-present segment as inactive
-                if master.vm.reg($ar) & (1 << 7) == 0 {
-                    master.vm.set_reg($ar, 0x10000);
+                if master.reg($ar) & (1 << 7) == 0 {
+                    master.set_reg($ar, 0x10000);
                 }
 
                 // If any bit in the bottom 12 bits of the limit is zero, then
                 // G must be zero
-                if master.vm.reg($lim) & 0xfff != 0xfff {
-                    master.vm.set_reg($ar, master.vm.reg($ar) & !(1 << 15));
+                if master.reg($lim) & 0xfff != 0xfff {
+                    let oldr = master.reg($ar);
+                    master.set_reg($ar, oldr & !(1 << 15));
                 }
             }
         }
@@ -1528,8 +1586,14 @@ impl<'a> FuzzSession<'a> {
         filter_ars!(Register::LdtrAccessRights, Register::LdtrLimit);
         filter_ars!(Register::TrAccessRights, Register::TrLimit);
 
+        // Init the master VM
+        init_master(&mut master);
+
+        // Rip out only the backing from the master
+        let master = Arc::new(master.backing);
+
         FuzzSession {
-            master_vm:        Arc::new(master),
+            master_vm:        master,
             coverage:         Aht::new(),
             pending_coverage: LockCell::new(Vec::new()),
             pending_inputs:   LockCell::new(Vec::new()),
@@ -1543,15 +1607,6 @@ impl<'a> FuzzSession<'a> {
             id:               cpu::rdtsc(),
             server_addr:      server.into(),
         }
-    }
-
-    /// Invoke a closure with access to the initial memory and register states
-    /// of the snapshot such that they can be mutated to create the basis for
-    /// all fuzz cases.
-    pub fn init_master_vm<F>(mut self, callback: F) -> Self
-            where F: FnOnce(&mut Worker) {
-        callback(Arc::get_mut(&mut self.master_vm).unwrap());
-        self
     }
 
     /// Set the timeout for the VMs in microseconds

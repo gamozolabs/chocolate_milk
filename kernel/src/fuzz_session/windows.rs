@@ -73,10 +73,10 @@ impl Enlightenment {
         if worker.cpl() != 0 { return None; }
 
         // Get the LStar
-        let lstar = worker.vm.reg(Register::LStar);
+        let lstar = worker.reg(Register::LStar);
 
         // Get the current CR3
-        let cr3 = worker.vm.reg(Register::Cr3);
+        let cr3 = worker.reg(Register::Cr3);
 
         // Scan a bit around LStar
         for offset in (0..16 * 1024 * 1024).step_by(16) {
@@ -140,7 +140,7 @@ impl crate::fuzz_session::Enlightenment for Enlightenment {
             }
         } else {
             // Get the base of the TEB
-            let gs_base = worker.vm.reg(Register::GsBase);
+            let gs_base = worker.reg(Register::GsBase);
 
             // Get the address of the `_PEB`
             let peb = worker.read_virt::<u64>(VirtAddr(gs_base + 0x60))?;
