@@ -84,7 +84,7 @@ index 004141fc04..aa71c6f878 100644
 ```
 mkdir build
 cd build
-../QEMU/configure --target-list=x86_64-softmmu
+../configure --target-list=x86_64-softmmu
 make -j32
 ```
 
