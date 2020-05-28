@@ -3,10 +3,12 @@
 
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering, AtomicU8};
+use core::convert::TryInto;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 
 use crate::mm;
+use rangeset::{RangeSet, Range};
 use page_table::PhysAddr;
 
 /// Maximum number of cores allowed on the system
@@ -56,6 +58,10 @@ static TOTAL_CORES: AtomicU32 = AtomicU32::new(0);
 /// `ApicState` enum
 static APICS: [AtomicU8; MAX_CORES] =
     [AtomicU8::new(ApicState::None as u8); MAX_CORES];
+
+/// Mappings of APIC IDs to their memory domains
+pub static APIC_TO_DOMAIN: [AtomicU8; MAX_CORES] =
+    [AtomicU8::new(0); MAX_CORES];
 
 /// Set the current execution state of a given APIC ID
 pub unsafe fn set_core_state(apic_id: u32, state: ApicState) {
@@ -283,6 +289,12 @@ pub unsafe fn init() {
     }
 
     if let (Some(ad), Some(md)) = (apic_domains, memory_domains) {
+        // Register APIC to domain mappings
+        for (&apic, &node) in ad.iter() {
+            APIC_TO_DOMAIN[apic as usize].store(node.try_into().unwrap(),
+                Ordering::Relaxed);
+        }
+
         // Notify the memory manager of the known APIC -> NUMA mappings
         crate::mm::register_numa_nodes(ad, md);
     }
@@ -407,9 +419,9 @@ unsafe fn parse_madt(ptr: PhysAddr) -> Vec<u32> {
 }
 
 /// Parse the SRAT out of the ACPI tables
-/// Returns a tuple of (apic -> domain, memory domain -> (paddr, size))
+/// Returns a tuple of (apic -> domain, memory domain -> phys_ranges)
 unsafe fn parse_srat(ptr: PhysAddr) ->
-        (BTreeMap<u32, u32>, BTreeMap<u32, (PhysAddr, u64)>) {
+        (BTreeMap<u32, u32>, BTreeMap<u32, RangeSet>) {
     // Parse the SRAT header
     let (_header, payload, size) = parse_header(ptr);
 
@@ -419,7 +431,7 @@ unsafe fn parse_srat(ptr: PhysAddr) ->
 
     // Mapping of proximity domains to their memory ranges
     let mut memory_affinities:
-        BTreeMap<u32, (PhysAddr, u64)> = BTreeMap::new();
+        BTreeMap<u32, RangeSet> = BTreeMap::new();
     
     // Mapping of APICs to their proximity domains
     let mut apic_affinities: BTreeMap<u32, u32> = BTreeMap::new();
@@ -473,10 +485,19 @@ unsafe fn parse_srat(ptr: PhysAddr) ->
                 let size:   u64      = mm::read_phys(PhysAddr(sra.0 + 16));
                 let flags:  u32      = mm::read_phys(PhysAddr(sra.0 + 28));
 
-                // Log the affinity record
-                if (flags & FLAGS_ENABLED) != 0 {
-                    assert!(memory_affinities.insert(domain, (base, size))
-                            .is_none(), "Duplicate memory affinity domain");
+                // Only process ranges with a non-zero size (observed on
+                // polar and grizzly that some ranges were 0 size)
+                if size > 0 {
+                    // Log the affinity record
+                    if (flags & FLAGS_ENABLED) != 0 {
+                        memory_affinities.entry(domain).or_insert_with(|| {
+                            RangeSet::new()
+                        }).insert(Range {
+                            start: base.0,
+                            end:   base.0.checked_add(size.checked_sub(1)
+                                                      .unwrap()).unwrap()
+                        });
+                    }
                 }
             }
             2 => {

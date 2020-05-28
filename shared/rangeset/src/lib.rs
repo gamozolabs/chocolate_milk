@@ -194,11 +194,11 @@ impl RangeSet {
 
     /// Allocate `size` bytes of memory with `align` requirement for alignment
     /// Preferring to allocate from the `region`. If an allocation cannot be
-    /// satisfied from `region` the allocation will come from whatever is next
-    /// best. If `region` is `None`, then the allocation will be satisfied from
-    /// anywhere.
+    /// satisfied from `regions` the allocation will come from whatever is next
+    /// best. If `regions` is `None`, then the allocation will be satisfied
+    /// from anywhere.
     pub fn allocate_prefer(&mut self, size: u64, align: u64,
-                           region: Option<Range>) -> Option<usize> {
+                           regions: Option<&RangeSet>) -> Option<usize> {
         // Don't allow allocations of zero size
         if size == 0 {
             return None;
@@ -237,38 +237,42 @@ impl RangeSet {
             }
 
             // If there was a specific region the caller wanted to use
-            if let Some(region) = region {
+            if let Some(regions) = regions {
                 // Check if there is overlap with this region
-                if let Some(overlap) = overlaps(*ent, region) {
-                    // Compute the rounded-up alignment from the overlapping
-                    // region
-                    let align_overlap =
-                        (overlap.start.wrapping_add(alignmask)) & !alignmask;
+                for &region in regions.entries() {
+                    if let Some(overlap) = overlaps(*ent, region) {
+                        // Compute the rounded-up alignment from the
+                        // overlapping region
+                        let align_overlap =
+                            (overlap.start.wrapping_add(alignmask)) &
+                            !alignmask;
 
-                    if align_overlap >= overlap.start &&
-                            align_overlap <= overlap.end &&
-                            (overlap.end - align_overlap) >= (size - 1) {
-                        // Alignment did not cause an overflow AND
-                        // Alignment did not cause exceeding the end AND
-                        // Amount of aligned overlap can satisfy the allocation
+                        if align_overlap >= overlap.start &&
+                                align_overlap <= overlap.end &&
+                                (overlap.end - align_overlap) >= (size - 1) {
+                            // Alignment did not cause an overflow AND
+                            // Alignment did not cause exceeding the end AND
+                            // Amount of aligned overlap can satisfy the
+                            // allocation
 
-                        // Compute the inclusive end of this proposed
-                        // allocation
-                        let overlap_alc_end = align_overlap + (size - 1);
-                        
-                        // Make sure the allocation fits in the current
-                        // addressable address space
-                        if align_overlap > core::usize::MAX as u64 ||
-                                overlap_alc_end > core::usize::MAX as u64 {
-                            continue 'allocation_search;
+                            // Compute the inclusive end of this proposed
+                            // allocation
+                            let overlap_alc_end = align_overlap + (size - 1);
+                            
+                            // Make sure the allocation fits in the current
+                            // addressable address space
+                            if align_overlap > core::usize::MAX as u64 ||
+                                    overlap_alc_end > core::usize::MAX as u64 {
+                                continue 'allocation_search;
+                            }
+
+                            // We know the allocation can be satisfied starting
+                            // at `align_overlap`
+                            allocation = Some((align_overlap,
+                                               overlap_alc_end,
+                                               align_overlap as usize));
+                            break 'allocation_search;
                         }
-
-                        // We know the allocation can be satisfied starting at
-                        // `align_overlap`
-                        allocation = Some((align_overlap,
-                                           overlap_alc_end,
-                                           align_overlap as usize));
-                        break 'allocation_search;
                     }
                 }
             }

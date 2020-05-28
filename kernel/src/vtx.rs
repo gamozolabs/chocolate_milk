@@ -531,6 +531,12 @@ pub enum Register {
     PmlAddress,
     PmlIndex,
 
+    ProcBasedControls,
+    ProcBasedControls2,
+    PinBasedControls,
+    ExitControls,
+    EntryControls,
+
     NumRegisters,
 }
 
@@ -634,6 +640,11 @@ const REG_TYPES: &[(Register, RegType)] = &[
     (Register::PendingDebug, RegType::Vmcs(Vmcs::GuestPendingDebugExceptions)),
     (Register::PmlAddress, RegType::Vmcs(Vmcs::PmlAddress)),
     (Register::PmlIndex, RegType::Vmcs(Vmcs::PmlIndex)),
+    (Register::ProcBasedControls, RegType::Vmcs(Vmcs::ProcBasedControls)),
+    (Register::ProcBasedControls2, RegType::Vmcs(Vmcs::ProcBasedControls2)),
+    (Register::PinBasedControls, RegType::Vmcs(Vmcs::PinBasedControls)),
+    (Register::ExitControls, RegType::Vmcs(Vmcs::ExitControls)),
+    (Register::EntryControls, RegType::Vmcs(Vmcs::EntryControls)),
 ];
 
 /// General purpose register state
@@ -645,12 +656,12 @@ pub struct RegisterState {
     /// Bitmap tracking if registers are cached, if they are cached, they can
     /// be pulled directly from `registers`, otherwise they must be fetched
     /// directly from the source
-    cached: [u8; (Register::NumRegisters as usize + 7) / 8],
+    pub cached: [u8; (Register::NumRegisters as usize + 7) / 8],
 
     /// Bitmap tracking if registers are dirtied, this indicates that the
     /// value in a `registers` field is different from what is commit to the
     /// VM state and must be flushed before the next VM entry
-    dirtied: [u8; (Register::NumRegisters as usize + 7) / 8],
+    pub dirtied: [u8; (Register::NumRegisters as usize + 7) / 8],
 }
 
 impl RegisterState {
@@ -672,7 +683,7 @@ impl RegisterState {
         }
 
         // Copy the fxsave unconditionally
-        self.fxsave = other.fxsave;
+        //self.fxsave = other.fxsave;
     }
 
     /// Get the value of a register, if and only if it is cached. This doesn't
@@ -890,6 +901,7 @@ impl From<u8> for Exception {
 /// Virtual machine exit reason
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum VmExit {
+    MonitorTrap,
     EptViolation {
         addr:  PhysAddr,
         read:  bool,
@@ -957,9 +969,6 @@ pub struct Vm {
 
     /// Pre-emption timer value to use
     pub preemption_timer: Option<u32>,
-
-    /// Current setting for the pin-based controls
-    pinbased_controls: u64,
 }
 
 impl Vm {
@@ -1011,6 +1020,8 @@ impl Vm {
                 "EPT does not support all requested features");
         }
 
+        let mut guest_regs = RegisterState::default();
+
         unsafe {
             // Get access to the VMXON region
             let mut vmxon_lock = core!().vmxon_region().lock();
@@ -1059,26 +1070,169 @@ impl Vm {
         vmcs[..size_of::<u32>()].copy_from_slice(
             &vmcs_revision_number.to_le_bytes());
 
+        unsafe {
+            // Bits that are set in `ctrl0` MUST be SET in the respective
+            // VMCS control
+            //
+            // Bits that are clear in `ctrl1` MUST be CLEAR in the
+            // respective VMCS control
+            let pinbased_ctrl0 =
+                (cpu::rdmsr(IA32_VMX_PINBASED_CTLS) >> 0) & 0xffff_ffff;
+            let pinbased_ctrl1 =
+                (cpu::rdmsr(IA32_VMX_PINBASED_CTLS) >> 32) & 0xffff_ffff;
+            let procbased_ctrl0 =
+                (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS) >> 0) & 0xffff_ffff;
+            let procbased_ctrl1 =
+                (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS) >> 32) & 0xffff_ffff;
+            let proc2based_ctrl0 =
+                (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS2) >> 0) & 0xffff_ffff;
+            let proc2based_ctrl1 =
+                (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS2) >> 32) & 0xffff_ffff;
+            let exit_ctrl0 =
+                (cpu::rdmsr(IA32_VMX_EXIT_CTLS) >> 0) & 0xffff_ffff;
+            let exit_ctrl1 =
+                (cpu::rdmsr(IA32_VMX_EXIT_CTLS) >> 32) & 0xffff_ffff;
+            let entry_ctrl0 =
+                (cpu::rdmsr(IA32_VMX_ENTRY_CTLS) >> 0) & 0xffff_ffff;
+            let entry_ctrl1 =
+                (cpu::rdmsr(IA32_VMX_ENTRY_CTLS) >> 32) & 0xffff_ffff;
+            
+            let pinbased_minimum   = pinbased_ctrl0   & pinbased_ctrl1;
+            let procbased_minimum  = procbased_ctrl0  & procbased_ctrl1;
+            let proc2based_minimum = proc2based_ctrl0 & proc2based_ctrl1;
+            let exit_minimum       = exit_ctrl0       & exit_ctrl1;
+            let entry_minimum      = entry_ctrl0      & entry_ctrl1;
+            
+            // Set the controls you do and don't want here
+
+            // We want pin entries:
+            // External interrupt exiting
+            // NMI existing
+            // Virtual NMIs
+            let pin_on  = (1 << 0) | (1 << 3) | (1 << 5);
+            let pin_off = 0;
+
+            // On entry we want:
+            // Load debug controls (required on Skylake)
+            // 64-bit guest
+            // Load IA32_EFER
+            let entry_on = (1 << 2) | (1 << 9) | (1 << 15);
+
+            // On entry we don't want:
+            // Load IA32_PERF_GLOBAL_CTRL
+            // Load IA32_PAT
+            // Load IA32_BNDCFGS
+            // Load IA32_RTIT_CTL
+            // Load CET state
+            let entry_off = (1 << 13) | (1 << 14) |
+                (1 << 16) | (1 << 18) | (1 << 20);
+
+            // On exit we want:
+            // Host is 64-bit
+            // Save debug controls
+            // Save IA32_EFER
+            // Load IA32_EFER
+            let exit_on = (1 << 2) | (1 << 9) | (1 << 20) | (1 << 21);
+            
+            // On exit we don't want:
+            // Load IA32_PERF_GLOBAL_CTRL
+            // Save IA32_PAT
+            // Load IA32_PAT
+            // Clear IA32_BNDCFGS
+            // Clear IA32_RTIT_CTL
+            // Load CET state
+            let exit_off = (1 << 12) | (1 << 18) | (1 << 19) |
+                (1 << 23) | (1 << 25) | (1 << 28);
+
+            // Processor controls:
+            // On:
+            //   Activate secondary controls
+            //   HLT exiting
+            //   RDPMC exiting
+            //   CR3 load exiting
+            //   CR3 store exiting
+            //   MOV DR exiting
+            //   Unconditional I/O exiting
+            //   RDPMC exiting
+            //   RDTSC exiting
+            // Off:
+            //   Use MSR bitmaps
+            //   Use I/O bitmaps
+            //   TPR shadow
+            let proc_on  = (1 << 31) | (1 << 7) | (1 << 11) | (1 << 15) |
+                (1 << 16) | (1 << 23) | (1 << 24) | (1 << 11) | (1 << 12);
+            let proc_off = (1 << 28) | (1 << 25) | (1 << 21);
+            
+            // Processor controls 2:
+            // On:
+            //     Enable EPT
+            //     Enable VPID
+            //     Enable PML
+            //     RDRAND exiting
+            //     RDSEED exiting
+            // Off:
+            //     Disable RDTSCP
+            //     Disable XSAVES/XRSTORS
+            let proc2_on  = (1 << 1) | (1 << 5) | (1 << 17) | (1 << 11) |
+                (1 << 16);
+            let proc2_off = (1 << 3) | (1 << 20);
+
+            // Validate that desired bits can be what was desired
+            {
+                let checks = &[
+                    (entry_ctrl0, entry_ctrl1, entry_on, entry_off),
+                    (exit_ctrl0, exit_ctrl1, exit_on, exit_off),
+                    (pinbased_ctrl0, pinbased_ctrl1, pin_on, pin_off),
+                    (procbased_ctrl0, procbased_ctrl1, proc_on, proc_off),
+                    (proc2based_ctrl0, proc2based_ctrl1,
+                        proc2_on, proc2_off),
+                ];
+
+                // mb1 = must be 1
+                // cb1 = can be 1
+                for &(mb1, cb1, on, off) in checks {
+                    // Compute what can be zero
+                    let cb0 = !mb1;
+
+                    assert!((on  & cb1) == on);
+                    assert!((off & cb0) == off);
+                }
+            }
+
+            // Establish the VM controls
+            guest_regs.set_reg(Register::PinBasedControls,
+                         pinbased_minimum | pin_on);
+            guest_regs.set_reg(Register::ProcBasedControls,
+                         procbased_minimum | proc_on);
+            guest_regs.set_reg(Register::ProcBasedControls2,
+                         proc2based_minimum | proc2_on);
+            guest_regs.set_reg(Register::ExitControls, 
+                        exit_minimum | exit_on);
+            guest_regs.set_reg(Register::EntryControls, 
+                        entry_minimum | entry_on);
+        }
+
         Vm {
-            vmcs: vmcs,
-            init: false,
-            ept:  Ept::new().expect("Failed to create EPT table"),
-            ept_dirty: false,
-            pml:  PhysContig::new([0; 512]),
-            host_regs:  RegisterState::default(),
-            guest_regs: RegisterState::default(),
-            launched:   false,
-            preemption_timer: None,
-            pinbased_controls: 0,
+            vmcs:              vmcs,
+            init:              false,
+            ept:               Ept::new().expect("Failed to create EPT table"),
+            ept_dirty:         false,
+            pml:               PhysContig::new([0; 512]),
+            host_regs:         RegisterState::default(),
+            guest_regs:        guest_regs,
+            launched:          false,
+            preemption_timer:  None,
         }
     }
     
     /// Get access to the EPT
+    #[inline]
     pub fn ept(&self) -> &Ept {
         &self.ept
     }
     
     /// Get mutable access to the EPT
+    #[inline]
     pub fn ept_mut(&mut self) -> &mut Ept {
         &mut self.ept
     }
@@ -1142,147 +1296,6 @@ impl Vm {
         // Do one-time initialization
         if !self.init {
             unsafe {
-                // Bits that are set in `ctrl0` MUST be SET in the respective
-                // VMCS control
-                //
-                // Bits that are clear in `ctrl1` MUST be CLEAR in the
-                // respective VMCS control
-                let pinbased_ctrl0 =
-                    (cpu::rdmsr(IA32_VMX_PINBASED_CTLS) >> 0) & 0xffff_ffff;
-                let pinbased_ctrl1 =
-                    (cpu::rdmsr(IA32_VMX_PINBASED_CTLS) >> 32) & 0xffff_ffff;
-                let procbased_ctrl0 =
-                    (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS) >> 0) & 0xffff_ffff;
-                let procbased_ctrl1 =
-                    (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS) >> 32) & 0xffff_ffff;
-                let proc2based_ctrl0 =
-                    (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS2) >> 0) & 0xffff_ffff;
-                let proc2based_ctrl1 =
-                    (cpu::rdmsr(IA32_VMX_PROCBASED_CTLS2) >> 32) & 0xffff_ffff;
-                let exit_ctrl0 =
-                    (cpu::rdmsr(IA32_VMX_EXIT_CTLS) >> 0) & 0xffff_ffff;
-                let exit_ctrl1 =
-                    (cpu::rdmsr(IA32_VMX_EXIT_CTLS) >> 32) & 0xffff_ffff;
-                let entry_ctrl0 =
-                    (cpu::rdmsr(IA32_VMX_ENTRY_CTLS) >> 0) & 0xffff_ffff;
-                let entry_ctrl1 =
-                    (cpu::rdmsr(IA32_VMX_ENTRY_CTLS) >> 32) & 0xffff_ffff;
-                
-                let pinbased_minimum   = pinbased_ctrl0   & pinbased_ctrl1;
-                let procbased_minimum  = procbased_ctrl0  & procbased_ctrl1;
-                let proc2based_minimum = proc2based_ctrl0 & proc2based_ctrl1;
-                let exit_minimum       = exit_ctrl0       & exit_ctrl1;
-                let entry_minimum      = entry_ctrl0      & entry_ctrl1;
-                
-                // Set the controls you do and don't want here
-
-                // We want pin entries:
-                // External interrupt exiting
-                // NMI existing
-                // Virtual NMIs
-                let pin_on  = (1 << 0) | (1 << 3) | (1 << 5);
-                let pin_off = 0;
-
-                // On entry we want:
-                // Load debug controls (required on Skylake)
-                // 64-bit guest
-                // Load IA32_EFER
-                let entry_on = (1 << 2) | (1 << 9) | (1 << 15);
-
-                // On entry we don't want:
-                // Load IA32_PERF_GLOBAL_CTRL
-                // Load IA32_PAT
-                // Load IA32_BNDCFGS
-                // Load IA32_RTIT_CTL
-                // Load CET state
-                let entry_off = (1 << 13) | (1 << 14) |
-                    (1 << 16) | (1 << 18) | (1 << 20);
-
-                // On exit we want:
-                // Host is 64-bit
-                // Save debug controls
-                // Save IA32_EFER
-                // Load IA32_EFER
-                let exit_on = (1 << 2) | (1 << 9) | (1 << 20) | (1 << 21);
-                
-                // On exit we don't want:
-                // Load IA32_PERF_GLOBAL_CTRL
-                // Save IA32_PAT
-                // Load IA32_PAT
-                // Clear IA32_BNDCFGS
-                // Clear IA32_RTIT_CTL
-                // Load CET state
-                let exit_off = (1 << 12) | (1 << 18) | (1 << 19) |
-                    (1 << 23) | (1 << 25) | (1 << 28);
-
-                // Processor controls:
-                // On:
-                //   Activate secondary controls
-                //   HLT exiting
-                //   RDPMC exiting
-                //   CR3 load exiting
-                //   CR3 store exiting
-                //   MOV DR exiting
-                //   Unconditional I/O exiting
-                //   RDPMC exiting
-                //   RDTSC exiting
-                // Off:
-                //   Use MSR bitmaps
-                //   Use I/O bitmaps
-                //   TPR shadow
-                let proc_on  = (1 << 31) | (1 << 7) | (1 << 11) | (1 << 15) |
-                    (1 << 16) | (1 << 23) | (1 << 24) | (1 << 11) | (1 << 12);
-                let proc_off = (1 << 28) | (1 << 25) | (1 << 21);
-                
-                // Processor controls 2:
-                // On:
-                //     Enable EPT
-                //     Enable VPID
-                //     Enable PML
-                //     RDRAND exiting
-                //     RDSEED exiting
-                // Off:
-                //     Disable RDTSCP
-                //     Disable XSAVES/XRSTORS
-                let proc2_on  = (1 << 1) | (1 << 5) | (1 << 17) | (1 << 11) |
-                    (1 << 16);
-                let proc2_off = (1 << 3) | (1 << 20);
-
-                // Validate that desired bits can be what was desired
-                {
-                    let checks = &[
-                        (entry_ctrl0, entry_ctrl1, entry_on, entry_off),
-                        (exit_ctrl0, exit_ctrl1, exit_on, exit_off),
-                        (pinbased_ctrl0, pinbased_ctrl1, pin_on, pin_off),
-                        (procbased_ctrl0, procbased_ctrl1, proc_on, proc_off),
-                        (proc2based_ctrl0, proc2based_ctrl1,
-                            proc2_on, proc2_off),
-                    ];
-
-                    // mb1 = must be 1
-                    // cb1 = can be 1
-                    for &(mb1, cb1, on, off) in checks {
-                        // Compute what can be zero
-                        let cb0 = !mb1;
-
-                        assert!((on  & cb1) == on);
-                        assert!((off & cb0) == off);
-                    }
-                }
-
-                // Establish the VM controls
-                vmwrite(Vmcs::PinBasedControls,
-                             pinbased_minimum | pin_on);
-                self.pinbased_controls = pinbased_minimum | pin_on;
-                vmwrite(Vmcs::ProcBasedControls,
-                             procbased_minimum | proc_on);
-                vmwrite(Vmcs::ProcBasedControls2,
-                             proc2based_minimum | proc2_on);
-                vmwrite(Vmcs::ExitControls, 
-                            exit_minimum | exit_on);
-                vmwrite(Vmcs::EntryControls, 
-                            entry_minimum | entry_on);
-
                 // Set the EPT table as a 4 level EPT with accessed and dirty
                 // bit tracking
                 vmwrite(Vmcs::EptPointer,
@@ -1346,29 +1359,28 @@ impl Vm {
             // We have initialized the VM
             self.init = true;
         }
-
+        
         // Make sure the fxsave starts at `0x400` from the `guest_regs`
         assert!((&self.guest_regs.fxsave as *const _ as usize -
                  &self.guest_regs as *const _ as usize) == 0x400);
          
         // Time spent inside the VM
         let vm_cycles;
-
+        
         unsafe {
             core!().disable_interrupts();
-           
+
+            let pbc = self.reg(Register::PinBasedControls);
             if let Some(timer) = self.preemption_timer {
-                if (self.pinbased_controls & (1 << 6)) == 0 {
+                if (pbc & (1 << 6)) == 0 {
                     // Enable the pre-emption timer
-                    self.pinbased_controls |= 1 << 6;
-                    vmwrite(Vmcs::PinBasedControls, self.pinbased_controls);
+                    self.set_reg(Register::PinBasedControls, (1 << 6) | pbc);
                 }
                 vmwrite(Vmcs::PreemptionTimer, timer as u64);
             } else {
-                if (self.pinbased_controls & (1 << 6)) != 0 {
+                if (pbc & (1 << 6)) != 0 {
                     // Disable the pre-emption timer
-                    self.pinbased_controls &= !(1 << 6);
-                    vmwrite(Vmcs::PinBasedControls, self.pinbased_controls);
+                    self.set_reg(Register::PinBasedControls, pbc & !(1 << 6));
                 }
             }
             
@@ -1385,7 +1397,7 @@ impl Vm {
                     }
                 }
             }
-            
+
             let it = cpu::rdtsc();
 
             llvm_asm!(r#"
@@ -1623,6 +1635,10 @@ impl Vm {
                     vmread(Vmcs::VmExitInstructionLength)
                 };
                 VmExit::WriteMsr { inst_len }
+            }
+            37 => {
+                // Monitor trap flag
+                VmExit::MonitorTrap
             }
             48 => {
                 // EPT violation

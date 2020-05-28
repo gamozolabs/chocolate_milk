@@ -419,6 +419,8 @@ pub fn get_lease(device: Arc<NetDevice>) -> Option<Lease> {
         Some(())
     })?;
 
+    print!("DHCP lease {:02x?} {:?}\n", device.mac(), offer_ip);
+
     Some(Lease {
         client_ip: offer_ip,
         server_ip,

@@ -94,23 +94,28 @@ macro_rules! define_walker {
         unreachable!();
     }
 
-    pub fn $metadata<'a, F, C>(table: u64, depth: u8, get_page: F,
+    pub fn $metadata<'a, F, C>(table: u64, depth: u8, get_page: &mut F,
                                callback: &mut C)
-            where F: Fn(PhysAddr) -> Option<&'a [u8]> + Copy,
-                  C: FnMut(PhysAddr) {
-        // Stop traversal before the final PTE, we don't actually want to
-        // walk the pages in the system, only the page _tables_ so we stop
-        // before the final leaf
-        if depth.wrapping_add(2) as usize == $tbl.len() {
-            return;
-        }
-
+            where F: FnMut(PhysAddr) -> Option<&'a [u8]>,
+                  C: FnMut(PhysAddr) -> bool {
         // Mask the entry to get the page table
         let table = if depth == !0 {
             table & $cr3_mask
         } else {
             table & $tbl[depth as usize].page_mask
         };
+
+        // Invoke the callback with the metadata information
+        if !callback(PhysAddr(table)) {
+            return;
+        }
+
+        // Stop traversal before the final PTE, we don't actually want to
+        // walk the pages in the system, only the page _tables_ so we stop
+        // before the final leaf
+        if depth.wrapping_add(2) as usize == $tbl.len() {
+            return;
+        }
 
         // Get the information about this page table level
         let level = &$tbl[depth.wrapping_add(1) as usize];
@@ -138,10 +143,7 @@ macro_rules! define_walker {
                 // Entry was a large page, we don't have to recurse
                 continue;
             }
-
-            // Invoke the callback with the metadata information
-            callback(PhysAddr(ent & level.page_mask));
-
+            
             // Recurse into this table
             $metadata(ent & level.page_mask, depth.wrapping_add(1),
                 get_page, callback);

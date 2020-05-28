@@ -266,27 +266,8 @@ impl Ept {
                 let ptr = phys_mem.translate_mut(entries[ii - 1].unwrap(),
                     core::mem::size_of::<u64>())?;
 
-                if ii >= 2 {
-                    // Get access to the entry with the reference count of the
-                    // table we're updating
-                    let ptr = phys_mem.translate_mut(entries[ii - 2].unwrap(),
-                        core::mem::size_of::<u64>())?;
-                    
-                    // Read the entry
-                    let nent = core::ptr::read(ptr as *const u64);
-
-                    // Update the reference count
-                    let in_use = (nent >> 52) & 0x3ff;
-                    let nent = (nent & !0x3ff0_0000_0000_0000) |
-                        ((in_use + 1) << 52);
-
-                    // Write in the new entry
-                    core::ptr::write(ptr as *mut u64, nent);
-                }
-
                 // Insert the new table at the entry in the table above us
-                core::ptr::write(ptr as *mut u64,
-                    table.0 | EPT_PRESENT);
+                core::ptr::write(ptr as *mut u64, table.0 | EPT_PRESENT);
 
                 // Update the mapping state as we have changed the tables
                 entries[ii] = Some(PhysAddr(
@@ -295,24 +276,6 @@ impl Ept {
             }
         }
         
-        {
-            // Get access to the entry with the reference count of the
-            // table we're updating with the new page
-            let ptr = phys_mem.translate_mut(entries[depth - 2].unwrap(),
-                core::mem::size_of::<u64>())?;
-            
-            // Read the entry
-            let nent = core::ptr::read(ptr as *const u64);
-
-            // Update the reference count
-            let in_use = (nent >> 52) & 0x3ff;
-            let nent = (nent & !0x3ff0_0000_0000_0000) |
-                ((in_use + 1) << 52);
-
-            // Write in the new entry
-            core::ptr::write(ptr as *mut u64, nent);
-        }
-
         // At this point, the tables have been created, and the page doesn't
         // already exist. Thus, we can write in the mapping!
         let ptr = phys_mem.translate_mut(entries[depth - 1].unwrap(),

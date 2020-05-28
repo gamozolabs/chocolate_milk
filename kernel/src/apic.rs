@@ -279,6 +279,27 @@ impl Apic {
     /// Handler for APIC timer interrupts
     unsafe fn timer_interrupt(_number: u8, _frame: &mut InterruptFrame,
                               _error: u64, _regs: &mut AllRegs) -> bool {
+        /*
+        static mut TIMERS: u64 = 0;
+        static mut SAMPLES: [u64; 1024 * 1024] = [0; 1024 * 1024];
+
+        TIMERS += 1;
+        SAMPLES[_frame.rip - 0x133700000000] += 1;
+
+        if TIMERS & 0xffff == 0 {
+            print!("TIMERS {}\n", TIMERS);
+            for (ii, samp) in SAMPLES.iter_mut().enumerate() {
+                if *samp == 0 { continue; }
+                let freq = *samp as f64 / TIMERS as f64;
+                if freq > 0.01 {
+                    print!("{:016x} {:12.6}\n", ii + 0x133700000000, freq);
+                }
+
+                *samp = 0;
+            }
+            TIMERS = 0;
+        }*/
+
         crate::panic::attempt_soft_reboot();
 
         true
@@ -331,7 +352,7 @@ impl Apic {
         // Program the initial count, this will be decremented until it hits
         // zero. At which point an interrupt through the APIC timer LVT entry
         // will be fired
-        self.write_apic(Register::InitialCount, 10_000_000);
+        self.write_apic(Register::InitialCount, 100_000);
     }
     
     /// Disable the APIC timer

@@ -14,31 +14,45 @@ static RDTSC_MHZ: AtomicU64 = AtomicU64::new(3_000);
 static RDTSC_START: AtomicU64 = AtomicU64::new(0);
 
 /// Get the TSC rate in MHz
+#[inline]
 pub fn tsc_mhz() -> u64 {
-    RDTSC_MHZ.load(Ordering::SeqCst)
+    RDTSC_MHZ.load(Ordering::Relaxed)
 }
 
 /// Returns the TSC value upon a future time in microseconds
+#[inline]
 pub fn future(microseconds: u64) -> u64 {
-	cpu::rdtsc() + (microseconds * RDTSC_MHZ.load(Ordering::SeqCst))
+	cpu::rdtsc() + (microseconds * tsc_mhz())
 }
 
 /// Returns system uptime in seconds as a float
+#[inline]
 pub fn uptime() -> f64 {
-    elapsed(RDTSC_START.load(Ordering::SeqCst))
+    elapsed(RDTSC_START.load(Ordering::Relaxed))
 }
 
 /// Return number of seconds elapsed since a prior TSC value
+#[inline]
 pub fn elapsed(start_time: u64) -> f64 {
     (cpu::rdtsc() - start_time) as f64 /
-        RDTSC_MHZ.load(Ordering::SeqCst) as f64 / 1_000_000.0
+        RDTSC_MHZ.load(Ordering::Relaxed) as f64 / 1_000_000.0
 }
 
 /// Busy sleep for a given number of microseconds
+#[inline]
 pub fn sleep(microseconds: u64) {
     let waitval = future(microseconds);
     while cpu::rdtsc() < waitval {
         core::sync::atomic::spin_loop_hint();
+    }
+}
+
+/// Halt sleep for a given number of microseconds
+#[inline]
+pub fn haltsleep(microseconds: u64) {
+    let waitval = future(microseconds);
+    while cpu::rdtsc() < waitval {
+        cpu::single_halt();
     }
 }
 
@@ -47,11 +61,11 @@ pub fn sleep(microseconds: u64) {
 pub unsafe fn calibrate() {
     // Store off the current rdtsc value
     let start = cpu::rdtsc();
-    RDTSC_START.store(start, Ordering::SeqCst);
+    RDTSC_START.store(start, Ordering::Relaxed);
 
     // Check if we already calibrated
     if let Some(tsc_freq) = *core!().persist_store().rdtsc_freq.lock() {
-        RDTSC_MHZ.store(tsc_freq, Ordering::SeqCst);
+        RDTSC_MHZ.store(tsc_freq, Ordering::Relaxed);
         return;
     }
 
@@ -93,7 +107,7 @@ pub unsafe fn calibrate() {
     let rounded_rate = (((computed_rate / 100.0) + 0.5) as u64) * 100;
 
     // Stock the TSC rate
-    RDTSC_MHZ.store(rounded_rate, Ordering::SeqCst);
+    RDTSC_MHZ.store(rounded_rate, Ordering::Relaxed);
 
     // Save the TSC frequency in the persist store
     *core!().persist_store().rdtsc_freq.lock() = Some(rounded_rate);

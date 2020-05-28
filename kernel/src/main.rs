@@ -1,7 +1,7 @@
 //! A kernel written all in Rust
 
 #![feature(panic_info_message, alloc_error_handler, llvm_asm, global_asm)]
-#![feature(const_in_array_repeat_expressions, const_generics)]
+#![feature(const_in_array_repeat_expressions, const_generics, new_uninit)]
 #![allow(incomplete_features)]
 
 #![no_std]
@@ -48,13 +48,13 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
 
     // Initialize the core locals, this must happen first.
     core_locals::init(boot_args, core_id);
-    
+
     // Initialize interrupts
     interrupts::init();
 
     // Initialize the APIC
     unsafe { apic::init(); }
-     
+
     // Calibrate the TSC so we can use `time` routines
     if core_id == 0 { unsafe { time::calibrate(); } }
     
@@ -69,6 +69,10 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
         // information.
         unsafe { acpi::init() }
     }
+
+    // Latch core local information which may not have been available yet
+    // during initial local initialization
+    unsafe { core!().latch(); }
 
     // Enable the APIC timer
     unsafe { core!().apic().lock().as_mut().unwrap().enable_timer(); }

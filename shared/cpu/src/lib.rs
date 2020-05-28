@@ -119,6 +119,16 @@ pub unsafe fn set_fs_base(base: u64) {
     wrmsr(IA32_FS_BASE, base);
 }
 
+/// Halt once
+#[inline]
+pub fn single_halt() {
+    unsafe {
+        llvm_asm!(r#"
+            hlt
+        "# :::: "volatile", "intel");
+    }
+}
+
 /// Halt forever
 #[inline]
 pub fn halt() -> ! {

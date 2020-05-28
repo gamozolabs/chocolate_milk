@@ -34,6 +34,13 @@ use lockcell::LockCell;
 use atomicvec::AtomicVec;
 use page_table::{PhysAddr, VirtAddr, PhysMem, PageType, Mapping};
 
+/// Number of microseconds to wait before syncing worker statistics into the
+/// `FuzzTarget`
+///
+/// This is used to reduce the frequency which workers sync with the master,
+/// to cut down on the lock contention
+const STATISTIC_SYNC_INTERVAL: u64 = 10_000;
+
 /// Trait to allow conversion of slices of bytes to primitives and back
 /// generically
 pub unsafe trait Primitive: Default + Sized {
@@ -136,13 +143,6 @@ pub enum Address {
         cr3:  u64
     },
 }
-
-/// Number of microseconds to wait before syncing worker statistics into the
-/// `FuzzTarget`
-///
-/// This is used to reduce the frequency which workers sync with the master,
-/// to cut down on the lock contention
-const STATISTIC_SYNC_INTERVAL: u64 = 100_000;
 
 /// A random number generator based off of xorshift64
 pub struct Rng(Cell<u64>);
@@ -273,6 +273,189 @@ impl<'a> Backing<'a> {
             }
         }
     }
+
+    /// Translate a physical address for the guest into a physical address on
+    /// the host. If `write` is set, the translation will occur for a write
+    /// access, and thus the copy-on-write will be performed on the page if
+    /// needed to satisfy the write.
+    ///
+    /// If the physical address is not valid for the guest, this will return
+    /// `None`.
+    ///
+    /// The translation will only be valid for the page the `gpaddr` resides in
+    /// The returned physical address will have the offset from the physical
+    /// address applied. Such that a request for physical address `0x13371337`
+    /// would return a physical address ending in `0x337`
+    fn translate(&mut self, gpaddr: PhysAddr, _read: bool, write: bool,
+                 _exec: bool, pml: &mut Vec<u64>) -> Option<PhysAddr> {
+        // Get access to physical memory
+        let mut pmem = mm::PhysicalMemory;
+        
+        // Align the guest physical address
+        let align_gpaddr = PhysAddr(gpaddr.0 & !0xfff);
+        
+        // Attempt to translate the page, it is possible it has not yet been
+        // mapped and we need to page it in from the network mapped storage in
+        // the `FuzzTarget`
+        let translation = if !write {
+            self.vm.ept().translate(align_gpaddr)
+        } else {
+            self.vm.ept_mut().translate_int(align_gpaddr, write, false)
+        };
+        
+        // First, determine if we need to perform a CoW or make a mapping for
+        // an unmapped page
+        if let Some(Mapping {
+                pte: Some(pte), page: Some((orig_page, _, ent)), .. }) =
+                    translation {
+            // Page is mapped, it is possible it needs to be promoted to
+            // writable
+            let page_writable =
+                (unsafe { mm::read_phys::<u64>(pte) } & EPT_WRITE) != 0;
+
+            // If the page is writable, and this is is a write, OR if the
+            // operation is not a write, then the existing allocation can
+            // satisfy the translation request.
+            if (write && page_writable) || !write {
+                if write {
+                    // Check if the dirty bit was previously clear
+                    if (ent & EPT_DIRTY) == 0 {
+                        // Log that this page has been dirtied to the PML
+                        pml.push(align_gpaddr.0);
+                        
+                        // Set that the TLB should be flushed on next VM entry
+                        // as we changed dirty bits
+                        self.vm.ept_dirty = true;
+                    }
+                }
+
+                return Some(PhysAddr(orig_page.0 + (gpaddr.0 & 0xfff)));
+            }
+        }
+
+        // At this stage, we either must perform a CoW or map an unmapped page
+
+        // Get the original contents of the page
+        let orig_page_gpaddr = if let Some(master) = &self.master {
+            // Get the page from the master
+            master.get_page(align_gpaddr)?
+        } else if let Some(_) = &self.network_mem {
+            self.get_page(align_gpaddr)?
+        } else {
+            // Page is not present, and cannot be filled from the master or
+            // network memory
+            return None;
+        };
+
+        // Look up the physical page backing for the mapping
+
+        // Touch the page to make sure it's present
+        unsafe { core::ptr::read_volatile(orig_page_gpaddr.0 as *const u8); }
+        
+        let orig_page = {
+            // Get access to the host page table
+            let mut page_table = core!().boot_args.page_table.lock();
+            let page_table = page_table.as_mut().unwrap();
+
+            // Translate the mapping virtual address into a physical
+            // address
+            //
+            // This will always succeed as we touched the memory above
+            let (page, offset, _) =
+                page_table.translate(&mut pmem, orig_page_gpaddr)
+                    .map(|x| x.page).flatten()
+                    .expect("Whoa, memory page not mapped?!");
+            PhysAddr(page.0 + offset)
+        };
+
+        // Get a slice to the original read-only page
+        let ro_page = unsafe { mm::slice_phys_mut(orig_page, 4096) };
+
+        let page = if let Some(Mapping { pte: Some(pte), page: Some(_), .. }) =
+                translation {
+            // Promote the original page via CoW
+                
+            // Allocate a new page
+            let page = pmem.alloc_phys(
+                Layout::from_size_align(4096, 4096).unwrap()).unwrap();
+
+            // Get mutable access to the underlying page
+            let psl = unsafe { mm::slice_phys_mut(page, 4096) };
+
+            // Copy in the bytes to initialize the page from the network
+            // mapped memory
+            psl.copy_from_slice(&ro_page);
+
+            // Promote the page via CoW
+            unsafe {
+                mm::write_phys(pte, 
+                    page.0 | EPT_WRITE | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
+                    EPT_DIRTY | EPT_ACCESSED);
+
+                // Log that this page has been dirtied to the PML
+                pml.push(align_gpaddr.0);
+
+                // Mapping changed, we must invalidate the TLB on next VM
+                // entry
+                self.vm.ept_dirty = true;
+            }
+
+            page
+        } else {
+            // Page was not mapped
+            if write {
+                // Page needs to be CoW-ed from the network mapped file
+
+                // Allocate a new page
+                let page = pmem.alloc_phys(
+                    Layout::from_size_align(4096, 4096).unwrap()).unwrap();
+
+                // Get mutable access to the underlying page
+                let psl = unsafe { mm::slice_phys_mut(page, 4096) };
+
+                // Copy in the bytes to initialize the page from the network
+                // mapped memory
+                psl.copy_from_slice(&ro_page);
+
+                unsafe {
+                    // Map in the page as RWX, WB, and already dirtied and
+                    // accessed (since we're getting write access to it)
+                    self.vm.ept_mut().map_raw(align_gpaddr,
+                        PageType::Page4K,
+                        page.0 | EPT_READ | EPT_WRITE | EPT_EXEC |
+                        EPT_USER_EXEC | EPT_MEMTYPE_WB | EPT_DIRTY |
+                        EPT_ACCESSED)
+                        .unwrap();
+               
+                    // Memory was dirtied
+                    pml.push(align_gpaddr.0);
+                }
+
+                // Return the physical address of the new page
+                page
+            } else {
+                // Page is only being accessed for read. Alias the guest's
+                // physical memory directly into the network mapped page as
+                // read-only
+                
+                unsafe {
+                    // Map in the page as read-only into the guest page table
+                    self.vm.ept_mut().map_raw(align_gpaddr,
+                        PageType::Page4K,
+                        orig_page.0 | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
+                        EPT_MEMTYPE_WB)
+                        .unwrap();
+                }
+
+                // Return the physical address of the backing page
+                orig_page
+            }
+        };
+        
+        // Return the host physical address of the requested guest physical
+        // address
+        Some(PhysAddr(page.0 + (gpaddr.0 & 0xfff)))
+    }
 }
 
 /// A VM worker which is likely part of a large fuzzing group
@@ -317,12 +500,11 @@ pub struct Worker<'a> {
     /// Page modification log of dirtied physical memory pages
     pml: Vec<u64>,
 
-    /// Guest physical addresses of memory which is used for page table
-    /// metadata. This allows us to make sure we never map it as writable so
-    /// we can hook all page table changes
-    /// Addresses reference their refcounts, which tracks the number of uses
-    /// of that page as metadata
-    page_metadata: RefCell<BTreeMap<PhysAddr, usize>>,
+    /// Mapping of guest physical addresses to their original final level
+    /// EPT pointer, backing EPT page, and backing master page
+    /// This allows skipping the traversal of EPT tables on resets, as the
+    /// dirty bits and page copies can be done entirly with this information
+    page_cache: BTreeMap<PhysAddr, (*mut u64, VirtAddr, VirtAddr)>,
 }
 
 impl<'a> Worker<'a> {
@@ -345,7 +527,7 @@ impl<'a> Worker<'a> {
             hasher:         FalkHasher::new(),
             enlightenment:  None,
             pml:            Vec::new(),
-            page_metadata:  Default::default(),
+            page_cache:     BTreeMap::default(),
         }
     }
     
@@ -375,7 +557,7 @@ impl<'a> Worker<'a> {
             hasher:         FalkHasher::new(),
             enlightenment:  None,
             pml:            Vec::new(),
-            page_metadata:  Default::default(),
+            page_cache:     BTreeMap::default(),
         }
     }
     
@@ -434,36 +616,51 @@ impl<'a> Worker<'a> {
     /// Perform a single fuzz case to completion
     pub fn fuzz_case(&mut self) -> VmExit {
         let fuzz_start = cpu::rdtsc();
-
+        
         // Start a timer
         let it = cpu::rdtsc();
 
         // Get access to the session
-        let session = self.session.as_ref().unwrap().clone();
+        let session = self.session.take().unwrap();
 
         // Get access to the master
-        let master =
-            self.backing.master.as_ref().expect("Cannot fuzz without master");
+        let master = self.backing.master.as_mut().unwrap();
 
         // Reset memory to its original state
         for &paddr in self.pml.iter() {
             let paddr = PhysAddr(paddr);
 
             // Get the original page from the master
-            let orig_page = master.get_page(paddr)
-                .expect("Dirtied page without master!?");
+            let pc = &mut self.page_cache;
+            let vm = &mut self.backing.vm;
+            let (ept_entry, page, orig_page) = *pc.entry(paddr)
+                .or_insert_with(|| {
+                    // Translate our page
+                    let walk = vm.ept_mut()
+                        .translate_int(paddr, false, false).unwrap();
+                    let pte  = walk.pte.unwrap();
+                    let page = walk.page.unwrap().0;
             
-            // Get our page and clear dirty bits in the page table
-            let page = self.backing.vm.ept_mut()
-                .translate_int(paddr, false, true);
-            let page = page.unwrap().page.unwrap().0;
+                    // Convert physical addresses into virtual ones
+                    let pte = unsafe {
+                        mm::slice_phys_mut(pte,
+                                           core::mem::size_of::<u64>() as u64)
+                    };
+                    let page = unsafe { mm::slice_phys_mut(page, 4096) };
 
-            // Convert this physical address into a virtual address
-            let page = unsafe { mm::slice_phys_mut(page, 4096) };
+                    (
+                        pte.as_ptr() as *mut u64,
+                        VirtAddr(page.as_ptr() as u64),
+                        master.get_page(paddr)
+                            .expect("Dirtied page without master!?")
+                    )
+                });
 
-            // Set that the EPT TLB must be invalidated (since we changed dirty
-            // bit states)
-            self.backing.vm.ept_dirty = true;
+            unsafe {
+                // Clear the dirty bit on the EPT entry
+                core::ptr::write(ept_entry,
+                                 core::ptr::read(ept_entry) & !EPT_DIRTY); 
+            }
 
             unsafe {
                 // Copy the original page into the modified copy of the page
@@ -473,15 +670,21 @@ impl<'a> Worker<'a> {
                     rep movsq
 
                 "# ::
-                "{rdi}"(page.as_mut_ptr()),
+                "{rdi}"(page.0),
                 "{rsi}"(orig_page.0) :
                 "memory", "rcx", "rdi", "rsi", "cc" : 
                 "intel", "volatile");
             }
         }
 
-        // Clear the PML as everything has been cleaned
-        self.pml.clear();
+        if self.pml.len() > 0 {
+            // Set that the EPT TLB must be invalidated (since we changed dirty
+            // bit states)
+            self.backing.vm.ept_dirty = true;
+
+            // Clear the PML as everything has been cleaned
+            self.pml.clear();
+        }
        
         // Load the original snapshot registers
         self.backing.vm.guest_regs.copy_from(&master.vm.guest_regs);
@@ -489,23 +692,7 @@ impl<'a> Worker<'a> {
         // Reset the VMCS state, this also invalidates the TLB entries since
         // we have now changed the paging structures with EPT above
         self.backing.vm.reset();
-
-        // Clear metadata
-        self.page_metadata.borrow_mut().clear();
-
-        /*
-        translate_64_4_level_metadata(self.reg(Register::Cr3), !0, |paddr| {
-            unsafe {
-                Some(core::slice::from_raw_parts(
-                        self.backing.get_page(paddr)?.0 as *const u8,
-                        4096))
-            }
-        }, &mut |metadata| {
-            // Update the reference count for this metadata page
-            *self.page_metadata.borrow_mut().entry(metadata).or_insert(0) += 1;
-        });
-        panic!("DONE {}", self.page_metadata.borrow().len());*/
-
+        
         self.stats.reset_cycles += cpu::rdtsc() - it;
 
         // Invoke the injection callback
@@ -514,22 +701,27 @@ impl<'a> Worker<'a> {
         }
 
         // Compute the timeout
-        let timeout = session.timeout.map(|x| time::future(x));
+        let timeout = session.timeout.map(|x| time::future(x)).unwrap_or(!0);
 
         let vmexit = 'vm_loop: loop {
-            if cpu::rdtsc() >= timeout.unwrap_or(!0) {
+            if cpu::rdtsc() >= timeout {
                 break 'vm_loop VmExit::Timeout;
             }
 
+            //let pbc = self.reg(Register::ProcBasedControls);
+            //self.set_reg(Register::ProcBasedControls, pbc | (1 << 27));
+
             // Set the pre-emption timer for randomly breaking into the VM
             // to enforce timeouts
-            self.backing.vm.preemption_timer = None; //Some(3);
+            self.backing.vm.preemption_timer = 
+                None; //Some(self.rng.rand() as u32 % 50);
 
             // Run the VM until a VM exit
             let (vmexit, vm_cycles) = self.backing.vm.run();
-            self.stats.vm_exits += 1;
+            self.stats.vm_exits  += 1;
             self.stats.vm_cycles += vm_cycles;
-
+            //print!("{:x?}\n", vmexit);
+                    
             // Closure to invoke if we want to report new coverage
             let mut report_coverage = || {
                 let rip = self.reg(Register::Rip);
@@ -565,7 +757,7 @@ impl<'a> Worker<'a> {
                         offset: modoff.1,
                 });
             };
-
+            
             match vmexit {
                 VmExit::Rdtsc { inst_len } => {
                     self.set_reg(Register::Rax, 0);
@@ -575,8 +767,21 @@ impl<'a> Worker<'a> {
                     self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
-                VmExit::EptViolation { addr, read, write, exec } => {
-                    if self.translate(addr, read, write, exec).is_some() {
+                VmExit::EptViolation { addr, read, write: _write, exec } => {
+                    // So without this `write = true` line, we will alias the
+                    // master's original page as read-only. However, it is
+                    // possible that inside the VM it does atomic reads to this
+                    // page. If the atomic accesses never update the value,
+                    // this means _all_ VMs will be thrashing the same cache
+                    // line with a `lock`. This makes for terrible scaling.
+                    // Thus, by marking all accesses as writes, we'll CoW
+                    // everything, meaning every single VM will get their own
+                    // copy of each page. Eliminating any shared cache lines
+                    // which could affect adjacent cores.
+                    let write = true;
+
+                    if self.backing.translate(addr, read, write, exec,
+                                              &mut self.pml).is_some() {
                         continue 'vm_loop;
                     }
                 }
@@ -651,6 +856,8 @@ impl<'a> Worker<'a> {
                     continue 'vm_loop;
                 }
                 VmExit::WriteCr { cr, gpr, inst_len } => {
+                    //break 'vm_loop vmexit;
+
                     // Get the GPR source for the write
                     let gpr = match gpr {
                          0 => self.reg(Register::Rax),
@@ -675,7 +882,9 @@ impl<'a> Worker<'a> {
                     // Update the CR
                     match cr {
                         0 => self.set_reg(Register::Cr0, gpr),
-                        3 => self.set_reg(Register::Cr3, gpr),
+                        3 => {
+                            self.set_reg(Register::Cr3, gpr);
+                        },
                         4 => self.set_reg(Register::Cr4, gpr),
                         _ => panic!("Invalid CR register for write CR"),
                     }
@@ -719,6 +928,9 @@ impl<'a> Worker<'a> {
                     self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
+                VmExit::MonitorTrap => {
+                    continue 'vm_loop;
+                }
                 VmExit::PreemptionTimer => {
                     report_coverage();
                     continue 'vm_loop;
@@ -755,6 +967,17 @@ impl<'a> Worker<'a> {
         // Sync the local statistics into the master on an interval
         self.stats.total_cycles += cpu::rdtsc() - fuzz_start;
         if cpu::rdtsc() >= self.sync {
+            /*
+            unsafe {
+                static mut STATS: [u64; 4] = [0; 4];
+                STATS[core!().id as usize / 64] |= 1 << (core!().id % 64);
+                if core!().id == 0 {
+                    print!("{:016x?}\n", STATS);
+                    STATS = [0; 4];
+                }
+            }
+            //print!("{:5} {:10}\n", core!().id, self.stats.fuzz_cases);*/
+
             self.stats.sync_into(&mut session.stats.lock());
             if self.worker_id == 0 {
                 // Report to the server
@@ -765,6 +988,7 @@ impl<'a> Worker<'a> {
             self.sync = time::future(STATISTIC_SYNC_INTERVAL);
         }
 
+        self.session = Some(session);
         vmexit
     }
 
@@ -859,7 +1083,8 @@ impl<'a> Worker<'a> {
             };
 
             // Get the host physical address for this page
-            let paddr = self.translate(PhysAddr(gpaddr), true, false, false)?;
+            let paddr = self.backing.translate(
+                PhysAddr(gpaddr), true, false, false, &mut self.pml)?;
 
             // Compute the remaining number of bytes on the page
             let page_remain = 0x1000 - (paddr.0 & 0xfff);
@@ -935,7 +1160,8 @@ impl<'a> Worker<'a> {
             };
 
             // Get the host physical address for this page
-            let paddr = self.translate(PhysAddr(gpaddr), false, true, false)?;
+            let paddr = self.backing.translate(PhysAddr(gpaddr), false, true,
+                false, &mut self.pml)?;
 
             // Compute the remaining number of bytes on the page
             let page_remain = 0x1000 - (paddr.0 & 0xfff);
@@ -1068,7 +1294,8 @@ impl<'a> Worker<'a> {
         while buf.len() > 0 {
             if (paddr.0 & 0xfff) == 0 {
                 // Crossed into a new page, translate
-                paddr = self.translate(gpaddr, true, false, false)?;
+                paddr = self.backing.translate(gpaddr, true, false, false,
+                                               &mut self.pml)?;
             }
 
             // Compute the remaining number of bytes on the page
@@ -1112,7 +1339,8 @@ impl<'a> Worker<'a> {
         while buf.len() > 0 {
             if (paddr.0 & 0xfff) == 0 {
                 // Crossed into a new page, translate
-                paddr = self.translate(gpaddr, false, true, false)?;
+                paddr = self.backing.translate(gpaddr, false, true, false,
+                                               &mut self.pml)?;
             }
 
             // Compute the remaining number of bytes on the page
@@ -1133,189 +1361,6 @@ impl<'a> Worker<'a> {
         }
 
         Some(())
-    }
-
-    /// Translate a physical address for the guest into a physical address on
-    /// the host. If `write` is set, the translation will occur for a write
-    /// access, and thus the copy-on-write will be performed on the page if
-    /// needed to satisfy the write.
-    ///
-    /// If the physical address is not valid for the guest, this will return
-    /// `None`.
-    ///
-    /// The translation will only be valid for the page the `gpaddr` resides in
-    /// The returned physical address will have the offset from the physical
-    /// address applied. Such that a request for physical address `0x13371337`
-    /// would return a physical address ending in `0x337`
-    fn translate(&mut self, gpaddr: PhysAddr, _read: bool, write: bool,
-                 _exec: bool) -> Option<PhysAddr> {
-        // Get access to physical memory
-        let mut pmem = mm::PhysicalMemory;
-        
-        // Align the guest physical address
-        let align_gpaddr = PhysAddr(gpaddr.0 & !0xfff);
-        
-        // Attempt to translate the page, it is possible it has not yet been
-        // mapped and we need to page it in from the network mapped storage in
-        // the `FuzzTarget`
-        let translation = if !write {
-            self.backing.vm.ept().translate(align_gpaddr)
-        } else {
-            self.backing.vm.ept_mut().translate_int(align_gpaddr, write, false)
-        };
-        
-        // First, determine if we need to perform a CoW or make a mapping for
-        // an unmapped page
-        if let Some(Mapping {
-                pte: Some(pte), page: Some((orig_page, _, ent)), .. }) =
-                    translation {
-            // Page is mapped, it is possible it needs to be promoted to
-            // writable
-            let page_writable =
-                (unsafe { mm::read_phys::<u64>(pte) } & EPT_WRITE) != 0;
-
-            // If the page is writable, and this is is a write, OR if the
-            // operation is not a write, then the existing allocation can
-            // satisfy the translation request.
-            if (write && page_writable) || !write {
-                if write {
-                    // Check if the dirty bit was previously clear
-                    if (ent & EPT_DIRTY) == 0 {
-                        // Log that this page has been dirtied to the PML
-                        self.pml.push(align_gpaddr.0);
-                        
-                        // Set that the TLB should be flushed on next VM entry
-                        // as we changed dirty bits
-                        self.backing.vm.ept_dirty = true;
-                    }
-                }
-
-                return Some(PhysAddr(orig_page.0 + (gpaddr.0 & 0xfff)));
-            }
-        }
-
-        // At this stage, we either must perform a CoW or map an unmapped page
-
-        // Get the original contents of the page
-        let orig_page_gpaddr = if let Some(master) = &self.backing.master {
-            // Get the page from the master
-            master.get_page(align_gpaddr)?
-        } else if let Some(_) = &self.backing.network_mem {
-            self.backing.get_page(align_gpaddr)?
-        } else {
-            // Page is not present, and cannot be filled from the master or
-            // network memory
-            return None;
-        };
-
-        // Look up the physical page backing for the mapping
-
-        // Touch the page to make sure it's present
-        unsafe { core::ptr::read_volatile(orig_page_gpaddr.0 as *const u8); }
-        
-        let orig_page = {
-            // Get access to the host page table
-            let mut page_table = core!().boot_args.page_table.lock();
-            let page_table = page_table.as_mut().unwrap();
-
-            // Translate the mapping virtual address into a physical
-            // address
-            //
-            // This will always succeed as we touched the memory above
-            let (page, offset, _) =
-                page_table.translate(&mut pmem, orig_page_gpaddr)
-                    .map(|x| x.page).flatten()
-                    .expect("Whoa, memory page not mapped?!");
-            PhysAddr(page.0 + offset)
-        };
-
-        // Get a slice to the original read-only page
-        let ro_page = unsafe { mm::slice_phys_mut(orig_page, 4096) };
-
-        let page = if let Some(Mapping { pte: Some(pte), page: Some(_), .. }) =
-                translation {
-            // Promote the original page via CoW
-                
-            // Allocate a new page
-            let page = pmem.alloc_phys(
-                Layout::from_size_align(4096, 4096).unwrap()).unwrap();
-
-            // Get mutable access to the underlying page
-            let psl = unsafe { mm::slice_phys_mut(page, 4096) };
-
-            // Copy in the bytes to initialize the page from the network
-            // mapped memory
-            psl.copy_from_slice(&ro_page);
-
-            // Promote the page via CoW
-            unsafe {
-                mm::write_phys(pte, 
-                    page.0 | EPT_WRITE | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
-                    EPT_DIRTY | EPT_ACCESSED);
-
-                // Log that this page has been dirtied to the PML
-                self.pml.push(align_gpaddr.0);
-
-                // Mapping changed, we must invalidate the TLB on next VM
-                // entry
-                self.backing.vm.ept_dirty = true;
-            }
-
-            page
-        } else {
-            // Page was not mapped
-            if write {
-                // Page needs to be CoW-ed from the network mapped file
-
-                // Allocate a new page
-                let page = pmem.alloc_phys(
-                    Layout::from_size_align(4096, 4096).unwrap()).unwrap();
-
-                // Get mutable access to the underlying page
-                let psl = unsafe { mm::slice_phys_mut(page, 4096) };
-
-                // Copy in the bytes to initialize the page from the network
-                // mapped memory
-                psl.copy_from_slice(&ro_page);
-
-                unsafe {
-                    // Map in the page as RWX, WB, and already dirtied and
-                    // accessed (since we're getting write access to it)
-                    self.backing.vm.ept_mut().map_raw(align_gpaddr,
-                        PageType::Page4K,
-                        page.0 | EPT_READ | EPT_WRITE | EPT_EXEC |
-                        EPT_USER_EXEC | EPT_MEMTYPE_WB | EPT_DIRTY |
-                        EPT_ACCESSED)
-                        .unwrap();
-               
-                    // Memory was dirtied
-                    self.pml.push(align_gpaddr.0);
-                }
-
-                // Return the physical address of the new page
-                page
-            } else {
-                // Page is only being accessed for read. Alias the guest's
-                // physical memory directly into the network mapped page as
-                // read-only
-                
-                unsafe {
-                    // Map in the page as read-only into the guest page table
-                    self.backing.vm.ept_mut().map_raw(align_gpaddr,
-                        PageType::Page4K,
-                        orig_page.0 | EPT_READ | EPT_EXEC | EPT_USER_EXEC |
-                        EPT_MEMTYPE_WB)
-                        .unwrap();
-                }
-
-                // Return the physical address of the backing page
-                orig_page
-            }
-        };
-        
-        // Return the host physical address of the requested guest physical
-        // address
-        Some(PhysAddr(page.0 + (gpaddr.0 & 0xfff)))
     }
 }
 

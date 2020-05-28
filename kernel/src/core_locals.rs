@@ -1,9 +1,10 @@
 //! This file is used to hold and access all of the core locals
 
 use core::mem::size_of;
-use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU8, AtomicU32, AtomicU64,Ordering};
 use core::alloc::Layout;
 
+use crate::acpi;
 use crate::apic::Apic;
 use crate::mm::{FreeList, PhysContig};
 use crate::interrupts::Interrupts;
@@ -141,6 +142,9 @@ pub struct CoreLocals {
 
     /// Current active VM pointer from a `vmptrld`
     current_vm_ptr: AtomicU64,
+
+    /// NUMA node ID this core belongs to
+    node_id: AtomicU8,
 }
 
 /// Empty marker trait that requires `Sync`, such that we can compile-time
@@ -172,6 +176,25 @@ impl CoreLocals {
 
         // Get the free list corresponding to this size
         &self.free_lists[idx as usize - 3]
+    }
+
+    /// Commit some constant values in our core information
+    /// This may be information which was not available early during boot,
+    /// like NUMA information, but should be made constant such that it isn't
+    /// fetched from the source every access
+    pub unsafe fn latch(&self) {
+        // Store the NUMA node ID for this core
+        self.node_id.store(
+            acpi::APIC_TO_DOMAIN[self.apic_id().unwrap() as usize]
+                .load(Ordering::Relaxed),
+            Ordering::Relaxed);
+    }
+
+    /// Get the NUMA node ID this core belongs to, or zero if node information
+    /// is not available
+    #[inline]
+    pub fn node_id(&self) -> u8 {
+        self.node_id.load(Ordering::Relaxed)
     }
 
     /// Get access to the VMXON region
@@ -365,6 +388,8 @@ pub fn init(boot_args: PhysAddr, core_id: u32) {
 
         vmxon_region:   LockCell::new_no_preempt(None),
         current_vm_ptr: AtomicU64::new(!0),
+
+        node_id: AtomicU8::new(0),
 
         free_lists: [
             LockCell::new(FreeList::new(0x0000000000000008)),

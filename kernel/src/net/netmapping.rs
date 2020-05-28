@@ -18,8 +18,8 @@ use crate::interrupts::{register_fault_handler, FaultReg, PageFaultHandler};
 
 /// Structure to handle `NetMapping` page faults
 pub struct NetMapHandler {
-    /// Virtual address of the base of the mapping
-    vaddr: VirtAddr,
+    /// Virtual address of the base of the mapping for each NUMA node
+    vaddr: [VirtAddr; 8],
 
     /// A TCP port which we are bound to and able to recv from and send to
     tcp: BufferedIo<TcpConnection>,
@@ -40,8 +40,11 @@ pub struct NetMapHandler {
 
 impl PageFaultHandler for NetMapHandler {
     unsafe fn page_fault(&mut self, fault_addr: VirtAddr, code: u64) -> bool {
+        // Get the virtual address for this NUMA node
+        let vaddr = self.vaddr[core!().node_id() as usize];
+
         // Compute the ending virtual address for our mapping
-        let end = VirtAddr(self.vaddr.0 + (self.size as u64 - 1));
+        let end = VirtAddr(vaddr.0 + (self.size as u64 - 1));
 
         // If there is a write access to a read only mapping, return unhandled
         if self.read_only && (code & (1 << 1)) != 0 {
@@ -49,7 +52,7 @@ impl PageFaultHandler for NetMapHandler {
         }
 
         // Check if this fault happened in our mapping range
-        if fault_addr >= self.vaddr && fault_addr <= end {
+        if fault_addr >= vaddr && fault_addr <= end {
             // Prevent 2 handlers at the same time
             let _lock = self.handling.lock();
 
@@ -74,7 +77,7 @@ impl PageFaultHandler for NetMapHandler {
 
             // Compute the offset into the mapping that this fault represents
             // and page align it
-            let offset = ((fault_addr.0 & !0xfff) - self.vaddr.0) as usize;
+            let offset = ((fault_addr.0 & !0xfff) - vaddr.0) as usize;
 
             // Request the file contents at this offset
             ServerMessage::ReadPage {
@@ -130,8 +133,8 @@ impl PageFaultHandler for NetMapHandler {
 /// A network backed mapping of `u8`s which will be faulted in upon access per
 /// page
 pub struct NetMapping<'a> {
-    /// Slice to the raw contents of the mapping
-    backing: &'a mut [u8],
+    /// Slice to the raw contents of the mapping for each NUMA node
+    backings: [&'a mut [u8]; 8],
  
     /// Registration for the fault handler
     _fault_reg: FaultReg,
@@ -165,11 +168,20 @@ impl<'a> NetMapping<'a> {
 
         // Allocate virtual memory capable of holding the file
         let size_align = size.checked_add(0xfff)? & !0xfff;
-        let virt_addr  = crate::mm::alloc_virt_addr_4k(size_align as u64);
+        let virt_addrs = [
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+            crate::mm::alloc_virt_addr_4k(size_align as u64),
+        ];
 
         // Create a fault handler entry
         let handler = Box::new(NetMapHandler {
-            vaddr:     virt_addr,
+            vaddr:     virt_addrs,
             file_id:   file_id,
             tcp:       tcp,
             size:      size,
@@ -178,9 +190,25 @@ impl<'a> NetMapping<'a> {
         });
 
         Some(NetMapping {
-            backing: unsafe {
-                core::slice::from_raw_parts_mut(virt_addr.0 as *mut u8,
-                                                size.try_into().ok()?)
+            backings: unsafe {
+                [
+                    core::slice::from_raw_parts_mut(virt_addrs[0].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                    core::slice::from_raw_parts_mut(virt_addrs[1].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                    core::slice::from_raw_parts_mut(virt_addrs[2].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                    core::slice::from_raw_parts_mut(virt_addrs[3].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                    core::slice::from_raw_parts_mut(virt_addrs[4].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                    core::slice::from_raw_parts_mut(virt_addrs[5].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                    core::slice::from_raw_parts_mut(virt_addrs[6].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                    core::slice::from_raw_parts_mut(virt_addrs[7].0 as *mut u8,
+                                                    size.try_into().ok()?),
+                ]
             },
             _fault_reg: register_fault_handler(handler),
             read_only,
@@ -191,7 +219,7 @@ impl<'a> NetMapping<'a> {
 impl<'a> Deref for NetMapping<'a> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        self.backing
+        self.backings[core!().node_id() as usize]
     }
 }
 
@@ -199,8 +227,7 @@ impl<'a> DerefMut for NetMapping<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         assert!(!self.read_only,
                 "Attempted write access to read-only network mapping");
-
-        self.backing
+        self.backings[core!().node_id() as usize]
     }
 }
 

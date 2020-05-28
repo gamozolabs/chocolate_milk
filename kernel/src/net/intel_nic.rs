@@ -134,7 +134,6 @@ pub fn probe(device: &PciDevice) -> Option<Arc<NetDevice>> {
         // 82574L Gigabit Network Connection "e1000e"
         (0x8086, 0x10d3, E1000_REGS),
 
-        /*
         // I210 Gigabit Network Connection
         (0x8086, 0x1533, NicRegisters {
             ctrl:     0x0000,
@@ -160,7 +159,34 @@ pub fn probe(device: &PciDevice) -> Option<Arc<NetDevice>> {
             fctrl:    None,
             rxctrl:   None,
             ctrl_ext: Some(0x0018),
-        }),*/
+        }),
+        
+        // I350 Gigabit Network Connection
+        (0x8086, 0x1521, NicRegisters {
+            ctrl:     0x0000,
+            imc:      0x00d8,
+            rdbal:    0x2800,
+            rdbah:    0x2804,
+            rdlen:    0x2808,
+            rdh:      0x2810,
+            rdt:      0x2818,
+            tdbal:    0x3800,
+            tdbah:    0x3804,
+            tdlen:    0x3808,
+            tdh:      0x3810,
+            tdt:      0x3818,
+            ral0:     0x5400,
+            rah0:     0x5404,
+            rctl:     Some(0x0100),
+            tctl:     Some(0x0400),
+            rxdctl:   Some(0x2828),
+            txdctl:   Some(0x3828),
+            srrctl:   Some(0xc00c),
+            dmatxctl: None,
+            fctrl:    None,
+            rxctrl:   None,
+            ctrl_ext: Some(0x0018),
+        }),
 
         // Ethernet Converged Network Adapter X540-T1
         (0x8086, 0x1528, NicRegisters {
@@ -194,6 +220,11 @@ pub fn probe(device: &PciDevice) -> Option<Arc<NetDevice>> {
     for &(vid, did, regs) in HANDLED_DEVICES {
         // Check if the VID:DID match what we support
         if device.header.vendor_id == vid && device.header.device_id == did {
+            if device.bar0 == 2864185344 || device.bar0 == 2863136768 ||
+                    device.bar0 == 2862612480 {
+                continue;
+            }
+
             // Create the new device
             return Some(
                 NetDevice::new(Box::new(IntelGbit::new(*device, regs)))

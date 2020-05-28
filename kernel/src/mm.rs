@@ -2,6 +2,7 @@
 
 use core::marker::PhantomData;
 use core::mem::size_of;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::alloc::{Layout, GlobalAlloc};
 use core::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
@@ -10,20 +11,20 @@ use alloc::collections::BTreeMap;
 
 use crate::acpi::MAX_CORES;
 
-use rangeset::Range;
+use rangeset::RangeSet;
 use boot_args::{KERNEL_PHYS_WINDOW_BASE, KERNEL_PHYS_WINDOW_SIZE};
 use boot_args::KERNEL_VMEM_BASE;
 use page_table::{PhysMem, PhysAddr, PageType, VirtAddr};
 
 /// Table which is indexed by an APIC identifier to map to a physical range
 /// which is local to it its NUMA node
-static APIC_TO_MEMORY_RANGE: AtomicPtr<[Option<Range>; MAX_CORES]> =
+static APIC_TO_MEMORY_RANGE: AtomicPtr<[Option<RangeSet>; MAX_CORES]> =
     AtomicPtr::new(core::ptr::null_mut());
 
 /// Get the preferred memory range for the currently running APIC. Returns
 /// `None` if we have no valid APIC ID yet, or we do not have NUMA knowledge
 /// of the current APIC ID
-pub fn memory_range() -> Option<Range> {
+pub fn memory_range<'a>() -> Option<&'a RangeSet> {
     // Check to see if the `APIC_TO_MEMORY_RANGE` has been initialized
     let atmr = APIC_TO_MEMORY_RANGE.load(Ordering::SeqCst);
     if atmr.is_null() {
@@ -34,24 +35,31 @@ pub fn memory_range() -> Option<Range> {
     let atmr = unsafe { &*atmr };
 
     // Based on our current APIC ID look up the memory range
-    core!().apic_id().and_then(|x| atmr[x as usize])
+    core!().apic_id().and_then(|x| atmr[x as usize].as_ref())
 }
 
 /// Establish the `APIC_TO_MEMORY_RANGE` global with the APIC IDs to their
 /// corresponding NUMA-local memory regions
 pub unsafe fn register_numa_nodes(apic_to_domain: BTreeMap<u32, u32>,
-        domain_to_mem: BTreeMap<u32, (PhysAddr, u64)>) {
+        domain_to_mem: BTreeMap<u32, RangeSet>) {
     // Create a heap-based database
-    let mut apic_mappings = Box::new([None; MAX_CORES]);
+    let mut apic_mappings: Box<MaybeUninit<[Option<RangeSet>; MAX_CORES]>> =
+        Box::new_uninit();
+
+    // Initialize the heap based memory
+    for core in 0..MAX_CORES {
+        let foo = apic_mappings.as_mut_ptr() as *mut Option<RangeSet>;
+        core::ptr::write(foo.offset(core as isize), None);
+    }
+
+    // APIC mappings are now initialized
+    let mut apic_mappings = apic_mappings.assume_init();
 
     // Go through each APIC to domain mapping
     for (&apic, domain) in apic_to_domain.iter() {
         apic_mappings[apic as usize] = domain_to_mem.get(domain)
-            .and_then(|&(paddr, size)| {
-                Some(Range {
-                    start: paddr.0,
-                    end:   paddr.0.checked_add(size.checked_sub(1)?)?,
-                })
+            .and_then(|&rs| {
+                Some(rs)
             });
     }
 
