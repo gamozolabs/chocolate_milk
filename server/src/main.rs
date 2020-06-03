@@ -40,6 +40,9 @@ struct Session<'a> {
     
     /// Number of cycles spent resetting the VM
     reset_cycles: u64,
+    
+    /// Number of cycles spent injecting the fuzz case
+    inject_cycles: u64,
 
     /// Total cycles spent fuzzing
     total_cycles: u64,
@@ -112,13 +115,17 @@ fn stats(context: Arc<Context>) {
 
             let reset_pct =
                 session.reset_cycles as f64 / session.total_cycles as f64;
+            let inject_pct =
+                session.inject_cycles as f64 / session.total_cycles as f64;
             let vm_pct =
                 session.vm_cycles as f64 / session.total_cycles as f64;
+            let unac_pct = 1.0 - (reset_pct + inject_pct + vm_pct);
 
             print!("\x1b[34;1m    workers {:3} | cov {:8} ({:8}) | \
                         inp {:8} ({:8}) | \
-                        cases {:14} [{:12.2} / s] | vm {:8.4} | \
-                        reset {:8.4} | {:016x} {}\x1b[0m\n",
+                        cases {:14} [{:12.2} / s]\n    \
+                        >>> reset {:8.4} | inject {:8.4} | vm {:8.4} | \
+                        unaccounted {:8.4} | {:016x} {}\x1b[0m\n",
                    session.workers.len(),
                    session.coverage.len(),
                    session.unique_coverage,
@@ -126,8 +133,10 @@ fn stats(context: Arc<Context>) {
                    session.unique_inputs,
                    session.fuzz_cases,
                    session.fuzz_cases as f64 / uptime,
-                   vm_pct,
                    reset_pct,
+                   inject_pct,
+                   vm_pct,
+                   unac_pct,
                    session.id,
                    if unresponsive { "???" } else { "" });
 
@@ -194,22 +203,23 @@ fn handle_client(stream: TcpStream,
 
         match msg {
             ServerMessage::ReportStatistics { fuzz_cases, total_cycles,
-                    vm_cycles, reset_cycles, allocs, frees,
+                    vm_cycles, reset_cycles, inject_cycles, allocs, frees,
                     phys_free, phys_total, vm_exits } => {
                 // Get access to the client and session
                 let client = client.unwrap();
                 let mut session = client.session.write().unwrap();
 
                 // Update the client statistics
-                session.fuzz_cases   = fuzz_cases;
-                session.total_cycles = total_cycles;
-                session.vm_cycles    = vm_cycles;
-                session.reset_cycles = reset_cycles;
-                session.vm_exits     = vm_exits;
-                session.allocs       = allocs;
-                session.frees        = frees;
-                session.phys_free    = phys_free;
-                session.phys_total   = phys_total;
+                session.fuzz_cases    = fuzz_cases;
+                session.total_cycles  = total_cycles;
+                session.vm_cycles     = vm_cycles;
+                session.reset_cycles  = reset_cycles;
+                session.inject_cycles = inject_cycles;
+                session.vm_exits      = vm_exits;
+                session.allocs        = allocs;
+                session.frees         = frees;
+                session.phys_free     = phys_free;
+                session.phys_total    = phys_total;
 
                 {
                     // Get access to the global input database
@@ -225,10 +235,11 @@ fn handle_client(stream: TcpStream,
                                 hash:  x.hash,
                                 input: x.input.clone(),
                             }).collect();
+                        let delta = &delta[..core::cmp::min(128, delta.len())];
 
                         // Send the input deltas to the worker
                         ServerMessage::Inputs(
-                            Cow::Borrowed(delta.as_slice()))
+                            Cow::Borrowed(delta))
                             .serialize(&mut stream).unwrap();
                         stream.flush().unwrap();
                     }
@@ -249,10 +260,11 @@ fn handle_client(stream: TcpStream,
                                     .map(|x| Cow::Owned((**x).clone())),
                                 offset: x.offset,
                             }).collect();
+                        let delta = &delta[..core::cmp::min(128, delta.len())];
 
                         // Send the coverage deltas to the worker
                         ServerMessage::Coverage(
-                            Cow::Borrowed(delta.as_slice()))
+                            Cow::Borrowed(delta))
                             .serialize(&mut stream).unwrap();
                         stream.flush().unwrap();
                     }
@@ -299,6 +311,7 @@ fn handle_client(stream: TcpStream,
                             fuzz_cases:      0,
                             total_cycles:    0,
                             reset_cycles:    0,
+                            inject_cycles:   0,
                             vm_cycles:       0,
                             vm_exits:        0,
                             unique_coverage: 0,
@@ -445,12 +458,14 @@ fn handle_client(stream: TcpStream,
                 // Attempt to get access to the file contents at the requested
                 // location
                 let sliced = file_db.get(&id).and_then(|(_, x)| {
-                    x.get(offset..offset + 4096)
+                    let to_copy = core::cmp::min(
+                        x.len().checked_sub(offset).unwrap(), 4096);
+                    x.get(offset..offset + to_copy)
                 });
 
                 if let Some(sliced) = sliced {
                     let mut tmp = [0u8; 4096];
-                    tmp.copy_from_slice(sliced);
+                    tmp[..sliced.len()].copy_from_slice(sliced);
 
                     ServerMessage::ReadPageResponse(tmp)
                         .serialize(&mut stream).unwrap();

@@ -1,12 +1,11 @@
+use core::any::Any;
 use alloc::sync::Arc;
 use alloc::boxed::Box;
 
-//use crate::vtx::Register;
 use crate::core_locals::LockInterrupts;
 use crate::fuzz_session::{Worker, FuzzSession};
 
 use lockcell::LockCell;
-//use page_table::VirtAddr;
 
 pub fn fuzz() {
     //if core!().id != 0 { cpu::halt(); }
@@ -20,15 +19,11 @@ pub fn fuzz() {
     let session = {
         let mut session = SESSION.lock();
         if session.is_none() {
+            print!("LETS FUZZ!\n");
             *session = Some(
                 Arc::new(FuzzSession::from_falkdump(
-                        "192.168.101.1:1911", "out.falkdump", |_worker| {
-                    //_worker.set_reg(crate::vtx::Register::Rsp, 0x13371337);
-                    //_worker.set_reg(crate::vtx::Register::Cr3, 0x3713371337);
-                    /*let rip = _worker.reg(Register::Rip);
-                    let cr3 = _worker.reg(Register::Cr3);
-                    _worker.write_virt_cr3_from(
-                        VirtAddr(rip), b"\xeb\xfe", cr3).unwrap();*/
+                        "192.168.101.1:1911", "test.falkdump", |_worker| {
+                    // Mutate the master at this point
                 })
                 .timeout(1_000_000)
                 .inject(inject))
@@ -44,14 +39,10 @@ pub fn fuzz() {
                 crate::fuzz_session::windows::Enlightenment::default())));
 
     loop {
-        let _vmexit = worker.fuzz_case();
-        //print!("{:#x?}\n", _vmexit);
-        //crate::time::sleep(1_000_000);
+        let _vmexit = worker.fuzz_case(&mut ());
     }
 }
 
-fn inject(worker: &mut Worker) {
-    let mut input = worker.fuzz_input.borrow_mut();
-    input.clear();
+fn inject(_worker: &mut Worker, _context: &mut dyn Any) {
 }
 

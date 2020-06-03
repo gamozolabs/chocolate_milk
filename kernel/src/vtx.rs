@@ -8,6 +8,7 @@
 use core::mem::size_of;
 use core::sync::atomic::Ordering::SeqCst;
 use page_table::{PhysAddr, VirtAddr};
+use alloc::vec::Vec;
 use crate::mm::PhysContig;
 use crate::ept::Ept;
 use crate::interrupts::Tss;
@@ -118,11 +119,23 @@ enum Vmcs {
     /// VM exit reason
     ExitReason = 0x00004402,
     
+    /// VM entry interruption information
+    EntryInterruptionInformation = 0x4016,
+    
+    /// VM entry interruption error code
+    EntryInterruptionErrorCode = 0x4018,
+
+    /// Length of instruction to set for VM entry event injection
+    EntryInstructionLength = 0x401a,
+    
     /// VM exit interruption information
-    InterruptionInformation = 0x4404,
+    ExitInterruptionInformation = 0x4404,
     
     /// VM exit interruption error code
-    InterruptionErrorCode = 0x4406,
+    ExitInterruptionErrorCode = 0x4406,
+
+    /// Length of the instruction which caused the VM exit
+    ExitInstructionLength = 0x440c,
 
     /// VM exit qualification
     ExitQualification = 0x6400,
@@ -376,9 +389,6 @@ enum Vmcs {
     /// Guest physical address (used in EPT violations)
     GuestPhysicalAddress = 0x2400,
 
-    /// Length of the instruction which caused the VM exit
-    VmExitInstructionLength = 0x440c,
-
     /// Page modification logging physical address (4 KiB page)
     PmlAddress = 0x200e,
 
@@ -536,6 +546,14 @@ pub enum Register {
     PinBasedControls,
     ExitControls,
     EntryControls,
+    
+    EntryInterruptionInformation,
+    EntryInterruptionErrorCode,
+    EntryInstructionLength,
+
+    ExitInterruptionInformation,
+    ExitInterruptionErrorCode,
+    ExitInstructionLength,
 
     NumRegisters,
 }
@@ -645,9 +663,21 @@ const REG_TYPES: &[(Register, RegType)] = &[
     (Register::PinBasedControls, RegType::Vmcs(Vmcs::PinBasedControls)),
     (Register::ExitControls, RegType::Vmcs(Vmcs::ExitControls)),
     (Register::EntryControls, RegType::Vmcs(Vmcs::EntryControls)),
+    (Register::EntryInterruptionInformation,
+        RegType::Vmcs(Vmcs::EntryInterruptionInformation)),
+    (Register::EntryInterruptionErrorCode,
+        RegType::Vmcs(Vmcs::EntryInterruptionErrorCode)),
+    (Register::EntryInstructionLength,
+        RegType::Vmcs(Vmcs::EntryInstructionLength)),
+    (Register::ExitInterruptionInformation,
+        RegType::Vmcs(Vmcs::ExitInterruptionInformation)),
+    (Register::ExitInterruptionErrorCode,
+        RegType::Vmcs(Vmcs::ExitInterruptionErrorCode)),
+    (Register::ExitInstructionLength,
+        RegType::Vmcs(Vmcs::ExitInstructionLength)),
 ];
 
-/// General purpose register state
+/// System register state for a single CPU
 #[repr(C)]
 pub struct RegisterState {
     registers: [u64; Register::NumRegisters as usize],
@@ -683,7 +713,7 @@ impl RegisterState {
         }
 
         // Copy the fxsave unconditionally
-        //self.fxsave = other.fxsave;
+        self.fxsave = other.fxsave;
     }
 
     /// Get the value of a register, if and only if it is cached. This doesn't
@@ -822,6 +852,49 @@ impl Default for RegisterState {
     }
 }
 
+/// System register states for all cores
+pub struct RegisterStates {
+    /// Active register state index
+    active_cpu: usize,
+
+    /// Time stamp counter
+    pub tsc: u64,
+
+    /// Guest register states
+    pub guest_regs: Vec<RegisterState>,
+}
+
+impl RegisterStates {
+    /// Create a new register state capable of holding `cpu`s worth of register
+    /// states
+    pub fn new(cpus: usize) -> Self {
+        assert!(cpus > 0, "Whoa, we can't make register states with 0 CPUs");
+
+        RegisterStates {
+            active_cpu: 0,
+            tsc:        0,
+            guest_regs: (0..cpus).map(|_| RegisterState::default()).collect(),
+        }
+    }
+
+    /// Copy the register state from another one
+    pub fn copy_regs_from(&mut self, other: &RegisterStates) {
+        assert!(self.guest_regs.len() == other.guest_regs.len(),
+            "copy_regs_from() not allowed from machine with fewer cores");
+
+        // Copy all register states
+        for ii in 0..self.guest_regs.len() {
+            self.guest_regs[ii].copy_from(&other.guest_regs[ii]);
+        }
+
+        // Copy the tsc state
+        self.tsc = other.tsc;
+
+        // Update the active cpu
+        self.active_cpu = other.active_cpu;
+    }
+}
+
 /// An x86 exception
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Exception {
@@ -901,6 +974,7 @@ impl From<u8> for Exception {
 /// Virtual machine exit reason
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum VmExit {
+    Io,
     MonitorTrap,
     EptViolation {
         addr:  PhysAddr,
@@ -961,7 +1035,7 @@ pub struct Vm {
     pub ept_dirty: bool,
 
     /// Guest registers
-    pub guest_regs: RegisterState,
+    pub guest_regs: RegisterStates,
 
     /// Tracks if this VM is currently launched (thus, `vmresume` should be
     /// used)
@@ -972,8 +1046,8 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Create a new virtual machine
-    pub fn new() -> Vm {
+    /// Create a new virtual machine with `cpus` CPUs
+    pub fn new(cpus: usize) -> Vm {
         // Make sure `REG_TYPES` is well formed
         for reg in 0..Register::NumRegisters as usize {
             assert!(reg == REG_TYPES[reg].0 as usize,
@@ -1020,7 +1094,8 @@ impl Vm {
                 "EPT does not support all requested features");
         }
 
-        let mut guest_regs = RegisterState::default();
+        // Create empty register states for all cores
+        let mut guest_regs = RegisterStates::new(cpus);
 
         unsafe {
             // Get access to the VMXON region
@@ -1199,17 +1274,20 @@ impl Vm {
                 }
             }
 
-            // Establish the VM controls
-            guest_regs.set_reg(Register::PinBasedControls,
-                         pinbased_minimum | pin_on);
-            guest_regs.set_reg(Register::ProcBasedControls,
-                         procbased_minimum | proc_on);
-            guest_regs.set_reg(Register::ProcBasedControls2,
-                         proc2based_minimum | proc2_on);
-            guest_regs.set_reg(Register::ExitControls, 
-                        exit_minimum | exit_on);
-            guest_regs.set_reg(Register::EntryControls, 
-                        entry_minimum | entry_on);
+            // Set up the VM controls for each CPU
+            for grs in guest_regs.guest_regs.iter_mut() {
+                // Establish the VM controls
+                grs.set_reg(Register::PinBasedControls,
+                            pinbased_minimum | pin_on);
+                grs.set_reg(Register::ProcBasedControls,
+                            procbased_minimum | proc_on);
+                grs.set_reg(Register::ProcBasedControls2,
+                            proc2based_minimum | proc2_on);
+                grs.set_reg(Register::ExitControls, 
+                            exit_minimum | exit_on);
+                grs.set_reg(Register::EntryControls, 
+                            entry_minimum | entry_on);
+            }
         }
 
         Vm {
@@ -1236,23 +1314,60 @@ impl Vm {
     pub fn ept_mut(&mut self) -> &mut Ept {
         &mut self.ept
     }
+
+    /// Switch to another CPU context
+    pub fn switch_cpu(&mut self, cpu: usize) {
+        // Make sure the `cpu` is in bounds of the number of CPUs on the system
+        assert!(cpu < self.guest_regs.guest_regs.len(),
+            "Target CPU not in bounds of CPUs for VM");
+
+        // Set the active CPU
+        self.guest_regs.active_cpu = cpu;
+
+        // Mark all registers as dirty, meaning they'll all be updated upon
+        // the next VM entry
+        self.guest_regs.guest_regs[cpu].dirtied.iter_mut()
+            .for_each(|x| *x = !0);
+    }
+
+    /// Get the current active CPU
+    #[inline]
+    pub fn active_cpu(&self) -> usize {
+        self.guest_regs.active_cpu
+    }
+
+    /// Get the number of CPUs for this VM
+    #[inline]
+    pub fn cpus(&self) -> usize {
+        self.guest_regs.guest_regs.len()
+    }
+
+    /// Get the current active register states
+    #[inline]
+    pub fn active_register_state(&mut self) -> &mut RegisterState {
+        let ac = self.active_cpu();
+        &mut self.guest_regs.guest_regs[ac]
+    }
     
     /// Get a register
     #[inline]
     pub fn reg(&mut self, reg: Register) -> u64 {
-        self.guest_regs.reg(reg)
+        let ac = self.active_cpu();
+        self.guest_regs.guest_regs[ac].reg(reg)
     }
 
     /// Set a register to the internal cache
     #[inline]
     pub fn set_reg(&mut self, reg: Register, val: u64) {
-        self.guest_regs.set_reg(reg, val);
+        let ac = self.active_cpu();
+        self.guest_regs.guest_regs[ac].set_reg(reg, val);
     }
 
     /// Set the fxsave state for the VM
     #[inline]
     pub fn set_fxsave(&mut self, fxsave: FxSave) {
-        self.guest_regs.set_fxsave(fxsave);
+        let ac = self.active_cpu();
+        self.guest_regs.guest_regs[ac].set_fxsave(fxsave);
     }
 
     /// Get access to the page modification log
@@ -1302,7 +1417,7 @@ impl Vm {
                         self.ept.table().0 | (3 << 3) | (1 << 6) | 6);
 
                 // Exit on all exceptions
-                vmwrite(Vmcs::ExceptionBitmap, !0 & !(1 << 14));
+                vmwrite(Vmcs::ExceptionBitmap, !0);
 
                 // Write in the host state which will not change per run
 
@@ -1361,8 +1476,9 @@ impl Vm {
         }
         
         // Make sure the fxsave starts at `0x400` from the `guest_regs`
-        assert!((&self.guest_regs.fxsave as *const _ as usize -
-                 &self.guest_regs as *const _ as usize) == 0x400);
+        assert!((&self.guest_regs.guest_regs[0].fxsave as *const _ as usize -
+                 &self.guest_regs.guest_regs[0] as *const _ as usize) ==
+                 0x400);
          
         // Time spent inside the VM
         let vm_cycles;
@@ -1385,14 +1501,17 @@ impl Vm {
             }
             
             // Flush any registers which may have changed during execution
-            let dirtied = self.guest_regs.dirtied;
+            let ac = self.active_cpu();
+            let guest_regs = &mut self.guest_regs.guest_regs[ac];
+            let mut dirtied = guest_regs.dirtied;
+            dirtied.iter_mut().for_each(|x| *x = !0);
             for (byte, &st) in dirtied.iter().enumerate() {
                 if st == 0 { continue; }
                 for bit in 0..8 {
                     if (st & (1 << bit)) != 0 {
                         let idx = byte * 8 + bit;
                         if idx < Register::NumRegisters as usize {
-                            self.guest_regs.flush_reg(idx);
+                            guest_regs.flush_reg(idx);
                         }
                     }
                 }
@@ -1524,13 +1643,13 @@ impl Vm {
 
             "# ::
             "{rcx}"(&mut self.host_regs),
-            "{rdx}"(&mut self.guest_regs),
+            "{rdx}"(guest_regs as *mut RegisterState),
             "{edi}"(self.launched as u32) :
             "memory", "rax", "rbx", "cc" : "intel", "volatile");
 
             // Mark that nothing is cached anymore (dirtied is already clear
             // from the prior flushes)
-            self.guest_regs.cached.iter_mut().for_each(|x| *x = 0);
+            guest_regs.cached.iter_mut().for_each(|x| *x = 0);
 
             // Record the time spent in the VM
             vm_cycles = cpu::rdtsc() - it;
@@ -1548,18 +1667,14 @@ impl Vm {
         let vmexit = match unsafe { vmread(Vmcs::ExitReason) } {
             0 => {
                 // Exception or NMI
-                let int_info = unsafe {
-                    vmread(Vmcs::InterruptionInformation)
-                };
+                let int_info = self.reg(Register::ExitInterruptionInformation);
                
                 // Convert the interrupt vector into an exception
                 let mut exception: Exception = (int_info as u8).into();
 
                 if let Exception::GeneralProtectionFault(ref mut info) =
                         exception {
-                    *info = unsafe {
-                        vmread(Vmcs::InterruptionErrorCode)
-                    };
+                    *info = self.reg(Register::ExitInterruptionErrorCode);
                 }
 
                 // If this exception was a page fault, store the faulting
@@ -1577,9 +1692,7 @@ impl Vm {
                     });
 
                     // Get the error for the exception
-                    let error = unsafe {
-                        vmread(Vmcs::InterruptionErrorCode)
-                    };
+                    let error = self.reg(Register::ExitInterruptionErrorCode);
 
                     // Extract the access fault information from the fault
                     *present = (error & (1 << 0)) != 0;
@@ -1592,9 +1705,7 @@ impl Vm {
             }
             1 => VmExit::ExternalInterrupt,
             16 => {
-                let inst_len = unsafe {
-                    vmread(Vmcs::VmExitInstructionLength)
-                };
+                let inst_len = self.reg(Register::ExitInstructionLength);
                 VmExit::Rdtsc { inst_len }
             }
             28 => {
@@ -1606,9 +1717,7 @@ impl Vm {
                 let typ = (exit_qual >> 4) & 3;
                 let gpr = ((exit_qual >> 8) & 0xf) as u8;
 
-                let inst_len = unsafe {
-                    vmread(Vmcs::VmExitInstructionLength)
-                };
+                let inst_len = self.reg(Register::ExitInstructionLength);
 
                 match typ {
                     0 => {
@@ -1622,18 +1731,17 @@ impl Vm {
                     _ => panic!("Unexpected read/write to control register"),
                 }
             }
+            30 => {
+                VmExit::Io
+            }
             31 => {
                 // Read an MSR
-                let inst_len = unsafe {
-                    vmread(Vmcs::VmExitInstructionLength)
-                };
+                let inst_len = self.reg(Register::ExitInstructionLength);
                 VmExit::ReadMsr { inst_len }
             }
             32 => {
                 // Write an MSR
-                let inst_len = unsafe {
-                    vmread(Vmcs::VmExitInstructionLength)
-                };
+                let inst_len = self.reg(Register::ExitInstructionLength);
                 VmExit::WriteMsr { inst_len }
             }
             37 => {

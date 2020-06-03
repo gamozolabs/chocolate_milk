@@ -32,6 +32,8 @@ pub mod test_fuzzer;
 pub mod ept;
 pub mod paging;
 
+pub mod redacted;
+
 use page_table::PhysAddr;
 
 /// Release the early boot stack such that other cores can use it by marking
@@ -94,7 +96,11 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // which has a "main" or something and call `mod::main()`
     // ====================================================================
 
-    test_fuzzer::fuzz();
+    //test_fuzzer::fuzz();
+    
+    {
+        redacted::fuzz();
+    }
 
     cpu::halt();
 }

@@ -39,6 +39,11 @@ pub unsafe fn attempt_soft_reboot() {
     // Attempt to get a byte from the serial port
     let byte = core!().boot_args.serial.lock().as_mut().unwrap().read_byte();
 
+    // Check if we got a halt request from the serial port
+    if let Some(b'H') = byte {
+        panic!("Halt requested from timer");
+    }
+
     // Check if we got a 'Z' from the serial port.
     if let Some(b'Z') = byte {
         // Request a soft reboot

@@ -11,10 +11,10 @@ git clone https://github.com/qemu/QEMU
 
 ```
 diff --git a/target/i386/arch_dump.c b/target/i386/arch_dump.c
-index 004141fc04..aa71c6f878 100644
+index 004141fc04..7a407b2d48 100644
 --- a/target/i386/arch_dump.c
 +++ b/target/i386/arch_dump.c
-@@ -264,6 +264,17 @@ struct QEMUCPUState {
+@@ -264,6 +264,21 @@ struct QEMUCPUState {
       * by checking 'size' field.
       */
      uint64_t kernel_gs_base;
@@ -28,11 +28,15 @@ index 004141fc04..aa71c6f878 100644
 +    uint64_t sysenter_eip;
 +    uint64_t efer;
 +    uint64_t dr[8];
++    uint64_t tsc;
++    uint64_t tsc_adjust;
++    uint64_t tsc_deadline;
++    uint64_t tsc_aux;
 +    X86LegacyXSaveArea xsave;
  };
  
  typedef struct QEMUCPUState QEMUCPUState;
-@@ -322,8 +333,45 @@ static void qemu_get_cpustate(QEMUCPUState *s, CPUX86State *env)
+@@ -322,8 +337,50 @@ static void qemu_get_cpustate(QEMUCPUState *s, CPUX86State *env)
      s->cr[3] = env->cr[3];
      s->cr[4] = env->cr[4];
  
@@ -49,6 +53,11 @@ index 004141fc04..aa71c6f878 100644
 +    s->sysenter_eip = env->sysenter_eip;
 +    s->efer = env->efer;
 +    memcpy(s->dr, env->dr, sizeof(s->dr));
++
++    s->tsc          = env->tsc;
++    s->tsc_adjust   = env->tsc_adjust;
++    s->tsc_deadline = env->tsc_deadline;
++    s->tsc_aux      = env->tsc_aux;
 +
 +    int fpus, fptag, i;
 +
@@ -101,3 +110,6 @@ KVM for the virt speedup during snapshotting.
 ~/qemu_build/x86_64-softmmu/qemu-system-x86_64 -hda ./DISK.qcow2 -enable-kvm -m 4G -cpu core2duo -smp 1 -vga std -netdev tap,ifname=virbr1-nic,id=mynet -device driver=e1000,netdev=mynet
 ```
 
+## Take a snapshot
+
+Arrange the guest with GDB to be at the right location. Once you found the right place, go into the QEMU monitor and type `dump-guest-memory <filename>`. This file is directly what is consumed by chocolate milk!

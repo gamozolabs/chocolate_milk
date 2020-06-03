@@ -164,7 +164,7 @@ impl Writer for Vec<u8> {
     }
 }
 
-/// Serialize a `self` into an existing vector
+/// Serialize a `self` into a writer
 pub trait Serialize {
     fn serialize<W: Writer>(&self, writer: &mut W) -> Option<()>;
 }

@@ -175,8 +175,8 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
                 // amount of time that we can affordibly use RDTSC now to
                 // enforce a seconds-based timeout
                 if timeout == 0 {
-                    // 1 second on a 3 GHz processor
-                    timeout = rdtsc() + 3_000_000_000;
+                    // 3 seconds on a 3 GHz processor
+                    timeout = rdtsc() + 3_000_000_000 * 3;
                 } else {
                     if rdtsc() >= timeout {
                         let owner_loc = self.owner_location
