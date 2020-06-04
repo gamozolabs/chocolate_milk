@@ -120,6 +120,14 @@ impl TcpConnectionInt {
             return None;
         }
 
+        // If we got a reset, we're all done, we should actually handle FINs
+        // and closing the connection, but this will do the trick good enough
+        // for now.
+        if tcp.flags & TCP_RST != 0 {
+            self.state = TcpState::Closed;
+            return None;
+        }
+
         // We only ever expect acks at this point
         if tcp.flags & TCP_ACK == 0 {
             return None;

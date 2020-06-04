@@ -7,15 +7,17 @@ use std::io::{self, Write};
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, Duration};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, TcpStream, TcpListener};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, BTreeMap, HashMap};
 use std::collections::hash_map::DefaultHasher;
 
 use noodle::*;
-use falktp::{CoverageRecord, InputRecord, ServerMessage};
+use falktp::{CoverageRecord, InputRecord, ServerMessage, CrashType};
+use falktp::PageFaultType;
 
 /// If `true` prints some extra spew
 const VERBOSE: bool = false;
@@ -159,12 +161,18 @@ fn stats(context: Arc<Context>) {
 
         let cases_delta = total_cases.saturating_sub(last_cases);
         let coverage = context.coverage.read().unwrap().len();
+        let crashes  = context.crashes.read().unwrap().len();
         print!("\x1b[32;1mTOTALS: workers {:5} ({:3}) | cases {:14} \
-                [{:12.2} / s] | \
+                [{:12.2} / s] | crashes {:6} | \
                 cov {:8}\x1b[0m\n\n",
                total_workers, total_sessions,
                total_cases,
                cases_delta as f64 / PRINT_DELAY.as_secs_f64(),
+               if crashes > 0 {
+                   format!("\x1b[31;1m{:8}\x1b[32;1m", crashes)
+               } else {
+                   format!("{:8}", crashes)
+               },
                coverage);
 
         // Update last cases
@@ -473,6 +481,66 @@ fn handle_client(stream: TcpStream,
                 } else {
                 }
             },
+            ServerMessage::Crash(modoff, typ, regstate) => {
+                // Create the crashes directory
+                std::fs::create_dir_all("crashes").unwrap();
+
+                // Check if this is a new crash
+                let mut crashes = context.crashes.write().unwrap();
+                if !crashes.contains_key(&typ) {
+                    // Woo! New crash, save it and log it!
+                    crashes.insert(typ, regstate.to_string());
+                    
+                    let mut filename = format!("crash_{}", modoff);
+                    match typ {
+                        CrashType::PageFault { typ, cpl, read, write, exec }
+                                => {
+                            if cpl == 0 {
+                                filename += "_KERNEL";
+                            } else {
+                                filename += "_user";
+                            }
+
+                            if read {
+                                filename += "_read";
+                            } else if write {
+                                filename += "_WRITE";
+                            } else if exec {
+                                filename += "_EXEC";
+                            }
+                            
+                            match typ {
+                                PageFaultType::Null => filename += "_null",
+                                PageFaultType::High => filename += "_HIGH",
+                            }
+                        }
+                        x @ _ => filename += &format!("_{:?}", x),
+                    };
+                    
+                    // Create the crash file
+                    let mut fd = File::create(Path::new("crashes")
+                        .join(&filename))?;
+                    write!(fd, "{}", &regstate)?;
+                }
+            }
+            ServerMessage::Trace(trace) => {
+                // Create the traces directory
+                std::fs::create_dir_all("traces").unwrap();
+
+                if trace.contains(&0x07ffc927b70c0) {
+                    // Get a unique trace file ID
+                    let trace_id = context.trace_id
+                        .fetch_add(1, Ordering::Relaxed);
+
+                    // Create the trace file
+                    let mut fd = File::create(Path::new("traces")
+                        .join(&format!("trace_{:016x}", trace_id)))?;
+
+                    for rip in trace.iter() {
+                        write!(fd, "u {:#018x} L1\n", rip)?;
+                    }
+                }
+            }
             _ => panic!("Unhandled packet\n"),
         }
     }
@@ -484,6 +552,8 @@ struct Context<'a> {
     inputs:        RwLock<BTreeSet<InputRecord<'a>>>,
     clients:       RwLock<HashMap<IpAddr, Arc<Client<'a>>>>,
     sessions:      RwLock<HashMap<u64, Arc<RwLock<Session<'a>>>>>,
+    crashes:       RwLock<BTreeMap<CrashType, String>>,
+    trace_id:      AtomicU64,
     coverage_file: Mutex<File>,
 }
 
@@ -494,6 +564,8 @@ fn main() -> io::Result<()> {
         inputs:        Default::default(),
         clients:       Default::default(),
         sessions:      Default::default(),
+        trace_id:      Default::default(),
+        crashes:       Default::default(),
         coverage_file: Mutex::new(File::create("coverage.txt")?),
     });
 
@@ -509,12 +581,12 @@ fn main() -> io::Result<()> {
     for stream in listener.incoming() {
         let context = context.clone();
         threads.push(std::thread::spawn(move || {
-            handle_client(stream?, context)
+            handle_client(stream.unwrap(), context).unwrap()
         }));
     }
 
     for thread in threads {
-        thread.join().unwrap()?;
+        thread.join().unwrap();
     }
 
     Ok(())

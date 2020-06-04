@@ -92,7 +92,10 @@ unsafe fn invalidate_ept(eptp: u128) {
 #[inline]
 unsafe fn vmread(encoding: Vmcs) -> u64 {
     let ret;
-    llvm_asm!("vmread $0, $1" : "=r"(ret) : "r"(encoding as u64) : "memory" :
+    llvm_asm!(r#"
+            xor    eax, eax
+            vmread rax, rbx
+        "# : "={rax}"(ret) : "{rbx}"(encoding as u64) : "memory" :
          "intel", "volatile");
     ret
 }
@@ -974,6 +977,7 @@ impl From<u8> for Exception {
 /// Virtual machine exit reason
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum VmExit {
+    InterruptWindow,
     Io,
     MonitorTrap,
     EptViolation {
@@ -1317,6 +1321,10 @@ impl Vm {
 
     /// Switch to another CPU context
     pub fn switch_cpu(&mut self, cpu: usize) {
+        // Save the old PML address and index
+        let pmla = self.reg(Register::PmlAddress);
+        let pmli = self.reg(Register::PmlIndex);
+
         // Make sure the `cpu` is in bounds of the number of CPUs on the system
         assert!(cpu < self.guest_regs.guest_regs.len(),
             "Target CPU not in bounds of CPUs for VM");
@@ -1326,8 +1334,14 @@ impl Vm {
 
         // Mark all registers as dirty, meaning they'll all be updated upon
         // the next VM entry
-        self.guest_regs.guest_regs[cpu].dirtied.iter_mut()
-            .for_each(|x| *x = !0);
+        for &(reg, _) in REG_TYPES {
+            let old = self.reg(reg);
+            self.set_reg(reg, old);
+        }
+
+        // Move the old PML index and address into the new context
+        self.set_reg(Register::PmlIndex,   pmli);
+        self.set_reg(Register::PmlAddress, pmla);
     }
 
     /// Get the current active CPU
@@ -1378,20 +1392,11 @@ impl Vm {
 
     /// Reset the VMCS to the original VMCS state
     pub fn reset(&mut self) {
-        unsafe {
-            // Initialize the PML base address
-            self.set_reg(Register::PmlAddress, self.pml.phys_addr().0);
-            
-            // Reset the PML index
-            self.set_reg(Register::PmlIndex, 511);
-
-            if self.ept_dirty {
-                // Invalidate the EPT
-                invalidate_ept(
-                    (self.ept.table().0 | (3 << 3) | (1 << 6) | 6) as u128);
-                self.ept_dirty = false;
-            }
-        }
+        // Initialize the PML base address
+        self.set_reg(Register::PmlAddress, self.pml.phys_addr().0);
+        
+        // Reset the PML index
+        self.set_reg(Register::PmlIndex, 511);
     }
 
     /// Run the VM
@@ -1473,6 +1478,15 @@ impl Vm {
  
             // We have initialized the VM
             self.init = true;
+        }
+            
+        if self.ept_dirty {
+            unsafe {
+                // Invalidate the EPT
+                invalidate_ept(
+                    (self.ept.table().0 | (3 << 3) | (1 << 6) | 6) as u128);
+            }
+            self.ept_dirty = false;
         }
         
         // Make sure the fxsave starts at `0x400` from the `guest_regs`
@@ -1704,6 +1718,7 @@ impl Vm {
                 VmExit::Exception(exception)
             }
             1 => VmExit::ExternalInterrupt,
+            7 => VmExit::InterruptWindow,
             16 => {
                 let inst_len = self.reg(Register::ExitInstructionLength);
                 VmExit::Rdtsc { inst_len }

@@ -16,6 +16,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 
 use crate::mm;
 use crate::time;
@@ -29,7 +30,8 @@ use crate::core_locals::LockInterrupts;
 use crate::paging::*;
 
 use aht::Aht;
-use falktp::{CoverageRecord, InputRecord, ServerMessage};
+use falktp::{CoverageRecord, InputRecord, ServerMessage, CrashType};
+use falktp::PageFaultType;
 use noodle::*;
 use falkhash::FalkHasher;
 use lockcell::LockCell;
@@ -46,6 +48,14 @@ const STATISTIC_SYNC_INTERVAL: u64 = 10_000;
 /// When `true`, the guest RIPs will be stored in a frequency database,
 /// allowing visibility into where the guest is spending its CPU time
 const GUEST_PROFILING: bool = false;
+
+/// If enabled, the guest is single stepped and all RIPs are logged during
+/// execution. This is incredibly slow and memory intensive, use for debugging.
+const GUEST_TRACING: bool = false;
+
+/// When set, the APIC will be monitored for writes. This is not done yet, do
+/// not use!
+const ENABLE_APIC: bool = false;
 
 /// Trait to allow conversion of slices of bytes to primitives and back
 /// generically
@@ -599,6 +609,9 @@ pub struct Worker<'a> {
     /// Mapping of guest (page table, rip) pairs to their frequencies of being
     /// observed during preemption timers
     profiling: BTreeMap<(u64, u64), u64>,
+    
+    /// Vector to hold all RIPs executed when `GUEST_TRACING` is enabled
+    trace: Vec<u64>,
 }
 
 impl<'a> Worker<'a> {
@@ -623,6 +636,7 @@ impl<'a> Worker<'a> {
             pml:            Vec::new(),
             page_cache:     BTreeMap::new(),
             profiling:      BTreeMap::new(),
+            trace:          Vec::new(),
         }
     }
     
@@ -654,22 +668,15 @@ impl<'a> Worker<'a> {
             pml:            Vec::new(),
             page_cache:     BTreeMap::new(),
             profiling:      BTreeMap::new(),
+            trace:          Vec::new(),
         }
     }
 
     /// Switch to another CPU context
     #[inline]
     pub fn switch_cpu(&mut self, cpu: usize) {
-        // Save the old PML address and index
-        let pmla = self.reg(Register::PmlAddress);
-        let pmli = self.reg(Register::PmlIndex);
-
         // Switch CPUs
         self.backing.vm.switch_cpu(cpu);
-
-        // Move the old PML index and address into the new context
-        self.set_reg(Register::PmlIndex,   pmli);
-        self.set_reg(Register::PmlAddress, pmla);
     }
     
     /// Get the current active CPU
@@ -736,9 +743,9 @@ impl<'a> Worker<'a> {
         }
     }
     
-    /// This routine can be used to map in a single page full fo zeros as
+    /// This routine can be used to map in a single page full of zeros as
     /// read-only. This can be used to nop out things like the HPET
-    pub fn map_null_readonly_page(&mut self, paddr: PhysAddr) {
+    pub fn map_zeroed_readonly_page(&mut self, paddr: PhysAddr) {
         assert!(paddr.0 & 0xfff == 0);
 
         // Get access to physical memory
@@ -761,6 +768,47 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Resolve a `rip` into a `CoverageRecord`. This will attempt to enlighten
+    /// if the module does not resolve.
+    pub fn resolve_module<'b>(&mut self, rip: u64) -> CoverageRecord<'b> {
+        let mut modoff = self.resolve_module_int(rip);
+        if modoff.0.is_none() && self.enlightenment.is_some() {
+            // Get the current context ID
+            let pt = self.context_id();
+
+            // Check if we have a module list for this process
+            if !self.module_list.contains_key(&pt) {
+                // Oooh, go try to get the module list for this
+                // process
+
+                // Request the module list from enlightenment
+                let mut enl = self.enlightenment.take().unwrap();
+                if let Some(ml) = enl.get_module_list(self) {
+                    // Save the module list for the process
+                    self.module_list.insert(pt, ml);
+                
+                    // Re-resolve the module + offset
+                    modoff = self.resolve_module_int(rip);
+                }
+
+                self.enlightenment = Some(enl);
+            }
+        }
+
+        CoverageRecord {
+            module: modoff.0.map(|x| Cow::Owned(x)),
+            offset: modoff.1,
+        }
+    }
+
+    /// Report coverage from the current context
+    pub fn report_coverage(&mut self, session: &FuzzSession) -> bool {
+        let rip = self.reg(Register::Rip);
+        let modoff = self.resolve_module(rip);
+        let input = self.fuzz_input.as_ref().unwrap();
+        session.report_coverage(Some((input, &self.hasher)), &modoff)
+    }
+
     /// Perform a single fuzz case to completion
     pub fn fuzz_case(&mut self, context: &mut dyn Any) -> VmExit {
         let fuzz_start = cpu::rdtsc();
@@ -773,6 +821,13 @@ impl<'a> Worker<'a> {
 
         // Get access to the master
         let master = self.backing.master.as_mut().unwrap();
+
+        // Tracks a list of pending interrupt vectors which need to be
+        // delivered to the VM (in order)
+        let mut pending_interrupts: VecDeque<(usize, u8)> = VecDeque::new();
+
+        // Tracks that we're single stepping for an APIC write
+        let mut apic_write = None;
 
         // Reset memory to its original state
         for &paddr in self.pml.iter() {
@@ -861,15 +916,45 @@ impl<'a> Worker<'a> {
         let mut single_steps = 0;
 
         // Stores the register state of the VM during the last page fault
-        let mut last_page_fault: Option<BasicRegisterState> = None;
+        let mut last_page_fault:
+            Option<(CoverageRecord, VmExit, BasicRegisterState)> = None;
+
+        // Found a crash, we should report it
+        let mut crash:
+            Option<(CoverageRecord, VmExit, BasicRegisterState)> = None;
+
+        if GUEST_TRACING {
+            // Clear the execution trace
+            self.trace.clear();
+        }
 
         let vmexit = 'vm_loop: loop {
             if cpu::rdtsc() >= timeout {
                 break 'vm_loop VmExit::Timeout;
             }
 
+            if GUEST_TRACING {
+                // Always enable single stepping if `GUEST_TRACING` is true
+                single_steps = 1;
+            }
+
+            if pending_interrupts.len() > 0 {
+                // Switch to the CPU we want to interrupt
+                if let Some((cpu, _)) = pending_interrupts.front() {
+                    self.switch_cpu(*cpu);
+                }
+
+                // If there's a pending interrupt, request interrupt window
+                // exiting
+                let pbc = self.reg(Register::ProcBasedControls);
+                self.set_reg(Register::ProcBasedControls, pbc | (1 << 2));
+            } else {
+                let pbc = self.reg(Register::ProcBasedControls);
+                self.set_reg(Register::ProcBasedControls, pbc & !(1 << 2));
+            }
+
             // Single step when requested
-            if single_steps > 0 {
+            if apic_write.is_some() || single_steps > 0 {
                 let pbc = self.reg(Register::ProcBasedControls);
                 self.set_reg(Register::ProcBasedControls, pbc | (1 << 27));
                 single_steps -= 1;
@@ -881,52 +966,13 @@ impl<'a> Worker<'a> {
             // Set the pre-emption timer for randomly breaking into the VM
             // to enforce timeouts and get random coverage sampling
             self.backing.vm.preemption_timer = 
-                Some(self.rng.rand() as u32 % 64);
+                Some(self.rng.rand() as u32 % 100000);
 
             // Run the VM until a VM exit
             let (vmexit, vm_cycles) = self.backing.vm.run();
             self.stats.vm_exits  += 1;
             self.stats.vm_cycles += vm_cycles;
-                    
-            // Closure to invoke if we want to report new coverage
-            let mut report_coverage = || {
-                let rip = self.reg(Register::Rip);
-                let mut modoff = self.resolve_module(rip);
 
-                if modoff.0.is_none() && self.enlightenment.is_some() {
-                    // Get the current context ID
-                    let pt = self.context_id();
-
-                    // Check if we have a module list for this process
-                    if !self.module_list.contains_key(&pt) {
-                        // Oooh, go try to get the module list for this
-                        // process
-
-                        // Request the module list from enlightenment
-                        let mut enl = self.enlightenment.take().unwrap();
-                        if let Some(ml) = enl.get_module_list(self) {
-                            // Save the module list for the process
-                            self.module_list.insert(pt, ml);
-                        
-                            // Re-resolve the module + offset
-                            modoff = self.resolve_module(rip);
-                        }
-
-                        self.enlightenment = Some(enl);
-                    }
-                }
-
-                let input = self.fuzz_input.as_ref().unwrap();
-                if session.report_coverage(Some((input, &self.hasher)),
-                    &CoverageRecord {
-                        module: modoff.0.map(|x| Cow::Owned(x)),
-                        offset: modoff.1,
-                }) {
-                    // Single step a bit when we observe new coverage
-                    single_steps = 100;
-                }
-            };
-            
             match vmexit {
                 VmExit::Rdtsc { inst_len } => {
                     let tsc = self.backing.vm.guest_regs.tsc;
@@ -941,6 +987,28 @@ impl<'a> Worker<'a> {
                     continue 'vm_loop;
                 }
                 VmExit::EptViolation { addr, read, write, exec } => {
+                    if ENABLE_APIC && write &&
+                            (addr.0 & !0xfff) == 0xfee0_0000 {
+                        // Write was to the APIC, set that we're tracking a
+                        // write to the APIC, which will cause us to single
+                        // step
+                        apic_write = Some(addr);
+        
+                        unsafe {
+                            // Promote the page to writable, and then we single
+                            // step to observe the written value
+                            let pte =
+                                self.backing.vm.ept_mut().translate(addr)
+                                .unwrap().pte.unwrap();
+                            mm::write_phys(pte,
+                                mm::read_phys::<u64>(pte) | EPT_WRITE);
+                            self.backing.vm.ept_dirty = true;
+                        }
+
+                        // Handle the exit as we promoted the APIC page to RW
+                        continue 'vm_loop;
+                    }
+
                     if self.backing.translate(addr, read, write, exec,
                                               &mut self.pml).is_some() {
                         continue 'vm_loop;
@@ -968,16 +1036,20 @@ impl<'a> Worker<'a> {
                     self.set_reg(Register::EntryInstructionLength,       il);
                     self.set_reg(Register::Cr2, addr.0);
 
-                    last_page_fault = Some(
+                    let rip = self.reg(Register::Rip);
+                    last_page_fault = Some((
+                        self.resolve_module(rip),
+                        vmexit,
                         BasicRegisterState::from_register_state(
-                            self.backing.vm.active_register_state()));
+                            self.backing.vm.active_register_state())));
 
                     continue 'vm_loop;
                 }
                 VmExit::Exception(Exception::Breakpoint) => {
-                    if self.reg(Register::Rip) == 0xfffff801337d04b3 {
-                        let lpf = last_page_fault.as_ref().unwrap();
-                        print!("Hit page fault breakpoint:\n{}\n", lpf);
+                    let rip = self.reg(Register::Rip);
+                    if rip == 0xfffff801451d04b3 {
+                        crash = Some(last_page_fault.unwrap());
+                        break 'vm_loop vmexit;
                     }
                 }
                 VmExit::Exception(Exception::NMI) => {
@@ -987,10 +1059,15 @@ impl<'a> Worker<'a> {
                         cpu::halt();
                     }
                 }
-                VmExit::Exception(x) => {
-                    let lrs = BasicRegisterState::from_register_state(
-                        self.backing.vm.active_register_state());
-                    print!("Exception {:?}\n{}\n", x, lrs);
+                VmExit::Exception(_) => {
+                    let rip = self.reg(Register::Rip);
+                    crash = Some((
+                        self.resolve_module(rip),
+                        vmexit,
+                        BasicRegisterState::from_register_state(
+                            self.backing.vm.active_register_state())
+                    ));
+                    break 'vm_loop vmexit;
                 }
                 VmExit::ReadMsr { inst_len } => {
                     // Get the MSR ID we're reading
@@ -1114,12 +1191,102 @@ impl<'a> Worker<'a> {
                     self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
                     continue 'vm_loop;
                 }
+                VmExit::InterruptWindow => {
+                    let (cpu, int) = pending_interrupts.pop_front().unwrap();
+                    assert!(cpu == self.active_cpu());
+                    self.set_reg(
+                        Register::EntryInterruptionInformation,
+                        (1 << 31) | (int as u64));
+                    continue 'vm_loop;
+                }
                 VmExit::MonitorTrap => {
-                    report_coverage();
+                    if self.report_coverage(&session) {
+                        single_steps = 100;
+                    }
+
+                    if let Some(addr) = apic_write {
+                        unsafe {
+                            // Demote the APIC page back to read-only
+                            let trans =
+                                self.backing.vm.ept_mut().translate(addr)
+                                .unwrap();
+                            let pte = trans.pte.unwrap();
+                            let page = trans.page.unwrap().0;
+
+                            let val = mm::read_phys::<u64>(
+                                PhysAddr(page.0 + (addr.0 & 0xfff)));
+                            print!("APIC write from {} to {:#x} {:#x} with \
+                                   {:#x}\n",
+                                   self.active_cpu(),
+                                   self.reg(Register::Rip),
+                                   addr.0, val);
+
+                            if addr == PhysAddr(0xfee0_0300) {
+                                let delivery_mode   = (val >>  8) & 7;
+                                let _logical_dst    = (val >> 11) & 1 != 0;
+                                let delivery_status = (val >> 12) & 1 != 0;
+                                let level           = (val >> 14) & 1 != 0;
+                                let level_triggered = (val >> 15) & 1 != 0;
+                                let dest_shorthand  = (val >> 18) & 3;
+
+                                // We emulate so little, only IPI-to-self and
+                                // only fixed delivery mode (no NMI, etc)
+                                assert!(dest_shorthand == 1 &&
+                                        !level && !level_triggered &&
+                                        !delivery_status &&
+                                        delivery_mode == 0);
+
+                                // Request delivery of the interrupt
+                                for cpu in 0..self.cpus() {
+                                    pending_interrupts.push_back(
+                                        (cpu, val as u8));
+                                }
+
+                                self.set_reg(Register::PendingDebug, 0);
+                                self.set_reg(Register::ActivityState, 0);
+                                self.set_reg(
+                                    Register::InterruptabilityState, 0);
+
+                                self.set_reg(
+                                    Register::EntryInterruptionInformation, 0);
+                                self.set_reg(
+                                    Register::EntryInterruptionErrorCode, 0);
+                                self.set_reg(
+                                    Register::EntryInstructionLength, 0);
+                                self.set_reg(
+                                    Register::ExitInterruptionInformation, 0);
+                                self.set_reg(
+                                    Register::ExitInterruptionErrorCode, 0);
+                                self.set_reg(
+                                    Register::ExitInstructionLength, 0);
+                            }
+
+                            // Clear the backing APIC page
+                            mm::slice_phys_mut(page, 4096)
+                                .iter_mut().for_each(|x| *x = 0);
+
+                            // Clear the writable bit
+                            mm::write_phys(pte,
+                                mm::read_phys::<u64>(pte) & !EPT_WRITE);
+
+                            self.backing.vm.ept_dirty = true;
+                        }
+
+                        // No longer in APIC write state
+                        apic_write = None;
+                    }
+
+                    if GUEST_TRACING {
+                        // Log all RIPs executed when in tracing mode
+                        let rip = self.reg(Register::Rip);
+                        self.trace.push(rip);
+                    }
                     continue 'vm_loop;
                 }
                 VmExit::PreemptionTimer => {
-                    report_coverage();
+                    if self.report_coverage(&session) {
+                        single_steps = 100;
+                    }
 
                     if GUEST_PROFILING {
                         let rip = self.reg(Register::Rip);
@@ -1197,13 +1364,75 @@ impl<'a> Worker<'a> {
             self.sync = time::future(STATISTIC_SYNC_INTERVAL);
         }
 
+        if let Some((cr, VmExit::Exception(x), regstate)) = crash {
+            let ct = match x {
+                Exception::DivideError => CrashType::DivideError,
+                Exception::DebugException => CrashType::DebugException,
+                Exception::NMI => CrashType::NMI,
+                Exception::Breakpoint => CrashType::Breakpoint,
+                Exception::Overflow => CrashType::Overflow,
+                Exception::BoundRangeExceeded => CrashType::BoundRangeExceeded,
+                Exception::InvalidOpcode => CrashType::InvalidOpcode,
+                Exception::DeviceNotAvailable => CrashType::DeviceNotAvailable,
+                Exception::DoubleFault => CrashType::DoubleFault,
+                Exception::CoprocessorSegmentOverrun =>
+                    CrashType::CoprocessorSegmentOverrun,
+                Exception::InvalidTSS => CrashType::InvalidTSS,
+                Exception::SegmentNotPresent => CrashType::SegmentNotPresent,
+                Exception::StackSegmentFault => CrashType::StackSegmentFault,
+                Exception::GeneralProtectionFault(..) =>
+                    CrashType::GeneralProtectionFault,
+                Exception::PageFault { write, exec, addr, .. } =>
+                {
+                    CrashType::PageFault {
+                        typ: if (addr.0 as i64).abs() < (1024 * 1024) {
+                            PageFaultType::Null
+                        } else {
+                            PageFaultType::High
+                        },
+                        cpl:   self.cpl(),
+                        read:  if !write && !exec { true } else { false },
+                        write: write,
+                        exec:  exec,
+                    }
+                }
+                Exception::FloatingPointError => CrashType::FloatingPointError,
+                Exception::AlignmentCheck => CrashType::AlignmentCheck,
+                Exception::MachineCheck => CrashType::MachineCheck,
+                Exception::SimdFloatingPointException =>
+                    CrashType::SimdFloatingPointException,
+                Exception::VirtualizationException =>
+                    CrashType::VirtualizationException,
+                Exception::ControlProtectionException =>
+                    CrashType::ControlProtectionException,
+            };
+
+            let record = session.crashes.entry_or_insert(
+                &(regstate.rip, ct), regstate.rip as usize, || Box::new(()));
+            if record.inserted() {
+                let server = self.server.as_mut().unwrap();
+                ServerMessage::Crash(
+                    cr, ct, Cow::Owned(format!("{}", regstate))
+                ).serialize(server).unwrap();
+                server.flush().unwrap();
+            }
+        }
+
+        if GUEST_TRACING {
+            // Report the guest trace
+            ServerMessage::Trace(
+                Cow::Borrowed(self.trace.as_slice())
+            ).serialize(self.server.as_mut().unwrap()).unwrap();
+        }
+
         self.session = Some(session);
         vmexit
     }
 
     /// Attempt to resolve the `addr` into a module + offset based on the
     /// current `module_list`
-    pub fn resolve_module(&mut self, addr: u64) -> (Option<Arc<String>>, u64) {
+    pub fn resolve_module_int(&mut self, addr: u64)
+            -> (Option<Arc<String>>, u64) {
         // Get the current context id
         let pt = self.context_id();
 
@@ -1628,6 +1857,9 @@ pub struct FuzzSession<'a> {
     /// Inputs which caused coverage
     inputs: AtomicVec<Arc<Vec<u8>>, 65536>,
 
+    /// Unique crashes, currently only keyed by the RIP
+    crashes: Aht<(u64, CrashType), (), 4096>,
+
     /// Global statistics for the fuzz cases
     stats: LockCell<Statistics, LockInterrupts>,
 
@@ -1891,6 +2123,7 @@ impl<'a> FuzzSession<'a> {
             inject:           None,
             vmexit_filter:    None,
             input_dedup:      Aht::new(),
+            crashes:          Aht::new(),
             inputs:           AtomicVec::new(),
             workers:          AtomicU64::new(0),
             id:               cpu::rdtsc(),
@@ -1929,6 +2162,11 @@ impl<'a> FuzzSession<'a> {
         let mut worker =
             Worker::fork(session.master_vm.vm.cpus(), session.clone(),
                 session.master_vm.clone(), worker_id);
+       
+        if ENABLE_APIC {
+            // Map in a read-only APIC
+            worker.map_zeroed_readonly_page(PhysAddr(0xfee00000));
+        }
 
         // Connect to the server and associate this connection with the
         // worker

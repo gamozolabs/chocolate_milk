@@ -230,6 +230,21 @@ serialize_le!(i128);
 serialize_le!(usize, u64);
 serialize_le!(isize, i64);
 
+impl Serialize for bool {
+    fn serialize<W: Writer>(&self, writer: &mut W) -> Option<()> {
+        writer.write(&[*self as u8])
+    }
+}
+
+impl Deserialize for bool {
+    fn deserialize<R: Reader>(reader: &mut R) -> Option<Self> {
+        // Read in the bytes for this type
+        let mut arr = [0u8; 1];
+        reader.read_exact(&mut arr)?;
+        Some(arr[0] != 0)
+    }
+}
+
 /// Implement serialize for `&str`
 impl Serialize for str {
     fn serialize<W: Writer>(&self, writer: &mut W) -> Option<()> {

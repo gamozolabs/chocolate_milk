@@ -32,7 +32,7 @@ pub mod test_fuzzer;
 pub mod ept;
 pub mod paging;
 
-pub mod redacted;
+//pub mod redacted;
 
 use page_table::PhysAddr;
 
@@ -99,7 +99,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     //test_fuzzer::fuzz();
     
     {
-        redacted::fuzz();
+        //redacted::fuzz();
     }
 
     cpu::halt();

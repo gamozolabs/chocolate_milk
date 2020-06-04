@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use core::fmt;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
 use alloc::borrow::Cow;
@@ -17,6 +18,20 @@ noodle!(serialize, deserialize,
         pub offset: u64,
     }
 );
+
+impl<'a> fmt::Display for CoverageRecord<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(module) = &self.module {
+            if self.offset != 0 {
+                write!(f, "{}+{:#x}", module, self.offset)
+            } else {
+                write!(f, "{}", module)
+            }
+        } else {
+            write!(f, "{:#x}", self.offset)
+        }
+    }
+}
 
 noodle!(serialize, deserialize,
     #[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
@@ -82,8 +97,58 @@ pub enum ServerMessage<'a> {
         phys_total:  u64,
     },
 
+    /// Trace of all RIPs during an execution
+    Trace(Cow<'a, [u64]>),
+
+    /// Report a new "unique" crash to the server
+    Crash(CoverageRecord<'a>, CrashType, Cow<'a, str>),
+
     /// The server has sent any messages related to syncing and the client
     /// should resume fuzzing.
     SyncComplete,
 });
+
+noodle!(serialize, deserialize,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum PageFaultType {
+        /// Fault occurred between -1MiB and 1MiB of vaddr space
+        Null,
+
+        /// Fault happened in non-null memory
+        High,
+    }
+);
+
+noodle!(serialize, deserialize,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum CrashType {
+        DivideError,
+        DebugException,
+        NMI,
+        Breakpoint,
+        Overflow,
+        BoundRangeExceeded,
+        InvalidOpcode,
+        DeviceNotAvailable,
+        DoubleFault,
+        CoprocessorSegmentOverrun,
+        InvalidTSS,
+        SegmentNotPresent,
+        StackSegmentFault,
+        GeneralProtectionFault,
+        PageFault {
+            typ:   PageFaultType,
+            cpl:   u8,
+            read:  bool,
+            write: bool,
+            exec:  bool,
+        },
+        FloatingPointError,
+        AlignmentCheck,
+        MachineCheck,
+        SimdFloatingPointException,
+        VirtualizationException,
+        ControlProtectionException,
+    }
+);
 
