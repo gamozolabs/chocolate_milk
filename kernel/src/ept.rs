@@ -181,6 +181,41 @@ impl Ept {
         Some(ret)
     }
 
+    /// Map a `gpaddr` with zeroed out pages for `len` bytes
+    pub fn map(&mut self, gpaddr: PhysAddr, len: u64,
+               page_type: PageType,
+               read: bool, write: bool, execute: bool) -> Option<()> {
+        assert!(gpaddr.0 & (page_type as u64 - 1) == 0,
+            "Cannot map EPT range with unaligned base");
+        assert!(len > 0 && (len & (page_type as u64 - 1)) == 0,
+            "Cannot map EPT range invalid length");
+
+        for gpaddr in (gpaddr.0..gpaddr.0.checked_add(len - 1).unwrap())
+                .step_by(page_type as usize) {
+            // Get access to physical memory
+            let mut phys_mem = mm::PhysicalMemory;
+
+            // Allocate the backing page
+            let page = phys_mem.alloc_phys_zeroed(
+                Layout::from_size_align(page_type as usize,
+                                        page_type as usize).unwrap())?;
+
+            unsafe {
+                // Map it in!
+                self.map_raw(PhysAddr(gpaddr), page_type,
+                    if read    { EPT_READ  } else { 0 } |
+                    if write   { EPT_WRITE } else { 0 } |
+                    if execute { EPT_EXEC | EPT_USER_EXEC } else { 0 } |
+                    if page_type != PageType::Page4K
+                        { EPT_PAGE_SIZE } else { 0 } |
+                    EPT_MEMTYPE_WB |
+                    page.0)?;
+            }
+        }
+
+        Some(())
+    }
+
     /// Map a `gpaddr` to a raw page table entry `raw`. This will use the page
     /// size specified by `page_type`.
     ///

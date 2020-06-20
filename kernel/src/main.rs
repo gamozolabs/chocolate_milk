@@ -31,6 +31,7 @@ pub mod fuzz_session;
 pub mod test_fuzzer;
 pub mod ept;
 pub mod paging;
+pub mod winboot;
 
 //pub mod redacted;
 
@@ -97,10 +98,7 @@ pub extern fn entry(boot_args: PhysAddr, core_id: u32) -> ! {
     // ====================================================================
 
     //test_fuzzer::fuzz();
-    
-    {
-        //redacted::fuzz();
-    }
+    winboot::main();
 
     cpu::halt();
 }

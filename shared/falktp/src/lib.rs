@@ -49,6 +49,9 @@ pub enum ServerMessage<'a> {
     /// same ID.
     GetFileId(Cow<'a, str>),
 
+    /// File requested for open was invalid and thus was rejected
+    BadFile,
+
     /// Returns the file ID and length of the requested filename from a
     /// `GetFileId()` if the file exists on the server
     FileId {
@@ -101,7 +104,12 @@ pub enum ServerMessage<'a> {
     Trace(Cow<'a, [u64]>),
 
     /// Report a new "unique" crash to the server
-    Crash(CoverageRecord<'a>, CrashType, Cow<'a, str>),
+    Crash {
+        modoff:   CoverageRecord<'a>,
+        cpl:      u8,
+        typ:      CrashType,
+        regstate: Cow<'a, str>
+    },
 
     /// The server has sent any messages related to syncing and the client
     /// should resume fuzzing.
@@ -138,7 +146,6 @@ noodle!(serialize, deserialize,
         GeneralProtectionFault,
         PageFault {
             typ:   PageFaultType,
-            cpl:   u8,
             read:  bool,
             write: bool,
             exec:  bool,

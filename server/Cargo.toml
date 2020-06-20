@@ -9,4 +9,5 @@ edition = "2018"
 [dependencies]
 noodle = { path = "../shared/noodle", features = ["std"] }
 falktp = { path = "../shared/falktp" }
+mmap_helpers = { path = "../shared/mmap_helpers" }
 

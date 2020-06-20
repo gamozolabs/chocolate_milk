@@ -160,7 +160,7 @@ define_walker!(translate_32_no_pae, translate_32_no_pae_metadata, u32,
     PageTableEntry { bits: 12..22, page_mask: 0xfffff000, large_page: None },
 ]);
 
-define_walker!(translate_32_pae, translate_32_pae_metadata, u32, 0xfffff000, &[
+define_walker!(translate_32_pae, translate_32_pae_metadata, u64, 0xffffffe0, &[
     PageTableEntry { bits: 30..32, page_mask: 0xffffffffff000,
         large_page: None },
 

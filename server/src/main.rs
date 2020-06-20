@@ -18,6 +18,7 @@ use std::collections::hash_map::DefaultHasher;
 use noodle::*;
 use falktp::{CoverageRecord, InputRecord, ServerMessage, CrashType};
 use falktp::PageFaultType;
+use mmap_helpers::Mapping;
 
 /// If `true` prints some extra spew
 const VERBOSE: bool = false;
@@ -412,12 +413,12 @@ fn handle_client(stream: TcpStream,
             }
             ServerMessage::GetFileId(filename) => {
                 // Normalize the filename
-                if let Ok(filename) =
+                if let Some((file_id, file_len)) =
                         std::fs::canonicalize(Path::new("files")
-                                              .join(&*filename)) {
+                        .join(&*filename)).ok().and_then(|filename| {
                     // Jail the filename to the current directory
                     if !filename.starts_with(&cur_dir) {
-                        continue;
+                        return None;
                     }
 
                     // Compute the file ID by hashing the file path
@@ -429,6 +430,10 @@ fn handle_client(stream: TcpStream,
                     let modified = filename.metadata().unwrap()
                         .modified().unwrap();
 
+                    // Get the length of the file
+                    let file_len = filename.metadata().unwrap()
+                        .len();
+
                     // Get access to the file database
                     let mut file_db = context.file_db.write().unwrap();
 
@@ -436,21 +441,45 @@ fn handle_client(stream: TcpStream,
                     let file = file_db.entry(file_id)
                         .or_insert_with(|| {
                             print!("Loading {:?}\n", filename);
-                            (modified, std::fs::read(&filename).unwrap())
+                            (modified, Mapping::file(&filename,
+                                                     core::ptr::null_mut(),
+                                                     file_len as usize,
+                                                     false,
+                                                     false,
+                                                     true,
+                                                     false,
+                                                     false,
+                                                     false)
+                             .expect("Failed to map file"))
+
                         });
 
                     // Check if we should reload the file since it has been
                     // modified
                     if file.0 < modified {
                         print!("Reloading {:?}\n", filename);
-                        *file = (modified, std::fs::read(&filename).unwrap());
+                        *file = (modified, Mapping::file(&filename,
+                                                     core::ptr::null_mut(),
+                                                     file_len as usize,
+                                                     false,
+                                                     false,
+                                                     true,
+                                                     false,
+                                                     false,
+                                                     false)
+                             .expect("Failed to map file"));
                     }
 
+                    Some((file_id, file.1.len()))
+                }) {
                     // Send the ID response
                     ServerMessage::FileId {
                         id:   file_id,
-                        size: file.1.len(),
+                        size: file_len,
                     }.serialize(&mut stream).unwrap();
+                    stream.flush().unwrap();
+                } else {
+                    ServerMessage::BadFile.serialize(&mut stream).unwrap();
                     stream.flush().unwrap();
                 }
             },
@@ -481,7 +510,7 @@ fn handle_client(stream: TcpStream,
                 } else {
                 }
             },
-            ServerMessage::Crash(modoff, typ, regstate) => {
+            ServerMessage::Crash { modoff, cpl, typ, regstate } => {
                 // Create the crashes directory
                 std::fs::create_dir_all("crashes").unwrap();
 
@@ -492,15 +521,15 @@ fn handle_client(stream: TcpStream,
                     crashes.insert(typ, regstate.to_string());
                     
                     let mut filename = format!("crash_{}", modoff);
-                    match typ {
-                        CrashType::PageFault { typ, cpl, read, write, exec }
-                                => {
-                            if cpl == 0 {
-                                filename += "_KERNEL";
-                            } else {
-                                filename += "_user";
-                            }
+                    if cpl == 0 {
+                        filename += "_KERNEL";
+                    } else {
+                        filename += "_user";
+                    }
 
+                    match typ {
+                        CrashType::PageFault { typ, read, write, exec }
+                                => {
                             if read {
                                 filename += "_read";
                             } else if write {
@@ -527,7 +556,7 @@ fn handle_client(stream: TcpStream,
                 // Create the traces directory
                 std::fs::create_dir_all("traces").unwrap();
 
-                if trace.contains(&0x07ffc927b70c0) {
+                {
                     // Get a unique trace file ID
                     let trace_id = context.trace_id
                         .fetch_add(1, Ordering::Relaxed);
@@ -537,7 +566,7 @@ fn handle_client(stream: TcpStream,
                         .join(&format!("trace_{:016x}", trace_id)))?;
 
                     for rip in trace.iter() {
-                        write!(fd, "u {:#018x} L1\n", rip)?;
+                        write!(fd, "{:#018x}\n", rip)?;
                     }
                 }
             }
@@ -547,7 +576,7 @@ fn handle_client(stream: TcpStream,
 }
 
 struct Context<'a> {
-    file_db:       RwLock<HashMap<u64, (SystemTime, Vec<u8>)>>,
+    file_db:       RwLock<HashMap<u64, (SystemTime, Mapping)>>,
     coverage:      RwLock<BTreeSet<CoverageRecord<'a>>>,
     inputs:        RwLock<BTreeSet<InputRecord<'a>>>,
     clients:       RwLock<HashMap<IpAddr, Arc<Client<'a>>>>,

@@ -8,6 +8,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmap_helpers"
+version = "0.1.0"
+
+[[package]]
 name = "noodle"
 version = "0.1.0"
 
@@ -16,5 +20,6 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "falktp",
+ "mmap_helpers",
  "noodle",
 ]

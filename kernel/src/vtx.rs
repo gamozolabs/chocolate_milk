@@ -558,7 +558,65 @@ pub enum Register {
     ExitInterruptionErrorCode,
     ExitInstructionLength,
 
+    // Keep this at the end of actual registers to indicate the total number
+    // of registers
     NumRegisters,
+
+    // Register aliases here, these don't use additional storage, they are
+    // "hooked" to provide the pseudo-register behavior. 32-bit register writes
+    // are zero-extending, all others are merging
+    Al,
+    Ah,
+    Ax,
+    Eax,
+    Bl,
+    Bh,
+    Bx,
+    Ebx,
+    Cl,
+    Ch,
+    Cx,
+    Ecx,
+    Dl,
+    Dh,
+    Dx,
+    Edx,
+    Spl,
+    Sp,
+    Esp,
+    Bpl,
+    Bp,
+    Ebp,
+    Sil,
+    Si,
+    Esi,
+    Dil,
+    Di,
+    Edi,
+    R8b,
+    R8w,
+    R8d,
+    R9b,
+    R9w,
+    R9d,
+    R10b,
+    R10w,
+    R10d,
+    R11b,
+    R11w,
+    R11d,
+    R12b,
+    R12w,
+    R12d,
+    R13b,
+    R13w,
+    R13d,
+    R14b,
+    R14w,
+    R14d,
+    R15b,
+    R15w,
+    R15d,
 }
 
 /// Where different registers are stored
@@ -734,9 +792,75 @@ impl RegisterState {
         }
     }
 
+    /// Transform a register alias into its root components
+    /// Yields a (original register, bit index, bit length)
+    /// For example, for `Register::Ah` this would return (Register::Rax, 8, 8)
+    #[inline]
+    fn alias(reg: Register) -> (Register, u32, u32) {
+        match reg {
+            Register::Al  => (Register::Rax, 0,  8),
+            Register::Ah  => (Register::Rax, 8,  8),
+            Register::Ax  => (Register::Rax, 0, 16),
+            Register::Eax => (Register::Rax, 0, 32),
+            Register::Bl  => (Register::Rbx, 0,  8),
+            Register::Bh  => (Register::Rbx, 8,  8),
+            Register::Bx  => (Register::Rbx, 0, 16),
+            Register::Ebx => (Register::Rbx, 0, 32),
+            Register::Cl  => (Register::Rcx, 0,  8),
+            Register::Ch  => (Register::Rcx, 8,  8),
+            Register::Cx  => (Register::Rcx, 0, 16),
+            Register::Ecx => (Register::Rcx, 0, 32),
+            Register::Dl  => (Register::Rdx, 0,  8),
+            Register::Dh  => (Register::Rdx, 8,  8),
+            Register::Dx  => (Register::Rdx, 0, 16),
+            Register::Edx => (Register::Rdx, 0, 32),
+            Register::Spl => (Register::Rsp, 0,  8),
+            Register::Sp  => (Register::Rsp, 0, 16),
+            Register::Esp => (Register::Rsp, 0, 32),
+            Register::Bpl => (Register::Rbp, 0,  8),
+            Register::Bp  => (Register::Rbp, 0, 16),
+            Register::Ebp => (Register::Rbp, 0, 32),
+            Register::Sil => (Register::Rsi, 0,  8),
+            Register::Si  => (Register::Rsi, 0, 16),
+            Register::Esi => (Register::Rsi, 0, 32),
+            Register::Dil => (Register::Rdi, 0,  8),
+            Register::Di  => (Register::Rdi, 0, 16),
+            Register::Edi => (Register::Rdi, 0, 32),
+
+            Register::R8b  => (Register::R8,  0,  8),
+            Register::R8w  => (Register::R8,  0, 16),
+            Register::R8d  => (Register::R8,  0, 32),
+            Register::R9b  => (Register::R9,  0,  8),
+            Register::R9w  => (Register::R9,  0, 16),
+            Register::R9d  => (Register::R9,  0, 32),
+            Register::R10b => (Register::R10, 0,  8),
+            Register::R10w => (Register::R10, 0, 16),
+            Register::R10d => (Register::R10, 0, 32),
+            Register::R11b => (Register::R11, 0,  8),
+            Register::R11w => (Register::R11, 0, 16),
+            Register::R11d => (Register::R11, 0, 32),
+            Register::R12b => (Register::R12, 0,  8),
+            Register::R12w => (Register::R12, 0, 16),
+            Register::R12d => (Register::R12, 0, 32),
+            Register::R13b => (Register::R13, 0,  8),
+            Register::R13w => (Register::R13, 0, 16),
+            Register::R13d => (Register::R13, 0, 32),
+            Register::R14b => (Register::R14, 0,  8),
+            Register::R14w => (Register::R14, 0, 16),
+            Register::R14d => (Register::R14, 0, 32),
+            Register::R15b => (Register::R15, 0,  8),
+            Register::R15w => (Register::R15, 0, 16),
+            Register::R15d => (Register::R15, 0, 32),
+            _ => (reg, 0, 64),
+        }
+    }
+
     /// Get a register
     #[inline]
     pub fn reg(&mut self, reg: Register) -> u64 {
+        // Get aliasing information
+        let (reg, shamt, reglen) = Self::alias(reg);
+
         let idx = reg as usize / 8;
         let bit = reg as usize % 8;
 
@@ -774,15 +898,44 @@ impl RegisterState {
         }
 
         // Register is actively cached in the current register state
-        self.registers[reg as usize]
+        (self.registers[reg as usize] >> shamt)
+            .wrapping_shl(64 - reglen)
+            .wrapping_shr(64 - reglen)
     }
 
     /// Set a register to the internal cache
     #[inline]
     pub fn set_reg(&mut self, reg: Register, val: u64) {
+        // Get aliasing information
+        let (reg, shamt, reglen) = Self::alias(reg);
+
         let idx = reg as usize / 8;
         let bit = reg as usize % 8;
-        self.registers[reg as usize] = val;
+
+        if reglen == 64 {
+            // Directly replace the register
+            self.registers[reg as usize] = val;
+        } else if reglen == 32 && shamt == 0 {
+            // Zero-extend into 64-bits
+            // (mimics writes to 32-bit GPRs in 64-bit mode)
+            self.registers[reg as usize] = val as u32 as u64;
+        } else {
+            // Merge in the register
+            let old = self.reg(reg);
+
+            // Generate a mask for the bits we're going to merge in
+            let mask = ((1u64 << reglen) - 1) << shamt;
+
+            // Clear the old bits where we're masking in
+            let new = old & !mask;
+
+            // Merge in the new value
+            let new = new | ((val << shamt) & mask);
+
+            // Update the register
+            self.registers[reg as usize] = new;
+        }
+
         self.cached[idx]  |= 1 << bit;
         self.dirtied[idx] |= 1 << bit;
     }
@@ -974,9 +1127,21 @@ impl From<u8> for Exception {
     }
 }
 
+/// CPU operating modes
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+pub enum CpuMode {
+    Real,
+    Protected16,
+    Protected32,
+    Long16,
+    Long32,
+    Long64,
+}
+
 /// Virtual machine exit reason
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum VmExit {
+    VmCall,
     InterruptWindow,
     Io,
     MonitorTrap,
@@ -1193,9 +1358,8 @@ impl Vm {
 
             // On entry we want:
             // Load debug controls (required on Skylake)
-            // 64-bit guest
             // Load IA32_EFER
-            let entry_on = (1 << 2) | (1 << 9) | (1 << 15);
+            let entry_on = (1 << 2) | (1 << 15);
 
             // On entry we don't want:
             // Load IA32_PERF_GLOBAL_CTRL
@@ -1319,6 +1483,46 @@ impl Vm {
         &mut self.ept
     }
 
+    /// Get the current CPU operating mode
+    pub fn cpu_mode(&mut self) -> CpuMode {
+        // Determine if protected mode is enabled
+        let protected = (self.reg(Register::Cr0) & 1) != 0;
+
+        // Determine if long mode is active (EFER.LMA)
+        let long = protected && (self.reg(Register::Efer) & (1 << 10)) != 0;
+
+        // Get the CS access rights
+        let csar = self.reg(Register::CsAccessRights);
+
+        // Get the D bit (Default flag) from the CS descriptor
+        let dbit = (csar & (1 << 14)) != 0;
+        
+        // Get the L bit (64-bit flag) from the CS descriptor
+        let lbit = (csar & (1 << 13)) != 0;
+
+        if long {
+            if lbit {
+                // CS.L = 1 && CS.D = 0 is invalid
+                assert!(!dbit, "Invalid CPU state");
+                CpuMode::Long64
+            } else {
+                if dbit {
+                    CpuMode::Long32
+                } else {
+                    CpuMode::Long16
+                }
+            }
+        } else if protected {
+            if dbit {
+                CpuMode::Protected32
+            } else {
+                CpuMode::Protected16
+            }
+        } else {
+            CpuMode::Real
+        }
+    }
+
     /// Switch to another CPU context
     pub fn switch_cpu(&mut self, cpu: usize) {
         // Save the old PML address and index
@@ -1377,6 +1581,17 @@ impl Vm {
         self.guest_regs.guest_regs[ac].set_reg(reg, val);
     }
 
+    /// Modify a register and return the newly updated value
+    #[inline]
+    pub fn mod_reg<F>(&mut self, reg: Register, func: F) -> u64
+            where F: FnOnce(u64) -> u64 {
+        let ac = self.active_cpu();
+        let val = self.guest_regs.guest_regs[ac].reg(reg);
+        let new = func(val);
+        self.guest_regs.guest_regs[ac].set_reg(reg, new);
+        new
+    }
+
     /// Set the fxsave state for the VM
     #[inline]
     pub fn set_fxsave(&mut self, fxsave: FxSave) {
@@ -1411,6 +1626,25 @@ impl Vm {
                 core!().current_vm_ptr().store(self.vmcs.phys_addr().0,
                                                SeqCst);
             }
+        }
+
+        // Set the 64-bit guest entry control flag based on the EFER
+        let lma = (self.reg(Register::Efer) & (1 << 10)) != 0;
+        self.mod_reg(Register::EntryControls, |x| {
+            if lma {
+                // Set that we have a 64-bit guest
+                x | (1 << 15)
+            } else {
+                // Clear that the guest is 64-bit
+                x & !(1 << 15)
+            }
+        });
+
+        // Set unrestricted guest mode if we have a guest without paging
+        // enabled
+        if (self.reg(Register::Cr0) & (1 << 31)) == 0 {
+            // Set unrestricted guest
+            self.mod_reg(Register::ProcBasedControls2, |x| x | (1 << 7));
         }
 
         // Do one-time initialization
@@ -1723,6 +1957,7 @@ impl Vm {
                 let inst_len = self.reg(Register::ExitInstructionLength);
                 VmExit::Rdtsc { inst_len }
             }
+            18 => VmExit::VmCall,
             28 => {
                 // Control register access
 

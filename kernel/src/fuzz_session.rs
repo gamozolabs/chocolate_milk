@@ -51,7 +51,7 @@ const GUEST_PROFILING: bool = false;
 
 /// If enabled, the guest is single stepped and all RIPs are logged during
 /// execution. This is incredibly slow and memory intensive, use for debugging.
-const GUEST_TRACING: bool = false;
+const GUEST_TRACING: bool = true;
 
 /// When set, the APIC will be monitored for writes. This is not done yet, do
 /// not use!
@@ -106,7 +106,7 @@ pub trait Enlightenment: Send + Sync {
 }
 
 /// Different types of paging modes
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum PagingMode {
     /// 32-bit paging without PAE
     Bits32,
@@ -229,7 +229,7 @@ impl Statistics {
 }
 
 /// Network backed VM memory information
-struct NetBacking<'a> {
+pub struct NetBacking<'a> {
     /// Raw guest physical memory backing the snasphot
     memory: Arc<NetMapping<'a>>,
     
@@ -512,7 +512,7 @@ noodle!(serialize, deserialize,
 );
 
 impl BasicRegisterState {
-    fn from_register_state(rs: &mut RegisterState) -> Self {
+    pub fn from_register_state(rs: &mut RegisterState) -> Self {
         BasicRegisterState {
             rax: rs.reg(Register::Rax),
             rcx: rs.reg(Register::Rcx),
@@ -615,12 +615,12 @@ pub struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
-    /// Create a new empty VM from network backed memory
-    fn from_net(cpus: usize, memory: Arc<NetBacking<'a>>) -> Self {
+    /// Create a new empty VM
+    pub fn new(cpus: usize, memory: Option<Arc<NetBacking<'a>>>) -> Self {
         Worker {
             backing: Backing {
                 master:      None,
-                network_mem: Some(memory),
+                network_mem: memory,
                 vm:          Vm::new(cpus),
             },
             rng:            Rng::new(),
@@ -702,11 +702,24 @@ impl<'a> Worker<'a> {
     pub fn set_reg(&mut self, reg: Register, val: u64) {
         self.backing.vm.set_reg(reg, val)
     }
+    
+    /// Modify a register and return the newly updated value
+    #[inline]
+    pub fn mod_reg<F>(&mut self, reg: Register, func: F) -> u64
+            where F: FnOnce(u64) -> u64 {
+        self.backing.vm.mod_reg(reg, func)
+    }
 
     /// Get the current CPL
     #[inline]
     pub fn cpl(&mut self) -> u8 {
         (self.reg(Register::Cs) as u8) & 3
+    }
+    
+    /// Gets access to the VM backing this worker
+    #[inline]
+    pub fn vm_mut(&mut self) -> &mut Vm {
+        &mut self.backing.vm
     }
 
     /// Get a unique context identifier
@@ -833,6 +846,10 @@ impl<'a> Worker<'a> {
         for &paddr in self.pml.iter() {
             let paddr = PhysAddr(paddr);
 
+            if ENABLE_APIC && paddr == PhysAddr(0xfee00000) {
+                continue;
+            }
+
             // Get the original page from the master
             let pc = &mut self.page_cache;
             let vm = &mut self.backing.vm;
@@ -917,11 +934,7 @@ impl<'a> Worker<'a> {
 
         // Stores the register state of the VM during the last page fault
         let mut last_page_fault:
-            Option<(CoverageRecord, VmExit, BasicRegisterState)> = None;
-
-        // Found a crash, we should report it
-        let mut crash:
-            Option<(CoverageRecord, VmExit, BasicRegisterState)> = None;
+            Option<(CoverageRecord, VmExit, BasicRegisterState, u8)> = None;
 
         if GUEST_TRACING {
             // Clear the execution trace
@@ -1041,15 +1054,17 @@ impl<'a> Worker<'a> {
                         self.resolve_module(rip),
                         vmexit,
                         BasicRegisterState::from_register_state(
-                            self.backing.vm.active_register_state())));
-
+                            self.backing.vm.active_register_state()),
+                        self.cpl()));
                     continue 'vm_loop;
                 }
                 VmExit::Exception(Exception::Breakpoint) => {
                     let rip = self.reg(Register::Rip);
-                    if rip == 0xfffff801451d04b3 {
-                        crash = Some(last_page_fault.unwrap());
-                        break 'vm_loop vmexit;
+                    if rip == 0xfffff80429bd04b3 {
+                        let (cr, vm, rs, cpl) =
+                            last_page_fault.as_ref().unwrap();
+                        self.report_crash(&session, cr, vm, rs, *cpl);
+                        //break 'vm_loop vmexit;
                     }
                 }
                 VmExit::Exception(Exception::NMI) => {
@@ -1060,14 +1075,14 @@ impl<'a> Worker<'a> {
                     }
                 }
                 VmExit::Exception(_) => {
-                    let rip = self.reg(Register::Rip);
-                    crash = Some((
-                        self.resolve_module(rip),
-                        vmexit,
-                        BasicRegisterState::from_register_state(
-                            self.backing.vm.active_register_state())
-                    ));
-                    break 'vm_loop vmexit;
+                    let rip      = self.reg(Register::Rip);
+                    let modoff   = self.resolve_module(rip);
+                    let cpl      = self.cpl();
+                    let regstate = BasicRegisterState::from_register_state(
+                        self.backing.vm.active_register_state());
+                    self.report_crash(&session, &modoff, &vmexit, &regstate,
+                                      cpl);
+                    //break 'vm_loop vmexit;
                 }
                 VmExit::ReadMsr { inst_len } => {
                     // Get the MSR ID we're reading
@@ -1215,11 +1230,12 @@ impl<'a> Worker<'a> {
 
                             let val = mm::read_phys::<u64>(
                                 PhysAddr(page.0 + (addr.0 & 0xfff)));
+                            /*
                             print!("APIC write from {} to {:#x} {:#x} with \
                                    {:#x}\n",
                                    self.active_cpu(),
                                    self.reg(Register::Rip),
-                                   addr.0, val);
+                                   addr.0, val);*/
 
                             if addr == PhysAddr(0xfee0_0300) {
                                 let delivery_mode   = (val >>  8) & 7;
@@ -1227,11 +1243,11 @@ impl<'a> Worker<'a> {
                                 let delivery_status = (val >> 12) & 1 != 0;
                                 let level           = (val >> 14) & 1 != 0;
                                 let level_triggered = (val >> 15) & 1 != 0;
-                                let dest_shorthand  = (val >> 18) & 3;
+                                let _dest_shorthand = (val >> 18) & 3;
 
                                 // We emulate so little, only IPI-to-self and
                                 // only fixed delivery mode (no NMI, etc)
-                                assert!(dest_shorthand == 1 &&
+                                assert!(
                                         !level && !level_triggered &&
                                         !delivery_status &&
                                         delivery_mode == 0);
@@ -1364,60 +1380,6 @@ impl<'a> Worker<'a> {
             self.sync = time::future(STATISTIC_SYNC_INTERVAL);
         }
 
-        if let Some((cr, VmExit::Exception(x), regstate)) = crash {
-            let ct = match x {
-                Exception::DivideError => CrashType::DivideError,
-                Exception::DebugException => CrashType::DebugException,
-                Exception::NMI => CrashType::NMI,
-                Exception::Breakpoint => CrashType::Breakpoint,
-                Exception::Overflow => CrashType::Overflow,
-                Exception::BoundRangeExceeded => CrashType::BoundRangeExceeded,
-                Exception::InvalidOpcode => CrashType::InvalidOpcode,
-                Exception::DeviceNotAvailable => CrashType::DeviceNotAvailable,
-                Exception::DoubleFault => CrashType::DoubleFault,
-                Exception::CoprocessorSegmentOverrun =>
-                    CrashType::CoprocessorSegmentOverrun,
-                Exception::InvalidTSS => CrashType::InvalidTSS,
-                Exception::SegmentNotPresent => CrashType::SegmentNotPresent,
-                Exception::StackSegmentFault => CrashType::StackSegmentFault,
-                Exception::GeneralProtectionFault(..) =>
-                    CrashType::GeneralProtectionFault,
-                Exception::PageFault { write, exec, addr, .. } =>
-                {
-                    CrashType::PageFault {
-                        typ: if (addr.0 as i64).abs() < (1024 * 1024) {
-                            PageFaultType::Null
-                        } else {
-                            PageFaultType::High
-                        },
-                        cpl:   self.cpl(),
-                        read:  if !write && !exec { true } else { false },
-                        write: write,
-                        exec:  exec,
-                    }
-                }
-                Exception::FloatingPointError => CrashType::FloatingPointError,
-                Exception::AlignmentCheck => CrashType::AlignmentCheck,
-                Exception::MachineCheck => CrashType::MachineCheck,
-                Exception::SimdFloatingPointException =>
-                    CrashType::SimdFloatingPointException,
-                Exception::VirtualizationException =>
-                    CrashType::VirtualizationException,
-                Exception::ControlProtectionException =>
-                    CrashType::ControlProtectionException,
-            };
-
-            let record = session.crashes.entry_or_insert(
-                &(regstate.rip, ct), regstate.rip as usize, || Box::new(()));
-            if record.inserted() {
-                let server = self.server.as_mut().unwrap();
-                ServerMessage::Crash(
-                    cr, ct, Cow::Owned(format!("{}", regstate))
-                ).serialize(server).unwrap();
-                server.flush().unwrap();
-            }
-        }
-
         if GUEST_TRACING {
             // Report the guest trace
             ServerMessage::Trace(
@@ -1427,6 +1389,75 @@ impl<'a> Worker<'a> {
 
         self.session = Some(session);
         vmexit
+    }
+
+    /// Report a crash to the server
+    pub fn report_crash(&mut self, session: &FuzzSession, cr: &CoverageRecord,
+                        vmexit: &VmExit, regstate: &BasicRegisterState,
+                        cpl: u8) {
+        let ct = match vmexit {
+            VmExit::Exception(Exception::DivideError) => CrashType::DivideError,
+            VmExit::Exception(Exception::DebugException) =>
+                CrashType::DebugException,
+            VmExit::Exception(Exception::NMI) => CrashType::NMI,
+            VmExit::Exception(Exception::Breakpoint) => CrashType::Breakpoint,
+            VmExit::Exception(Exception::Overflow) => CrashType::Overflow,
+            VmExit::Exception(Exception::BoundRangeExceeded) =>
+                CrashType::BoundRangeExceeded,
+            VmExit::Exception(Exception::InvalidOpcode) =>
+                CrashType::InvalidOpcode,
+            VmExit::Exception(Exception::DeviceNotAvailable) =>
+                CrashType::DeviceNotAvailable,
+            VmExit::Exception(Exception::DoubleFault) => CrashType::DoubleFault,
+            VmExit::Exception(Exception::CoprocessorSegmentOverrun) =>
+                CrashType::CoprocessorSegmentOverrun,
+            VmExit::Exception(Exception::InvalidTSS) => CrashType::InvalidTSS,
+            VmExit::Exception(Exception::SegmentNotPresent) =>
+                CrashType::SegmentNotPresent,
+            VmExit::Exception(Exception::StackSegmentFault) =>
+                CrashType::StackSegmentFault,
+            VmExit::Exception(Exception::GeneralProtectionFault(..)) =>
+                CrashType::GeneralProtectionFault,
+            VmExit::Exception(Exception::PageFault { write, exec, addr, .. }) =>
+            {
+                CrashType::PageFault {
+                    typ: if (addr.0 as i64).abs() < (1024 * 1024) {
+                        PageFaultType::Null
+                    } else {
+                        PageFaultType::High
+                    },
+                    read:  if !write && !exec { true } else { false },
+                    write: *write,
+                    exec:  *exec,
+                }
+            }
+            VmExit::Exception(Exception::FloatingPointError) =>
+                CrashType::FloatingPointError,
+            VmExit::Exception(Exception::AlignmentCheck) =>
+                CrashType::AlignmentCheck,
+            VmExit::Exception(Exception::MachineCheck) =>
+                CrashType::MachineCheck,
+            VmExit::Exception(Exception::SimdFloatingPointException) =>
+                CrashType::SimdFloatingPointException,
+            VmExit::Exception(Exception::VirtualizationException) =>
+                CrashType::VirtualizationException,
+            VmExit::Exception(Exception::ControlProtectionException) =>
+                CrashType::ControlProtectionException,
+            _ => panic!("Did not know how to report crash {:?}", vmexit),
+        };
+
+        let record = session.crashes.entry_or_insert(
+            &(regstate.rip, ct), regstate.rip as usize, || Box::new(()));
+        if record.inserted() {
+            let server = self.server.as_mut().unwrap();
+            ServerMessage::Crash {
+                modoff:   cr.clone(),
+                cpl:      cpl,
+                typ:      ct,
+                regstate: Cow::Owned(format!("{}", regstate))
+            }.serialize(server).unwrap();
+            server.flush().unwrap();
+        }
     }
 
     /// Attempt to resolve the `addr` into a module + offset based on the
@@ -1508,6 +1539,7 @@ impl<'a> Worker<'a> {
                                 |paddr| self.read_phys(paddr))?
                         }
                         PagingMode::Bits32Pae => {
+                            print!("Pae {:#x} {:#x}\n", cr3, addr);
                             translate_32_pae(cr3, VirtAddr(addr),
                                 |paddr| self.read_phys(paddr))?
                         }
@@ -1927,7 +1959,7 @@ impl<'a> FuzzSession<'a> {
             memory: memory.clone(),
             phys_ranges
         });
-        let mut master = Worker::from_net(num_cpus, netbacking.clone());
+        let mut master = Worker::new(num_cpus, Some(netbacking.clone()));
 
         for regs in master.backing.vm.guest_regs.guest_regs.iter_mut() {
             // Get the size of the region region in bytes

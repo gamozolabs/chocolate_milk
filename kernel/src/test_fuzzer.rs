@@ -15,7 +15,7 @@ pub fn fuzz() {
         LockCell<Option<Arc<FuzzSession>>, LockInterrupts> =
         LockCell::new(None);
 
-    // Create the master sessionshot, and fork from it for all cores
+    // Create the master snapshot, and fork from it for all cores
     let session = {
         let mut session = SESSION.lock();
         if session.is_none() {
