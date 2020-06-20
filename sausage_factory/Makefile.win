@@ -1,7 +1,0 @@
-all:
-	nasm -f bin shellcode.asm -o shellcode.bin
-	cl /Wall /WX /wd4820 /wd4668 /wd4710 /Od /Zi /Zo \
-		test.c kernel32.lib ntdll.lib
-#	test.exe
-	cdb -g -G test.exe
-
