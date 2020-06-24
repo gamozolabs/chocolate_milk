@@ -1628,25 +1628,6 @@ impl Vm {
             }
         }
 
-        // Set the 64-bit guest entry control flag based on the EFER
-        let lma = (self.reg(Register::Efer) & (1 << 10)) != 0;
-        self.mod_reg(Register::EntryControls, |x| {
-            if lma {
-                // Set that we have a 64-bit guest
-                x | (1 << 15)
-            } else {
-                // Clear that the guest is 64-bit
-                x & !(1 << 15)
-            }
-        });
-
-        // Set unrestricted guest mode if we have a guest without paging
-        // enabled
-        if (self.reg(Register::Cr0) & (1 << 31)) == 0 {
-            // Set unrestricted guest
-            self.mod_reg(Register::ProcBasedControls2, |x| x | (1 << 7));
-        }
-
         // Do one-time initialization
         if !self.init {
             unsafe {
@@ -1713,7 +1694,27 @@ impl Vm {
             // We have initialized the VM
             self.init = true;
         }
-            
+        
+        // Set the 64-bit guest entry control flag based on the EFER
+        let lma = (self.reg(Register::Efer) & (1 << 10)) != 0;
+        self.mod_reg(Register::EntryControls, |x| {
+            if lma {
+                // Set that we have a 64-bit guest
+                x | (1 << 9)
+            } else {
+                // Clear that the guest is 64-bit
+                x & !(1 << 9)
+            }
+        });
+
+        // Set unrestricted guest mode if we have a guest without paging
+        // enabled
+        if (self.reg(Register::Cr0) & (1 << 31)) == 0 {
+            // Set unrestricted guest
+            self.mod_reg(Register::ProcBasedControls2, |x| x | (1 << 7));
+        }
+        
+        // Invalidate the EPT if it has been dirtied
         if self.ept_dirty {
             unsafe {
                 // Invalidate the EPT

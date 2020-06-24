@@ -8,7 +8,7 @@ use crate::fuzz_session::{Worker, FuzzSession};
 use lockcell::LockCell;
 
 pub fn fuzz() {
-    //if core!().id != 0 { cpu::halt(); }
+    if core!().id != 0 { cpu::halt(); }
     //if core!().id >= 24 { cpu::halt(); }
 
     static SESSION:
