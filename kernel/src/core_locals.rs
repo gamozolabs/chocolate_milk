@@ -48,7 +48,7 @@ impl AutoAtomicRef {
 }
 
 /// Guard structure that allows automatic reference count decrementing on
-/// `AutoAtomicRef`s when the increment goes out of score
+/// `AutoAtomicRef`s when the increment goes out of scope
 pub struct AutoAtomicRefGuard<'a>(&'a AutoAtomicRef);
 
 impl<'a> Drop for AutoAtomicRefGuard<'a> {
