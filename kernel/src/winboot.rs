@@ -91,7 +91,7 @@ pub fn main() {
     /// Base address to inject our BIOS, must be 16-byte aligned
     const BIOS_BASE: u64 = 0xf0000;
 
-    // Start the pointer to our BIOS, where we wriet out random code we
+    // Start the pointer to our BIOS, where we write out random code we
     // want to be resident inside the guest
     let mut bios = 0xf0000;
 
