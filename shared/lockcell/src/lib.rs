@@ -1,7 +1,7 @@
 //! Inner-mutability on shared variables through spinlocks
 
 #![no_std]
-#![feature(const_fn, track_caller, llvm_asm)]
+#![feature(const_fn, llvm_asm)]
 
 use core::ops::{Deref, DerefMut};
 use core::cell::UnsafeCell;
