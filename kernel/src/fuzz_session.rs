@@ -987,6 +987,24 @@ impl<'a> Worker<'a> {
             self.stats.vm_cycles += vm_cycles;
 
             match vmexit {
+                VmExit::CpuId { inst_len } => {
+                    let rax = self.reg(Register::Rax) as u32;
+                    let rcx = self.reg(Register::Rcx) as u32;
+                    
+                    // Take the host cpuid and write it into the guest
+                    unsafe{
+                        let (eax, ebx, ecx, edx) = cpu::cpuid(rax,rcx);
+                        self.set_reg(Register::Eax, eax as u64);
+                        self.set_reg(Register::Ebx, ebx as u64);
+                        self.set_reg(Register::Ecx, ecx as u64);
+                        self.set_reg(Register::Edx, edx as u64);
+                    }
+
+                    // Advance RIP to next instruction
+                    let rip = self.reg(Register::Rip);
+                    self.set_reg(Register::Rip, rip.wrapping_add(inst_len));
+                    continue 'vm_loop;
+                }
                 VmExit::Rdtsc { inst_len } => {
                     let tsc = self.backing.vm.guest_regs.tsc;
                     self.set_reg(Register::Rax, (tsc >>  0) & 0xffffffff);
