@@ -71,9 +71,6 @@ pub struct TcpConnectionInt {
     /// Current acknowledge
     ack: u32,
 
-    /// Last observed sequence number from the remote side
-    remote_seq: u32,
-
     /// Last observed acknowledge number from the remote side
     remote_ack: u32,
 
@@ -222,7 +219,6 @@ impl TcpConnectionInt {
         }
 
         // Update the server state to the most recent packet information
-        self.remote_seq    = tcp.seq;
         self.remote_ack    = tcp.ack;
         self.remote_window = tcp.window;
 
@@ -463,7 +459,6 @@ impl NetDevice {
                     seq:           rand_seq,
                     ack:           0,
                     server:        server,
-                    remote_seq:    0,
                     remote_ack:    rand_seq,
                     remote_window: 0,
                     remote_mss:    536,
