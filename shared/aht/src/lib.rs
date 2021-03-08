@@ -113,8 +113,9 @@ impl<K, V, const N: usize> Aht<K, V, N> {
             // Try to get exclusive access to this hash table entry
             if self.hash_table[hti].0.load(Ordering::SeqCst) == empty &&
                     self.hash_table[hti].0
-                        .compare_and_swap(empty, filling,
-                                          Ordering::SeqCst) == empty {
+                        .compare_exchange(empty, filling,
+                                          Ordering::SeqCst, Ordering::SeqCst)
+                        .unwrap_or_else(|x| x) == empty {
                 // Request the caller to create the entry
                 let ent = Box::into_raw(insert());
 

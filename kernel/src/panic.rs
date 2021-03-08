@@ -214,7 +214,8 @@ pub fn panic(info: &PanicInfo) -> ! {
     } else {
         // Check if the BSP is already panicing, if it is not, report our
         // panic to it via an NMI
-        if PANICING.compare_and_swap(false, true, Ordering::SeqCst) == false {
+        if PANICING.compare_exchange(false, true, Ordering::SeqCst,
+                        Ordering::SeqCst).unwrap_or_else(|x| x) == false {
             // Save the panic info for this core
             PANIC_PENDING.store(info as *const _ as *mut _, Ordering::SeqCst);
 

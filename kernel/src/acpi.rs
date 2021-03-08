@@ -84,9 +84,10 @@ pub fn core_checkin() {
 
     // Transition from launched to online
     let old_state = APICS[core!().apic_id().unwrap() as usize]
-        .compare_and_swap(ApicState::Launched as u8,
+        .compare_exchange(ApicState::Launched as u8,
                           ApicState::Online   as u8,
-                          Ordering::SeqCst);
+                          Ordering::SeqCst,
+                          Ordering::SeqCst).unwrap_or_else(|x| x);
 
     if core!().id == 0 {
         // BSP should already be marked online
