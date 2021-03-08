@@ -1,7 +1,7 @@
 //! A kernel written all in Rust
 
 #![feature(panic_info_message, alloc_error_handler, llvm_asm, global_asm)]
-#![feature(const_in_array_repeat_expressions, const_generics, new_uninit)]
+#![feature(const_generics, new_uninit)]
 #![allow(incomplete_features)]
 
 #![no_std]

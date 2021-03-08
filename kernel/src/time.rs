@@ -43,7 +43,7 @@ pub fn elapsed(start_time: u64) -> f64 {
 pub fn sleep(microseconds: u64) {
     let waitval = future(microseconds);
     while cpu::rdtsc() < waitval {
-        core::sync::atomic::spin_loop_hint();
+        core::hint::spin_loop();
     }
 }
 
