@@ -7,7 +7,8 @@ use core::ops::{Deref, DerefMut};
 use core::cell::UnsafeCell;
 use core::panic::Location;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, spin_loop_hint};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::hint::spin_loop;
 
 /// Read the time stamp counter
 #[inline]
@@ -193,7 +194,7 @@ impl<T: ?Sized, I: InterruptState> LockCell<T, I> {
                 }
             }
 
-            spin_loop_hint();
+            spin_loop();
         }
 
         // Note that this core owns the lock
