@@ -1141,6 +1141,9 @@ pub enum CpuMode {
 /// Virtual machine exit reason
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum VmExit {
+    CpuId {
+        inst_len: u64,
+    },
     VmCall,
     InterruptWindow,
     Io,
@@ -1954,6 +1957,10 @@ impl Vm {
             }
             1 => VmExit::ExternalInterrupt,
             7 => VmExit::InterruptWindow,
+            10 => {
+                let inst_len = self.reg(Register::ExitInstructionLength);
+                VmExit::CpuId { inst_len }
+            }
             16 => {
                 let inst_len = self.reg(Register::ExitInstructionLength);
                 VmExit::Rdtsc { inst_len }
