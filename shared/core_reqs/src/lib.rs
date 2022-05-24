@@ -1,9 +1,9 @@
 //! Requirements for Rust libcore. These are just basic libc `mem*()` routines
 //! as well as some intrinsics to get access to 64-bit integers in 32-bit land
 
-#![feature(global_asm, llvm_asm)]
-
 #![no_std]
+
+use core::arch::{asm, global_asm};
 
 /// libc `memcpy` implementation in Rust
 ///
@@ -65,10 +65,12 @@ pub unsafe extern fn memmove(dest: *mut u8, src: *const u8, n: usize)
 pub unsafe extern fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     if n == 0 { return s; }
 
-    llvm_asm!(r#"
-        rep stosb
-    "# :: "{edi}"(s), "{ecx}"(n), "{eax}"(c) : "memory", "edi", "ecx", "eax" :
-    "volatile", "intel");
+    asm!(
+        "rep stosb",
+        inout("edi") s => _,
+        inout("ecx") n => _,
+        inout("eax") c => _,
+    );
 
     s
 }
@@ -86,10 +88,12 @@ pub unsafe extern fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
 pub unsafe extern fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     if n == 0 { return s; }
 
-    llvm_asm!(r#"
-        rep stosb
-    "# :: "{rdi}"(s), "{rcx}"(n), "{eax}"(c) : "memory", "rdi", "rcx", "eax" :
-    "volatile", "intel");
+    asm!(
+        "rep stosb",
+        inout("rdi") s => _,
+        inout("rcx") n => _,
+        inout("rax") c => _,
+    );
 
     s
 }
@@ -114,6 +118,18 @@ pub unsafe extern fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
     }
     
     0
+}
+
+#[no_mangle]
+pub unsafe fn strlen(start: *const u8) -> usize
+{
+    let mut pos = start;
+
+    while *pos != 0 {
+        pos = pos.offset(1);
+    }
+
+    pos.offset_from(start) as _
 }
 
 // Making a fake __CxxFrameHandler3 in Rust causes a panic, this is hacky

@@ -1,5 +1,4 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![feature(const_generics)]
 #![allow(incomplete_features)]
 
 extern crate core;

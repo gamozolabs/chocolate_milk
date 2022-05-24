@@ -11,6 +11,8 @@
 // name mangling.
 // ---------------------------------------------------------------------------
 
+use core::arch::global_asm;
+
 /// Perform n % d
 #[export_name="\x01__aullrem"]
 pub extern "stdcall" fn __aullrem(n: u64, d: u64) -> u64 {
@@ -36,8 +38,6 @@ pub extern "stdcall" fn __alldiv(n: i64, d: i64) -> i64 {
 }
 
 global_asm!(r#"
-.intel_syntax
-
     // eax -> Size of the stack allocation needed
     .global __chkstk
     __chkstk:
@@ -48,10 +48,6 @@ global_asm!(r#"
 
         // Allocate the room on the stack as requested
         sub esp, eax
-
         // Jump to the return location
         jmp dword ptr [esp + eax]
-
-.att_syntax
 "#);
-
