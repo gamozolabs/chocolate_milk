@@ -1,5 +1,6 @@
 //! This file is used to hold and access all of the core locals
 
+use core::arch::asm;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, AtomicU8, AtomicU32, AtomicU64,Ordering};
 use core::alloc::Layout;
@@ -320,8 +321,7 @@ pub fn get_core_locals() -> &'static CoreLocals {
 
         // Get the first `u64` from `CoreLocals`, which given we don't change
         // the structure shape, should be the address of the core locals.
-        llvm_asm!("mov $0, gs:[0]" :
-             "=r"(ptr) :: "memory" : "volatile", "intel");
+        asm!("mov {0}, gs:[0]", out(reg) ptr);
 
         &*(ptr as *const CoreLocals)
     }

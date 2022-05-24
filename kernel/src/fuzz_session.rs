@@ -5,6 +5,7 @@ pub mod windows;
 
 use core::fmt;
 use core::any::Any;
+use core::arch::asm;
 use core::mem::size_of;
 use core::cell::Cell;
 use core::convert::TryInto;
@@ -884,16 +885,13 @@ impl<'a> Worker<'a> {
 
             unsafe {
                 // Copy the original page into the modified copy of the page
-                llvm_asm!(r#"
-                  
-                    mov rcx, 4096 / 8
-                    rep movsq
-
-                "# ::
-                "{rdi}"(page.0),
-                "{rsi}"(orig_page.0) :
-                "memory", "rcx", "rdi", "rsi", "cc" : 
-                "intel", "volatile");
+                asm!(
+                    "mov rcx, 4096 / 8",
+                    "rep movsq",
+                    inout("rdi") page.0 => _,
+                    inout("rsi") orig_page.0 => _,
+                    out("rcx") _,
+                );
             }
         }
 
@@ -1070,7 +1068,7 @@ impl<'a> Worker<'a> {
                 VmExit::Exception(Exception::NMI) => {
                     unsafe {
                         // NMI ourselves
-                        llvm_asm!("int 2" ::: "memory" : "volatile", "intel");
+                        asm!("int 2");
                         cpu::halt();
                     }
                 }

@@ -1,7 +1,6 @@
 //! An atomic vector with a fixed size capacity and insert-only semantics
 
 #![no_std]
-#![feature(const_generics)]
 #![allow(incomplete_features)]
 
 extern crate alloc;

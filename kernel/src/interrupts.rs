@@ -1,5 +1,6 @@
 //! Module to provide programming and use of interrupts on x86 processors
 
+use core::arch::{asm, global_asm};
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
@@ -230,15 +231,14 @@ pub fn init() {
 
     unsafe {
         // Update to use a GDT in the current virtual space
-        llvm_asm!(r#"
+        asm!(
                 // Load the GDT
-                lgdt [$0]
-
+                "lgdt [{0}]",
                 // Load the TSS
-                mov cx, 0x38
-                ltr cx
-        "# :: "r"(&gdt_ptr as *const TablePtr) : "memory", "rcx" :
-            "volatile", "intel");
+                "mov cx, 0x38",
+                "ltr cx",
+                in(reg) &gdt_ptr as *const TablePtr
+        );
     }
     
     // Create a new IDT
@@ -269,8 +269,7 @@ pub fn init() {
   
     unsafe {
         // Load the IDT!
-        llvm_asm!("lidt [$0]" :: "r"(&idt_ptr as *const TablePtr) :
-             "memory" : "volatile", "intel");
+        asm!("lidt [{0}]", in(reg) &idt_ptr as *const TablePtr);
     }
 
     // Create the interrupts structure
@@ -284,7 +283,7 @@ pub fn init() {
 
 /// Shape of a raw 64-bit interrupt frame
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
+#[repr(C)] // not packed?
 pub struct InterruptFrame {
 	pub rip:    usize,
 	pub cs:     usize,
@@ -295,7 +294,7 @@ pub struct InterruptFrame {
 
 /// Structure containing all registers at the state of the interrupt
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
+#[repr(C)] // not packed?
 pub struct AllRegs {
     pub xmm15: u128,
     pub xmm14: u128,
@@ -364,7 +363,7 @@ pub unsafe extern fn interrupt_handler(
             let vmxon_lock = core!().vmxon_region().shatter();
             if (*vmxon_lock).is_some() {
                 // Disable VMX root operation
-                llvm_asm!("vmxoff" :::: "intel", "volatile");
+                asm!("vmxoff");
             }
             
             // Mark that we're in the halted state
@@ -822,7 +821,6 @@ extern {
 }
 
 global_asm!(r#"
-.intel_syntax
 
 .macro XMMPUSH reg
     sub    rsp, 16
@@ -1219,7 +1217,6 @@ define_int_handler 253, 0
 define_int_handler 254, 0
 define_int_handler 255, 0
 
-.att_syntax
 
 "#);
 
