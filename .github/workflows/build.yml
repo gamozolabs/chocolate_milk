@@ -14,8 +14,8 @@ jobs:
             - name: Dependencies
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y lld-14 nasm
-                  sudo ln -s /usr/bin/lld-link-14 /usr/bin/lld-link
+                  sudo apt-get install -y lld-12 nasm
+                  sudo ln -s /usr/bin/lld-link-12 /usr/bin/lld-link
                   rustup default nightly
                   rustup target add i586-pc-windows-msvc x86_64-pc-windows-msvc
             - name: Compile
