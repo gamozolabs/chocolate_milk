@@ -11,31 +11,7 @@
 // name mangling.
 // ---------------------------------------------------------------------------
 
-use core::arch::global_asm;
-
-/// Perform n % d
-#[export_name="\x01__aullrem"]
-pub extern "stdcall" fn __aullrem(n: u64, d: u64) -> u64 {
-    compiler_builtins::int::udiv::__umoddi3(n, d)
-}
-
-/// Perform n / d
-#[export_name="\x01__aulldiv"]
-pub extern "stdcall" fn __aulldiv(n: u64, d: u64) -> u64 {
-    compiler_builtins::int::udiv::__udivdi3(n, d)
-}
-
-/// Perform n % d
-#[export_name="\x01__allrem"]
-pub extern "stdcall" fn __allrem(n: i64, d: i64) -> i64 {
-    compiler_builtins::int::sdiv::__moddi3(n, d)
-}
-
-/// Perform n / d
-#[export_name="\x01__alldiv"]
-pub extern "stdcall" fn __alldiv(n: i64, d: i64) -> i64 {
-    compiler_builtins::int::sdiv::__divdi3(n, d)
-}
+use core::arch::{global_asm};
 
 global_asm!(r#"
     // eax -> Size of the stack allocation needed
