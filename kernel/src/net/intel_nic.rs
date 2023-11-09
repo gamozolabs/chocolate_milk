@@ -290,6 +290,35 @@ struct RxState {
     head: usize,
 }
 
+/// A wrapper to a pointer to MMIO, because Rust is whiny.  This is necessary
+/// because of Send+Sync traits, which are disallowed for raw pointers.
+/// But we are dealing with volatile r/w so this is perfectly fine.
+struct IntelMMIO {
+    mmio: *mut [u32; 32 * 1024],
+}
+
+unsafe impl Sync for IntelMMIO {}
+unsafe impl Send for IntelMMIO {}
+
+impl IntelMMIO {
+    fn new(mmio: *mut [u32; 32 * 1024]) -> Self {
+        Self { mmio }
+    }
+
+    unsafe fn read(&self, reg_offset: usize) -> u32 {
+        let reg = reg_offset / size_of::<u32>();
+        let ptr = (self.mmio as *const u32).add(reg);
+        core::ptr::read_volatile(ptr)
+    }
+
+    unsafe fn write(&self, reg_offset: usize, val: u32) {
+        let reg = reg_offset / size_of::<u32>();
+        let ptr = (self.mmio as *mut u32).add(reg);
+        core::ptr::write_volatile(ptr, val);
+    }
+}
+
+
 /// Intel gigabit network driver
 struct IntelGbit {
     /// Per-NIC registers for the different registers we use
@@ -297,7 +326,7 @@ struct IntelGbit {
 
     /// Memory mapped I/O for this device
     /// These devices map 128 KiB of memory
-    mmio: &'static mut [u32; 32 * 1024],
+    mmio: IntelMMIO,
 
     /// Receive logic state
     rx_state: LockCell<RxState, LockInterrupts>,
@@ -368,9 +397,7 @@ impl<'a> IntelGbit {
             }
 
             // Box up the MMIO space
-            unsafe {
-                &mut *(vaddr.0 as *mut [u32; 32 * 1024])
-            }
+            IntelMMIO::new(vaddr.0 as *mut [u32; 32 * 1024])
         };
 
         // Make sure that the descriptor tables fit on a single page. They're
@@ -547,16 +574,13 @@ impl<'a> IntelGbit {
     /// Read from the MMIO Intel register at `reg_offset`. This is the offset
     /// into MMIO space in bytes, not the register ID
     unsafe fn read(&self, reg_offset: usize) -> u32 {
-        let reg = reg_offset / size_of::<u32>();
-        core::ptr::read_volatile(&self.mmio[reg])
+        self.mmio.read(reg_offset)
     }
 
     /// Write `val` to the MMIO Intel register at `reg_offset`. This is the
     /// offset into MMIO space in bytes, not the register ID
     unsafe fn write(&self, reg_offset: usize, val: u32) {
-        let reg = reg_offset / size_of::<u32>();
-        core::ptr::write_volatile(
-            &self.mmio[reg] as *const u32 as *mut u32, val);
+        self.mmio.write(reg_offset, val);
     }
 }
 

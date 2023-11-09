@@ -100,7 +100,7 @@ impl<T, const N: usize> Drop for AtomicVec<T, N> {
             // If the pointer was non-null, convert it back into a `Box` and
             // let it drop
             if !ptr.is_null() {
-                unsafe { Box::from_raw(ptr); }
+                unsafe { let _ = Box::from_raw(ptr); }
             }
         }
     }
