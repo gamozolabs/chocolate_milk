@@ -1,7 +1,7 @@
 //! Bootloader for BIOS-based x86 implementations using PXE to download a
 //! second stage x86_64 PE file which will be loaded and executed in long mode
 
-#![feature(panic_info_message, rustc_private, alloc_error_handler, global_asm)]
+#![feature(panic_info_message, rustc_private, alloc_error_handler)]
 #![no_std]
 #![no_main]
 
@@ -61,6 +61,7 @@ pub static BOOT_ARGS: BootArgs<LockInterrupts> = BootArgs::new();
 #[no_mangle]
 extern fn entry(bootloader_end: usize, soft_reboot_entry: usize,
                 num_boots: u64) -> ! {
+
     // Initialize the serial driver
     {
         // Get access to the serial driver

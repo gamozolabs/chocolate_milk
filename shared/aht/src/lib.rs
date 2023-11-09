@@ -1,7 +1,6 @@
 //! Atomic hash table. Allows thread-safe atomic hash table insertions without
 //! needing locks
 
-#![feature(const_generics)]
 #![allow(incomplete_features)]
 #![no_std]
 
@@ -185,7 +184,7 @@ impl<K, V, const N: usize> Drop for Aht<K, V, N> {
 
             if !ptr.is_null() {
                 // Drop the value
-                unsafe { Box::from_raw(ptr); }
+                unsafe { let _ = Box::from_raw(ptr); }
 
                 // Drop the key as well, as it's not automatically dropped due
                 // to `MaybeUninit`

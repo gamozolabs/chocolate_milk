@@ -5,6 +5,7 @@
 //! modprobe -r kvm_intel
 //! modprobe kvm_intel nested=1
 
+use core::arch::asm;
 use core::mem::size_of;
 use core::sync::atomic::Ordering::SeqCst;
 use page_table::{PhysAddr, VirtAddr};
@@ -84,27 +85,34 @@ const IA32_VMX_ENTRY_CTLS: u32 = 0x484;
 
 #[inline]
 unsafe fn invalidate_ept(eptp: u128) {
-    llvm_asm!("invept $0, [$1]" :: "r"(1u64), "r"(&eptp) : "memory" :
-              "intel", "volatile");
+    asm!(
+        "invept {0}, [{1}]",
+        in(reg) 1u64,
+        in(reg) &eptp,
+    );
 }
 
 /// Reads the contents of the current VMCS field based on `encoding`
 #[inline]
 unsafe fn vmread(encoding: Vmcs) -> u64 {
     let ret;
-    llvm_asm!(r#"
-            xor    eax, eax
-            vmread rax, rbx
-        "# : "={rax}"(ret) : "{rbx}"(encoding as u64) : "memory" :
-         "intel", "volatile");
+    asm!(
+            "xor    eax, eax",
+            "vmread rax, {0}",
+            in(reg) encoding as u64,
+            out("rax") ret,
+    );
     ret
 }
 
 /// Sets the contents of the current VMCS field based on `encoding` and `val`
 #[inline]
 unsafe fn vmwrite(encoding: Vmcs, val: u64) {
-    llvm_asm!("vmwrite $0, $1" :: "r"(encoding as u64), "r"(val) : "memory" :
-              "intel", "volatile");
+    asm!(
+        "vmwrite {0}, {1}",
+        in(reg) encoding as u64,
+        in(reg) val,
+    );
 }
 
 /// VMCS region encodings (the values to be used with `vmread` and `vmwrite`
@@ -1296,8 +1304,7 @@ impl Vm {
                     &vmcs_revision_number.to_le_bytes());
 
                 // Enable VMX by switching VMX to on
-                llvm_asm!("vmxon ($0)" :: "r"(&vmxon_region.phys_addr()) :
-                          "memory" : "volatile");
+                asm!("vmxon [{0}]", in(reg) &vmxon_region.phys_addr());
 
                 // Save the VMXON region as the current VMXON region
                 *vmxon_lock = Some(vmxon_region);
@@ -1621,8 +1628,7 @@ impl Vm {
             if core!().current_vm_ptr().load(SeqCst) !=
                     self.vmcs.phys_addr().0 {
                 // Set the current VM as the active VM
-                llvm_asm!("vmptrld ($0)" :: "r"(&self.vmcs.phys_addr()) :
-                          "memory" : "volatile");
+                asm!("vmptrld [{0}]", in(reg) &self.vmcs.phys_addr());
                 core!().current_vm_ptr().store(self.vmcs.phys_addr().0,
                                                SeqCst);
             }
@@ -1768,7 +1774,7 @@ impl Vm {
 
             let it = cpu::rdtsc();
 
-            llvm_asm!(r#"
+            asm!(r#"
 
                 // Save host state
                 mov [rcx +  0 * 8], rax
@@ -1890,11 +1896,13 @@ impl Vm {
                 mov rcx, [rcx +  2 * 8]
                 fxrstor64 [rcx + 0x400]
 
-            "# ::
-            "{rcx}"(&mut self.host_regs),
-            "{rdx}"(guest_regs as *mut RegisterState),
-            "{edi}"(self.launched as u32) :
-            "memory", "rax", "rbx", "cc" : "intel", "volatile");
+            "#,
+                in("rcx") &mut self.host_regs,
+                in("rdx") guest_regs as *mut RegisterState,
+                in("edi") self.launched as u32,
+                out("rax") _,
+                // out("rbx") _,
+            );
 
             // Mark that nothing is cached anymore (dirtied is already clear
             // from the prior flushes)

@@ -1,8 +1,7 @@
 //! Inner-mutability on shared variables through spinlocks
-
 #![no_std]
-#![feature(const_fn, llvm_asm)]
 
+use core::arch::asm;
 use core::ops::{Deref, DerefMut};
 use core::cell::UnsafeCell;
 use core::panic::Location;
@@ -17,8 +16,11 @@ pub fn rdtsc() -> u64 {
     let val_hi: u32;
 
     unsafe {
-        llvm_asm!("rdtsc" : "={edx}"(val_hi), "={eax}"(val_lo) ::
-             "memory" : "volatile", "intel");
+        asm!(
+            "rdtsc",
+            out("edx") val_hi,
+            out("eax") val_lo,
+        );
     }
 
     ((val_hi as u64) << 32) | val_lo as u64

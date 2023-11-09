@@ -1,5 +1,6 @@
 //! Panic handlers and soft reboots for the kernel
 
+use core::arch::asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicPtr, AtomicBool, Ordering};
@@ -113,7 +114,7 @@ pub unsafe fn soft_reboot(apic: &mut Apic) -> ! {
     let vmxon_lock = core!().vmxon_region().shatter();
     if (*vmxon_lock).is_some() {
         // Disable VMX root operation
-        llvm_asm!("vmxoff" :::: "intel", "volatile");
+        asm!("vmxoff");
     }
     
     // Convert the soft reboot virtual address into a function pointer that

@@ -7,7 +7,6 @@
 //! lives forever and is not deleted or moved by either the bootloader or
 //! kernel.
 
-#![feature(const_fn)]
 #![no_std]
 
 use core::sync::atomic::{AtomicU64, Ordering};
