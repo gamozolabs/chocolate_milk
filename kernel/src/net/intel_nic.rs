@@ -290,29 +290,39 @@ struct RxState {
     head: usize,
 }
 
+const INTEL_MMIO_SIZE: usize = 32 * 1024;
+
 /// A wrapper to a pointer to MMIO, because Rust is whiny.  This is necessary
 /// because of Send+Sync traits, which are disallowed for raw pointers.
 /// But we are dealing with volatile r/w so this is perfectly fine.
 struct IntelMMIO {
-    mmio: *mut [u32; 32 * 1024],
+    mmio: *mut [u32; INTEL_MMIO_SIZE],
 }
 
 unsafe impl Sync for IntelMMIO {}
 unsafe impl Send for IntelMMIO {}
 
 impl IntelMMIO {
-    fn new(mmio: *mut [u32; 32 * 1024]) -> Self {
+    fn new(mmio: *mut [u32; INTEL_MMIO_SIZE]) -> Self {
         Self { mmio }
     }
 
     unsafe fn read(&self, reg_offset: usize) -> u32 {
         let reg = reg_offset / size_of::<u32>();
+        assert!(reg * size_of::<u32>() == reg_offset,
+            "MMIO reg offset unaligned=0x{:04x}", reg_offset);
+        assert!(reg < INTEL_MMIO_SIZE,
+            "MMIO read OOB, offset=0x{:04x}", reg_offset);
         let ptr = (self.mmio as *const u32).add(reg);
         core::ptr::read_volatile(ptr)
     }
 
     unsafe fn write(&self, reg_offset: usize, val: u32) {
         let reg = reg_offset / size_of::<u32>();
+        assert!(reg * size_of::<u32>() == reg_offset,
+            "MMIO reg offset unaligned=0x{:04x}", reg_offset);
+        assert!(reg < INTEL_MMIO_SIZE,
+            "MMIO read OOB, offset=0x{:04x}", reg_offset);
         let ptr = (self.mmio as *mut u32).add(reg);
         core::ptr::write_volatile(ptr, val);
     }
@@ -369,8 +379,9 @@ impl<'a> IntelGbit {
 
         // Map in the physical MMIO space into uncacheable virtual memory
         let mmio = {
+            const ALLOC_SIZE: u64 = (INTEL_MMIO_SIZE * size_of::<u32>()) as _;
             // Get a virtual address capable of holding a 128 KiB mapping
-            let vaddr = alloc_virt_addr_4k(128 * 1024);
+            let vaddr = alloc_virt_addr_4k(ALLOC_SIZE);
             
             // Get access to physical memory allocations
             let mut pmem = crate::mm::PhysicalMemory;
@@ -381,7 +392,7 @@ impl<'a> IntelGbit {
 
             // Map in the 128 KiB of MMIO space into virtual memory based on
             // the `vaddr` we allocated above
-            for paddr in (bar.0..bar.0.checked_add(128 * 1024).unwrap())
+            for paddr in (bar.0..bar.0.checked_add(ALLOC_SIZE).unwrap())
                     .step_by(4096) {
                 // Compute the offset into MMIO space
                 let offset = paddr - bar.0;
@@ -397,7 +408,7 @@ impl<'a> IntelGbit {
             }
 
             // Box up the MMIO space
-            IntelMMIO::new(vaddr.0 as *mut [u32; 32 * 1024])
+            IntelMMIO::new(vaddr.0 as *mut [u32; INTEL_MMIO_SIZE])
         };
 
         // Make sure that the descriptor tables fit on a single page. They're
